@@ -967,6 +967,9 @@ func (t *Transformer) buildPVCs(md *airunwayv1alpha1.ModelDeployment) []interfac
 		pvcs = append(pvcs, map[string]interface{}{
 			"name":   vol.ResolvedClaimName(md.Name),
 			"create": false,
+			// This is a reference, not a resize request. Dynamo's legacy API
+			// round-trips an omitted quantity as "0"; render it canonically.
+			"size": "0",
 		})
 	}
 	return pvcs

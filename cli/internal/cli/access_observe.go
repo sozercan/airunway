@@ -33,8 +33,20 @@ func accessReferenceType(ctx context.Context, client ClusterClient, kind, apiVer
 			return ResourceType{}, err
 		}
 		versions = nil
+		seen := map[string]bool{}
+		appendVersion := func(version string) {
+			if version != "" && !seen[version] {
+				seen[version] = true
+				versions = append(versions, version)
+			}
+		}
 		for _, group := range objects(discovery["groups"]) {
-			versions = append(versions, stringAt(group, "preferredVersion", "groupVersion"))
+			// One group may serve unrelated resources in different versions,
+			// e.g. NVIDIA ClusterPolicy in v1 and Dynamo workloads in v1beta1.
+			appendVersion(stringAt(group, "preferredVersion", "groupVersion"))
+			for _, version := range objects(group["versions"]) {
+				appendVersion(stringAt(version, "groupVersion"))
+			}
 		}
 	}
 	for _, version := range versions {

@@ -346,3 +346,29 @@ func TestSpecUpdatePreservesOperatorMetadata(t *testing.T) {
 		t.Fatal("spec change was not applied")
 	}
 }
+
+func TestExternalPVCDefaultDoesNotCauseReconcileChurn(t *testing.T) {
+	md := newMDForController("pvc-default", "default")
+	md.Spec.Model.Storage = &airunwayv1alpha1.StorageSpec{Volumes: []airunwayv1alpha1.StorageVolume{{Name: "model-cache", ClaimName: "existing-cache", Purpose: airunwayv1alpha1.VolumePurposeModelCache}}}
+	existing := renderDGDForDefaultsTest(t, md)
+	addMinAvailableDefaultsForTest(existing)
+	pvcs := existing.Object["spec"].(map[string]any)["pvcs"].([]any)
+	if pvcs[0].(map[string]any)["size"] != "0" {
+		t.Fatal("reference quantity must be canonical zero")
+	}
+	existing.SetAnnotations(map[string]string{"nvidia.com/workload-provider": "grove"})
+	updates := 0
+	c := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(existing).WithInterceptorFuncs(interceptor.Funcs{Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		updates++
+		return cl.Update(ctx, obj, opts...)
+	}}).Build()
+	r := NewDynamoProviderReconciler(c, newScheme(), "")
+	for range 3 {
+		if err := r.createOrUpdateResource(context.Background(), renderDGDForDefaultsTest(t, md), md); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if updates != 0 {
+		t.Fatalf("server-defaulted PVC caused %d redundant updates", updates)
+	}
+}
