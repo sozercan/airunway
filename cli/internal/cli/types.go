@@ -131,7 +131,7 @@ func objects(v any) []Object {
 func cloneObject(v Object) Object {
 	b, _ := json.Marshal(v)
 	var out Object
-	_ = json.Unmarshal(b, &out)
+	_ = decodeJSON(b, &out)
 	return out
 }
 func required(f Flags, key string) (string, error) {

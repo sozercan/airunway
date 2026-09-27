@@ -17,7 +17,6 @@ import (
 	"testing"
 
 	"k8s.io/client-go/rest"
-	"sigs.k8s.io/yaml"
 )
 
 const managementTestToken = "hf_testValueThatMustNeverAppear123456"
@@ -174,7 +173,7 @@ func managementTestJSON(t *testing.T, a, b any) {
 			t.Fatal(err)
 		}
 		var value any
-		if err := json.Unmarshal(data, &value); err != nil {
+		if err := decodeJSON(data, &value); err != nil {
 			t.Fatal(err)
 		}
 		return value
@@ -186,7 +185,7 @@ func managementTestJSON(t *testing.T, a, b any) {
 func managementTestOutput(t *testing.T, h *managementHarness) any {
 	t.Helper()
 	var result any
-	if err := json.Unmarshal(h.out.Bytes(), &result); err != nil {
+	if err := decodeJSON(h.out.Bytes(), &result); err != nil {
 		t.Fatalf("invalid output %q: %v", h.out.String(), err)
 	}
 	return result
@@ -224,7 +223,7 @@ func managementTestWrite(t *testing.T, directory, name string, value any) string
 	} else if strings.HasSuffix(name, ".json") {
 		data, err = json.Marshal(value)
 	} else {
-		data, err = yaml.Marshal(value)
+		data, err = marshalYAML(value)
 	}
 	if err != nil {
 		t.Fatal(err)
@@ -239,7 +238,7 @@ func managementTestBatch(t *testing.T, values ...Object) string {
 	t.Helper()
 	var data []string
 	for _, value := range values {
-		b, err := yaml.Marshal(value)
+		b, err := marshalYAML(value)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -355,7 +354,7 @@ func TestManagementArtifactCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got any
-	if err := json.Unmarshal(decoded, &got); err != nil {
+	if err := decodeJSON(decoded, &got); err != nil {
 		t.Fatal(err)
 	}
 	managementTestJSON(t, got, value)
@@ -860,8 +859,8 @@ func TestManagementApplyBatchAndFieldOwnership(t *testing.T) {
 	agent := managementTestAgent("agent", "deployment")
 	config := Object{"custom": Object{"tools": []any{"one", "two"}, "instructions": "Data, not shell commands."}}
 	object(agent["spec"])["config"] = config
-	a, _ := yaml.Marshal(model)
-	b, _ := yaml.Marshal(agent)
+	a, _ := marshalYAML(model)
+	b, _ := marshalYAML(agent)
 	managementTestWrite(t, directory, "a.yaml", string(a)+"\n---\n"+string(b))
 	second := managementTestModel("second")
 	delete(object(second["metadata"]), "namespace")
@@ -1029,7 +1028,7 @@ func TestManagementApplyYAMLSafetyAndCoreSchema(t *testing.T) {
 		}
 	}
 	model := managementTestModel("model")
-	data, _ := yaml.Marshal(model)
+	data, _ := marshalYAML(model)
 	raw := string(data) + "  futureField:\n    date: 2026-01-01\n    answer: yes\n    enabled: true\n"
 	h := managementTestContext("file", managementTestWrite(t, t.TempDir(), "core.yaml", raw), "dry-run", "client")
 	managementTestRun(t, h, "apply")
@@ -1209,7 +1208,7 @@ func TestManagementApplyCoreScalarParity(t *testing.T) {
 		want any
 	}{
 		{"012", float64(12)}, {"0o12", float64(10)}, {"0b101", "0b101"}, {"1_000", "1_000"}, {"0xFF", float64(255)},
-		{"+0o12", "+0o12"}, {"0XFF", "0XFF"}, {"1e3", float64(1000)}, {"yes", "yes"}, {"2026-01-01", "2026-01-01"},
+		{"+0o12", "+0o12"}, {"0XFF", "0XFF"}, {"1e3", json.Number("1e3")}, {"yes", "yes"}, {"2026-01-01", "2026-01-01"},
 		{"!!int 0b101", float64(5)}, {"!!int +0o12", float64(10)}, {"!!str 0xFF", "0xFF"}, {"1e999", "1e999"},
 	}
 	for _, test := range cases {
@@ -1253,7 +1252,7 @@ func TestManagementApplyPartialFailureJSONThroughRun(t *testing.T) {
 				t.Fatalf("code=%d stderr=%s", code, h.stderr.String())
 			}
 			var receipts []Object
-			if json.Unmarshal(h.out.Bytes(), &receipts) != nil || len(receipts) != 1 || stringAt(receipts[0], "metadata", "name") != "first" {
+			if decodeJSON(h.out.Bytes(), &receipts) != nil || len(receipts) != 1 || stringAt(receipts[0], "metadata", "name") != "first" {
 				t.Fatalf("invalid partial receipt: %s", h.out.String())
 			}
 			lines := strings.Split(strings.TrimSpace(h.stderr.String()), "\n")
@@ -1262,7 +1261,7 @@ func TestManagementApplyPartialFailureJSONThroughRun(t *testing.T) {
 			}
 			for i, line := range lines {
 				var record Object
-				if json.Unmarshal([]byte(line), &record) != nil {
+				if decodeJSON([]byte(line), &record) != nil {
 					t.Fatalf("stderr is not JSON-lines: %s", line)
 				}
 				if i == 0 {

@@ -222,13 +222,6 @@ func accessLogs(client ClusterClient, noun string, resource Object, c *CommandCo
 	if response.Body == nil {
 		return nil
 	}
-	if !c.Flags.Bool("follow") {
-		text, err := accessCall(ctx, func() ([]byte, error) { return io.ReadAll(response.Body) })
-		if err != nil {
-			return err
-		}
-		return writeOutput(c.IO, c.Flags, string(text))
-	}
 	if output := c.Flags.Text("output"); output == "" || output == "text" {
 		buffer := make([]byte, 32*1024)
 		for {
@@ -246,9 +239,23 @@ func accessLogs(client ClusterClient, noun string, resource Object, c *CommandCo
 			}
 		}
 	}
+	if !c.Flags.Bool("follow") {
+		// Structured output is a single string. Limit the raw bytes before
+		// encoding it; ordinary text above streams without an aggregate limit.
+		text, err := accessCall(ctx, func() ([]byte, error) {
+			return io.ReadAll(io.LimitReader(response.Body, maxInput+1))
+		})
+		if err != nil {
+			return err
+		}
+		if len(text) > maxInput {
+			return cliError(1, "LOGS", "Log output exceeds 4 MiB for non-follow JSON/YAML output. Reduce --tail or use --output text to stream logs.")
+		}
+		return writeOutput(c.IO, c.Flags, string(text))
+	}
 	reader := bufio.NewReader(response.Body)
 	for {
-		line, err := accessCall(ctx, func() (string, error) { return reader.ReadString('\n') })
+		line, err := accessCall(ctx, func() (string, error) { return accessReadLogLine(reader) })
 		if line != "" {
 			if e := writeOutput(c.IO, c.Flags, Object{"pod": stringAt(pod, "metadata", "name"), "container": container, "line": strings.TrimSuffix(line, "\n")}); e != nil {
 				return e
@@ -262,6 +269,24 @@ func accessLogs(client ClusterClient, noun string, resource Object, c *CommandCo
 		}
 	}
 }
+
+// Structured follow output emits one record per line; cap a single line without
+// limiting the length of the overall stream. Text output never buffers a line.
+func accessReadLogLine(reader *bufio.Reader) (string, error) {
+	var line []byte
+	for {
+		part, err := reader.ReadSlice('\n')
+		if len(line)+len(part) > maxInput {
+			return "", cliError(1, "LOGS", "Log line exceeds 4 MiB for JSON/YAML output. Use --output text to stream logs.")
+		}
+		line = append(line, part...)
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		return string(line), err
+	}
+}
+
 func accessEvents(client ClusterClient, resource Object, c *CommandContext) error {
 	uid := stringAt(resource, "metadata", "uid")
 	if uid == "" {

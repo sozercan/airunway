@@ -192,7 +192,7 @@ func managementPresetEntries(raw, framework string) ([]Object, error) {
 		return invalid()
 	}
 	var value any
-	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+	if err := decodeJSON([]byte(raw), &value); err != nil {
 		return invalid()
 	}
 	if err := managementValidateJSON(value, true); err != nil {

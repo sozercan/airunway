@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -339,5 +340,122 @@ printf '%s' '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredent
 	data, err := os.ReadFile(calls)
 	if err != nil || string(data) != "x" {
 		t.Fatalf("expected one credential-helper invocation, got %q (%v)", data, err)
+	}
+}
+
+func TestDeleteWaitDeadlineBoundsInflightGET(t *testing.T) {
+	for _, noun := range []string{"model", "agent"} {
+		t.Run(noun, func(t *testing.T) {
+			var deleted atomic.Bool
+			pollCanceled := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete {
+					deleted.Store(true)
+					fmt.Fprint(w, `{}`)
+					return
+				}
+				if deleted.Load() {
+					<-r.Context().Done()
+					close(pollCanceled)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(Object{"apiVersion": "airunway.ai/v1alpha1", "kind": resourceTypes[noun].Kind, "metadata": Object{"name": "demo", "namespace": "default", "uid": "original"}})
+			}))
+			defer server.Close()
+			client, err := NewKubernetesClient(&rest.Config{Host: server.URL}, "default")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out, stderr bytes.Buffer
+			started := time.Now()
+			code := Run(context.Background(), []string{noun, "delete", "demo", "--timeout=50ms", "--output=json"}, RunOptions{IO: &IO{Out: &out, Err: &stderr}, Client: client, Config: &CLIConfig{Version: 1, Contexts: map[string]*ContextDefaults{}}})
+			if code != 4 || time.Since(started) > time.Second {
+				t.Fatalf("unbounded delete wait: code=%d elapsed=%s stderr=%s", code, time.Since(started), stderr.String())
+			}
+			var failure Object
+			if json.Unmarshal(stderr.Bytes(), &failure) != nil || stringAt(failure, "error", "code") != "TIMEOUT" {
+				t.Fatal(stderr.String())
+			}
+			select {
+			case <-pollCanceled:
+			case <-time.After(time.Second):
+				t.Fatal("poll request not canceled")
+			}
+			if !deleted.Load() {
+				t.Fatal("delete was not submitted")
+			}
+		})
+	}
+}
+
+func TestAgentConfigFileRejectsInlineCredentials(t *testing.T) {
+	t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "missing"))
+	secretValue := "fixture-inline-config-secret"
+	for _, config := range []Object{
+		{"apiKey": secretValue}, {"nested": Object{"token": secretValue}},
+		{"authorization": "Bearer " + secretValue}, {"env": []any{Object{"name": "API_KEY", "value": secretValue}}},
+	} {
+		raw, err := json.Marshal(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		file := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(file, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+		for _, action := range []string{"create", "update"} {
+			client := &managementFakeClient{resources: []Object{managementTestAgent("demo", "deployment")}}
+			args := []string{"agent", action, "demo", "--namespace", "team", "--config-file", file, "--output=json", "--wait=false"}
+			if action == "create" {
+				args = append(args, "--framework", "langgraph", "--model-ref", "model", "--dry-run=client")
+			}
+			var out, stderr bytes.Buffer
+			code := Run(context.Background(), args, RunOptions{IO: &IO{Out: &out, Err: &stderr}, Client: client, Config: &CLIConfig{Version: 1, Contexts: map[string]*ContextDefaults{}}})
+			if code != 2 || len(client.writes()) != 0 {
+				t.Fatalf("accepted config for %s: code=%d stderr=%s", action, code, stderr.String())
+			}
+			if strings.Contains(out.String()+stderr.String(), secretValue) {
+				t.Fatal("inline credentials leaked")
+			}
+		}
+	}
+	raw := `{"credentialsRef":{"name":"api-credential","key":"API_KEY"},"timeout":30}`
+	config, err := manifestJSONObject(raw, "--config-file")
+	if err != nil || stringAt(config, "credentialsRef", "name") != "api-credential" {
+		t.Fatal("credential reference rejected", err)
+	}
+}
+
+func TestGCSUnderscoreBucketPreview(t *testing.T) {
+	t.Setenv("AIRUNWAY_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "missing"))
+	code, stdout, stderr := coreRun(t, "model", "create", "demo", "--id", "gs://model_cache/weights", "--dry-run=client", "--output=json")
+	var manifest Object
+	if code != 0 || json.Unmarshal([]byte(stdout), &manifest) != nil || stringAt(manifest, "spec", "model", "artifact", "uri") != "gs://model_cache/weights" {
+		t.Fatalf("GCS preview failed: %d %s %s", code, stdout, stderr)
+	}
+	if code, _, _ := coreRun(t, "model", "create", "demo", "--id", "s3://model_cache/weights", "--dry-run=client"); code != 2 {
+		t.Fatal("GCS-specific naming leaked into S3 validation", code)
+	}
+}
+
+func TestAgentConfigFilePreservesLargeInteger(t *testing.T) {
+	t.Setenv("AIRUNWAY_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "missing"))
+	file := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(file, []byte(`{"seed":9007199254740993}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := coreRun(t, "agent", "create", "demo", "--framework", "langgraph", "--model-ref", "model", "--config-file", file, "--dry-run=client", "--output=json")
+	var manifest Object
+	if code != 0 || decodeJSON([]byte(stdout), &manifest) != nil || get(manifest, "spec", "config", "seed") != json.Number("9007199254740993") {
+		t.Fatalf("config integer changed: %d %s %s", code, stdout, stderr)
+	}
+}
+
+func TestPresetConfigPreservesLargeInteger(t *testing.T) {
+	presets, err := managementPresetEntries(`[{"name":"exact","title":"Exact seed","template":{"config":{"seed":9007199254740993}}}]`, "langgraph")
+	if err != nil || len(presets) != 1 || get(presets[0], "config", "seed") != json.Number("9007199254740993") {
+		t.Fatalf("preset precision: %v %v", presets, err)
 	}
 }

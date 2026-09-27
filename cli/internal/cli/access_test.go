@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -22,6 +23,7 @@ import (
 	streamspdy "k8s.io/apimachinery/pkg/util/httpstream/spdy"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/portforward"
+	"sigs.k8s.io/yaml"
 )
 
 type accessFakeCall struct {
@@ -1284,4 +1286,278 @@ func TestAccessPublishedGatewayWithoutServicePermission(t *testing.T) {
 		c, _, _ := accessTestContext(client, nil)
 		accessTestCode(t, runAccess("model", "endpoint", "llama", c), "HTTP_500")
 	})
+}
+
+func accessTestLogClient(noun string, body io.ReadCloser) (*accessFakeClient, string) {
+	agent, _, pod, workload, _ := accessTestAgent()
+	resource := agent
+	if noun == "model" {
+		resource = accessTestModel()
+		object(resource["status"])["workloadRef"] = Object{"apiVersion": "apps/v1", "kind": "Deployment", "name": stringAt(workload, "metadata", "name")}
+	}
+	return &accessFakeClient{resources: []Object{resource, pod, workload}, onRaw: func(context.Context, string, string, any, RequestOptions) (*http.Response, error) {
+		// Log responses do not need a Content-Length, including non-follow responses.
+		return &http.Response{StatusCode: http.StatusOK, ContentLength: -1, Body: body}, nil
+	}}, stringAt(resource, "metadata", "name")
+}
+
+type accessLogChunkWriter struct{ chunks chan string }
+
+func (w *accessLogChunkWriter) Write(p []byte) (int, error) {
+	w.chunks <- string(p)
+	return len(p), nil
+}
+
+func TestAccessLogTextStreamsWithoutBuffering(t *testing.T) {
+	for _, noun := range []string{"model", "agent"} {
+		for _, mode := range []string{"default", "text", "follow false", "follow true"} {
+			t.Run(noun+"/"+mode, func(t *testing.T) {
+				reader, writer := io.Pipe()
+				defer reader.Close()
+				defer writer.Close()
+				client, name := accessTestLogClient(noun, reader)
+				c, _, _ := accessTestContext(client, nil)
+				delete(c.Flags, "output")
+				if mode == "text" {
+					c.Flags["output"] = []string{"text"}
+				}
+				if mode == "follow false" {
+					c.Flags["follow"] = []string{"false"}
+				}
+				if mode == "follow true" {
+					c.Flags["follow"] = []string{"true"}
+				}
+				chunks := make(chan string, 8)
+				c.IO.Out = &accessLogChunkWriter{chunks: chunks}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				c.Context = ctx
+				done := make(chan error, 1)
+				go func() { done <- runAccess(noun, "logs", name, c) }()
+				// Split a UTF-8 sequence across writes and leave the response open. The
+				// first bytes must reach stdout before a second write or EOF is available.
+				first := "early caf\xc3"
+				sent := make(chan error, 1)
+				go func() { _, err := io.WriteString(writer, first); sent <- err }()
+				select {
+				case err := <-sent:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("log response was not read")
+				}
+				var emitted strings.Builder
+				select {
+				case chunk := <-chunks:
+					emitted.WriteString(chunk)
+				case err := <-done:
+					t.Fatalf("stopped before EOF: %v", err)
+				case <-time.After(time.Second):
+					t.Fatal("text output buffered until EOF")
+				}
+				if emitted.String() != first {
+					t.Fatalf("first chunk = %q", emitted.String())
+				}
+				rest := "\xa9\nlast without newline"
+				go func() { _, err := io.WriteString(writer, rest); writer.Close(); sent <- err }()
+				select {
+				case err := <-sent:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("remaining logs were not read")
+				}
+				select {
+				case err := <-done:
+					accessTestCode(t, err, "")
+				case <-time.After(time.Second):
+					t.Fatal("logs did not finish")
+				}
+				close(chunks)
+				for chunk := range chunks {
+					emitted.WriteString(chunk)
+				}
+				if emitted.String() != first+rest {
+					t.Fatalf("raw text changed: %q", emitted.String())
+				}
+				calls := client.snapshot()
+				expectedFollow := "false"
+				if mode == "follow true" {
+					expectedFollow = "true"
+				}
+				if got := calls[len(calls)-1].Options.Query.Get("follow"); got != expectedFollow {
+					t.Fatalf("follow = %q, want %q", got, expectedFollow)
+				}
+			})
+		}
+	}
+}
+
+// Produce chunked logs lazily, so the test can verify the read boundary without
+// allocating the large upstream body or relying on its advertised length.
+type accessGeneratedLogBody struct {
+	mu              sync.Mutex
+	remaining, read int
+	closed          bool
+}
+
+func (r *accessGeneratedLogBody) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return 0, io.ErrClosedPipe
+	}
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	n := min(len(p), r.remaining, 8192)
+	for i := range p[:n] {
+		p[i] = 'x'
+	}
+	r.remaining -= n
+	r.read += n
+	return n, nil
+}
+func (r *accessGeneratedLogBody) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.closed = true
+	return nil
+}
+func (r *accessGeneratedLogBody) snapshot() (int, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.read, r.closed
+}
+
+func TestAccessLogStructuredLimit(t *testing.T) {
+	for _, noun := range []string{"model", "agent"} {
+		for _, format := range []string{"json", "yaml"} {
+			for _, size := range []int{maxInput, maxInput + 1, maxInput * 8} {
+				t.Run(fmt.Sprintf("%s/%s/%d", noun, format, size), func(t *testing.T) {
+					body := &accessGeneratedLogBody{remaining: size}
+					client, name := accessTestLogClient(noun, body)
+					c, out, stderr := accessTestContext(client, Flags{"output": {format}})
+					code := Run(context.Background(), []string{noun, "logs", name, "--namespace", "test", "--output", format}, RunOptions{Client: client, IO: c.IO, Config: &CLIConfig{}})
+					read, closed := body.snapshot()
+					if !closed {
+						t.Fatal("log response body was not closed")
+					}
+					if size <= maxInput {
+						if code != 0 {
+							t.Fatalf("exit %d: %s", code, stderr.String())
+						}
+						var text string
+						var err error
+						if format == "json" {
+							err = json.Unmarshal(out.Bytes(), &text)
+						} else {
+							err = yaml.Unmarshal(out.Bytes(), &text)
+						}
+						if err != nil || len(text) != size || strings.Trim(text, "x") != "" {
+							t.Fatalf("structured logs changed: length=%d, error=%v", len(text), err)
+						}
+						if read != size {
+							t.Fatalf("read %d bytes, want %d", read, size)
+						}
+						return
+					}
+					if code != 1 {
+						t.Fatalf("exit %d, want 1; stderr=%s", code, stderr.String())
+					}
+					if read != maxInput+1 {
+						t.Fatalf("read %d bytes past structured limit; want %d", read, maxInput+1)
+					}
+					if out.Len() != 0 {
+						t.Fatalf("oversized structured logs produced %d stdout bytes", out.Len())
+					}
+					expected := "Log output exceeds 4 MiB for non-follow JSON/YAML output. Reduce --tail or use --output text to stream logs."
+					if format == "json" {
+						result := accessTestJSON(t, stderr)
+						if stringAt(result, "error", "code") != "LOGS" || stringAt(result, "error", "message") != expected {
+							t.Fatal(result)
+						}
+					} else if stderr.String() != "Error: "+expected+"\n" {
+						t.Fatal(stderr.String())
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestAccessLogTextHasNoStructuredSizeLimit(t *testing.T) {
+	body := &accessGeneratedLogBody{remaining: maxInput * 2}
+	client, name := accessTestLogClient("model", body)
+	c, _, _ := accessTestContext(client, Flags{"output": {"text"}})
+	c.IO.Out = io.Discard
+	accessTestCode(t, runAccess("model", "logs", name, c), "")
+	read, closed := body.snapshot()
+	if read != maxInput*2 || !closed {
+		t.Fatal("text logs capped or left open", read, closed)
+	}
+}
+
+func TestAccessLogNonFollowCancellation(t *testing.T) {
+	for _, noun := range []string{"model", "agent"} {
+		for _, format := range []string{"text", "json", "yaml"} {
+			t.Run(noun+"/"+format, func(t *testing.T) {
+				reader, writer := io.Pipe()
+				defer reader.Close()
+				defer writer.Close()
+				client, name := accessTestLogClient(noun, reader)
+				c, out, _ := accessTestContext(client, Flags{"output": {format}})
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				c.Context = ctx
+				done := make(chan error, 1)
+				go func() { done <- runAccess(noun, "logs", name, c) }()
+				// Ensure the command is reading a still-open non-follow response before
+				// cancellation. It must close the body instead of leaving the read blocked.
+				sent := make(chan error, 1)
+				go func() { _, err := io.WriteString(writer, "partial log\n"); sent <- err }()
+				select {
+				case err := <-sent:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("body was not read")
+				}
+				cancel()
+				select {
+				case err := <-done:
+					accessTestCode(t, err, "CANCELED")
+				case <-time.After(time.Second):
+					t.Fatal("non-follow logs did not cancel")
+				}
+				if format != "text" && out.Len() != 0 {
+					t.Fatal("partial structured response was emitted")
+				}
+				go func() { _, err := io.WriteString(writer, "more"); sent <- err }()
+				select {
+				case err := <-sent:
+					if err == nil {
+						t.Fatal("response body stayed open")
+					}
+				case <-time.After(time.Second):
+					t.Fatal("response body stayed open")
+				}
+			})
+		}
+	}
+}
+
+func TestAccessStructuredFollowBoundsEachLine(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader("first\r\n" + strings.Repeat("x", maxInput+1)))
+	line, err := accessReadLogLine(reader)
+	if err != nil || line != "first\r\n" {
+		t.Fatalf("line changed: %q %v", line, err)
+	}
+	line, err = accessReadLogLine(reader)
+	if !accessHasCode(err, "LOGS") || line != "" {
+		t.Fatalf("oversized line accepted: size=%d err=%v", len(line), err)
+	}
 }

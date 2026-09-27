@@ -290,6 +290,24 @@ not the deployment. Authentication remains required by the upstream service.
 the model credential as an agent-call token. Chat requests may execute configured
 tools, so use trusted frameworks and deliberate prompts.
 
+### Logs
+
+```bash
+airunway model logs demo --tail 1000
+airunway agent logs assistant --output json
+airunway model logs demo --follow
+```
+
+Log commands stream text to stdout as it arrives, with or without `--follow`.
+Text output preserves the received bytes and has no overall size limit.
+
+Without `--follow`, `--output json` and `--output yaml` return the logs as a single
+string and accept at most 4 MiB of log data before formatting. Larger responses
+fail with an explicit error and no partial structured output. Reduce `--tail` or
+use `--output text` to stream larger responses. With `--follow`, structured output
+emits one record per log line, with a 4 MiB limit per line.
+Ctrl+C or `--timeout` stops reading and closes the log response.
+
 ## Credentials
 
 ```bash

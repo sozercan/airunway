@@ -179,7 +179,7 @@ func (c *KubernetesClient) Request(ctx context.Context, method, path string, bod
 		return Object{}, nil
 	}
 	var value Object
-	if len(data) > 32*1024*1024 || json.Unmarshal(data, &value) != nil || value == nil {
+	if len(data) > 32*1024*1024 || decodeJSON(data, &value) != nil || value == nil {
 		return nil, cliError(1, "RESPONSE", "The cluster returned an invalid JSON response.")
 	}
 	return value, nil

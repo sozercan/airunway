@@ -360,7 +360,7 @@ func accessHTTPJSON(ctx context.Context, c *accessConnection, path string, body 
 		return Object{}, nil
 	}
 	var result Object
-	if err := json.Unmarshal(data, &result); err != nil || result == nil {
+	if err := decodeJSON(data, &result); err != nil || result == nil {
 		return nil, cliError(1, "RESPONSE", "Endpoint returned an invalid JSON response.")
 	}
 	return result, nil

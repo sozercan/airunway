@@ -441,9 +441,10 @@ func TestManifestAgentConfiguration(t *testing.T) {
 		result = manifestTestAgent(t, Flags{"mode": {"once"}, "__preset-config": {`{"prompt":"Legacy task."}`}})
 		manifestTestEqual(t, get(result, "spec", "config", "prompt"), "Legacy task.")
 	})
-	t.Run("prototype keys are inert JSON", func(t *testing.T) {
-		result := manifestTestAgent(t, Flags{"__preset-config": {`{"__proto__":{"polluted":true},"constructor":{"name":"data"}}`}})
-		manifestTestEqual(t, get(result, "spec", "config"), Object{"__proto__": Object{"polluted": true}, "constructor": Object{"name": "data"}})
+	t.Run("unsafe config keys match declarative validation", func(t *testing.T) {
+		streams, _, _ := manifestTestIO("")
+		_, err := manifestTestAgentResult(Flags{"__preset-config": {`{"__proto__":{"polluted":true},"constructor":{"name":"data"}}`}}, streams)
+		manifestTestUsage(t, err, "Unsafe document key")
 	})
 	for _, content := range []string{"plain: yaml", "[]", "null", "42", `"string"`, "{broken-json", `{} {}`} {
 		t.Run("invalid JSON "+content, func(t *testing.T) {

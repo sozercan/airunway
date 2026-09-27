@@ -206,9 +206,9 @@ func managementYAMLScalar(node *yaml.Node) (any, error) {
 	}
 	if (!explicit || node.Tag == "!!int") && integerPattern.MatchString(value) {
 		digits := value
-		sign := 1.0
+		negative := false
 		if strings.HasPrefix(digits, "-") {
-			sign = -1
+			negative = true
 			digits = digits[1:]
 		} else {
 			digits = strings.TrimPrefix(digits, "+")
@@ -225,10 +225,10 @@ func managementYAMLScalar(node *yaml.Node) (any, error) {
 			digits = digits[2:]
 		}
 		if number, ok := new(big.Int).SetString(digits, base); ok {
-			n, _ := number.Float64()
-			if !math.IsInf(n, 0) {
-				return sign * n, nil
+			if negative {
+				number.Neg(number)
 			}
+			return json.Number(number.String()), nil
 		}
 	}
 	if (!explicit || node.Tag == "!!float") && managementCoreFloat.MatchString(value) {
@@ -236,14 +236,42 @@ func managementYAMLScalar(node *yaml.Node) (any, error) {
 		if strings.Contains(lower, ".inf") || lower == ".nan" {
 			return nil, usage("Documents must contain only JSON-compatible values.")
 		}
-		if number, err := strconv.ParseFloat(value, 64); err == nil {
-			return number, nil
+		// Keep the core schema's float range classification, but never retain
+		// the approximate float value. Fractions and exponents can encode IDs.
+		if _, err := strconv.ParseFloat(value, 64); err == nil {
+			return managementYAMLJSONNumber(value), nil
 		}
 	}
 	if explicit {
 		return nil, usage("Documents must contain only JSON-compatible values.")
 	}
 	return value, nil
+}
+
+// YAML permits a leading plus, leading zeros, and omitted digits around a
+// decimal point. Normalize only that syntax, without rounding the number.
+func managementYAMLJSONNumber(value string) json.Number {
+	negative := strings.HasPrefix(value, "-")
+	value = strings.TrimLeft(value, "+-")
+	exponent := ""
+	if index := strings.IndexAny(value, "eE"); index >= 0 {
+		value, exponent = value[:index], value[index:]
+	}
+	integer, fraction, decimal := strings.Cut(value, ".")
+	integer = strings.TrimLeft(integer, "0")
+	if integer == "" {
+		integer = "0"
+	}
+	if negative {
+		integer = "-" + integer
+	}
+	if decimal {
+		if fraction == "" {
+			fraction = "0"
+		}
+		integer += "." + fraction
+	}
+	return json.Number(integer + exponent)
 }
 
 func managementManifest(value any, ns string) (Object, error) {
@@ -422,7 +450,7 @@ func managementApply(words []string, ctx *CommandContext) error {
 		totalBytes += int64(len(data))
 		if strings.EqualFold(filepath.Ext(file), ".json") {
 			var doc any
-			if err := json.Unmarshal(data, &doc); err != nil {
+			if err := decodeJSON(data, &doc); err != nil {
 				return usage("Cannot parse apply input as YAML or JSON.")
 			}
 			if err := appendDocument(doc); err != nil {

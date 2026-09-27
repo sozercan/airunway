@@ -444,9 +444,19 @@ func runResource(words []string, c *CommandContext, config *CLIConfig, localPrev
 			}
 			if !f.Has("wait") || f.Bool("wait") {
 				timeout, _ := parseDuration(f.Text("timeout"))
-				deadline := time.Now().Add(timeout)
+				waitContext, cancel := context.WithTimeout(c.Context, timeout)
+				defer cancel()
+				pending := func() error {
+					return cliError(4, "TIMEOUT", "Deletion is still pending. Inspect its events; no other resources were deleted.")
+				}
 				for {
-					current, err := client.Get(c.Context, t, c.Namespace, name)
+					current, err := accessGet(waitContext, client, t, c.Namespace, name)
+					if errors.Is(waitContext.Err(), context.DeadlineExceeded) {
+						return pending()
+					}
+					if c.Context.Err() != nil {
+						return cliError(130, "INTERRUPTED", "Interrupted. Submitted resources were not deleted.")
+					}
 					var ce *CLIError
 					if errors.As(err, &ce) && ce.Code == "HTTP_404" {
 						break
@@ -457,11 +467,10 @@ func runResource(words []string, c *CommandContext, config *CLIConfig, localPrev
 					if stringAt(current, "metadata", "uid") != uid {
 						break
 					}
-					remaining := time.Until(deadline)
-					if remaining <= 0 {
-						return cliError(4, "TIMEOUT", "Deletion is still pending. Inspect its events; no other resources were deleted.")
-					}
-					if err := pause(c.Context, min(time.Second, remaining)); err != nil {
+					if err := pause(waitContext, time.Second); err != nil {
+						if errors.Is(waitContext.Err(), context.DeadlineExceeded) {
+							return pending()
+						}
 						return err
 					}
 				}

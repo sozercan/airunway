@@ -1,17 +1,108 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sort"
 	"strings"
 
-	"sigs.k8s.io/yaml"
+	yaml "sigs.k8s.io/yaml/goyaml.v3"
 )
 
 const maxInput = 4 * 1024 * 1024
+
+// decodeJSON preserves numbers in untyped configuration and rejects trailing
+// values just as json.Unmarshal does. Callers retain their own safe error text.
+func decodeJSON(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err != nil {
+			return err
+		}
+		return errors.New("expected a single JSON value")
+	}
+	return nil
+}
+
+// Marshal through JSON to retain JSON field names and custom marshalers, then
+// emit numeric YAML nodes without the float conversion used by JSONToYAML.
+func marshalYAML(value any) ([]byte, error) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var decoded any
+	if err := decodeJSON(data, &decoded); err != nil {
+		return nil, err
+	}
+	var toNode func(any) (*yaml.Node, error)
+	toNode = func(value any) (*yaml.Node, error) {
+		node := &yaml.Node{}
+		switch value := value.(type) {
+		case json.Number:
+			node.Kind, node.Tag, node.Value = yaml.ScalarNode, "!!int", value.String()
+			if strings.ContainsAny(value.String(), ".eE") {
+				node.Tag = "!!float"
+			}
+		case map[string]any:
+			node.Kind, node.Tag = yaml.MappingNode, "!!map"
+			keys := make([]string, 0, len(value))
+			for key := range value {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				keyNode, err := toNode(key)
+				if err != nil {
+					return nil, err
+				}
+				child, err := toNode(value[key])
+				if err != nil {
+					return nil, err
+				}
+				node.Content = append(node.Content, keyNode, child)
+			}
+		case []any:
+			node.Kind, node.Tag = yaml.SequenceNode, "!!seq"
+			for _, value := range value {
+				child, err := toNode(value)
+				if err != nil {
+					return nil, err
+				}
+				node.Content = append(node.Content, child)
+			}
+		default:
+			if err := node.Encode(value); err != nil {
+				return nil, err
+			}
+		}
+		return node, nil
+	}
+	node, err := toNode(decoded)
+	if err != nil {
+		return nil, err
+	}
+	var output bytes.Buffer
+	encoder := yaml.NewEncoder(&output)
+	encoder.SetIndent(2)
+	encoder.CompactSeqIndent()
+	if err := encoder.Encode(node); err != nil {
+		return nil, err
+	}
+	if err := encoder.Close(); err != nil {
+		return nil, err
+	}
+	return output.Bytes(), nil
+}
 
 func readInput(r io.Reader, limit int64) ([]byte, error) {
 	b, err := io.ReadAll(io.LimitReader(r, limit+1))
@@ -52,7 +143,7 @@ func writeOutput(streams *IO, f Flags, v any) error {
 	case "json":
 		b, err = json.MarshalIndent(v, "", "  ")
 	case "yaml":
-		b, err = yaml.Marshal(v)
+		b, err = marshalYAML(v)
 	case "", "text":
 		if s, ok := v.(string); ok {
 			_, err = fmt.Fprintln(streams.Out, strings.TrimSuffix(s, "\n"))
@@ -113,7 +204,7 @@ func writeOutput(streams *IO, f Flags, v any) error {
 			}
 			return nil
 		}
-		b, err = yaml.Marshal(v)
+		b, err = marshalYAML(v)
 	default:
 		return usage("--output must be text, json, or yaml.")
 	}

@@ -508,7 +508,7 @@ func buildModel(name string, flags Flags, namespace string, streams *IO) (Object
 			return nil, err
 		}
 	}
-	if scheme == "s3" || scheme == "gs" {
+	if scheme == "s3" {
 		if _, err := manifestDNSName(host, "Artifact bucket"); err != nil {
 			return nil, err
 		}
@@ -788,12 +788,15 @@ func manifestBinding(flags Flags, existing Object) (Object, error) {
 
 func manifestJSONObject(raw, label string) (Object, error) {
 	var parsed any
-	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+	if err := decodeJSON([]byte(raw), &parsed); err != nil {
 		return nil, usage(label + " must contain valid JSON.")
 	}
 	result, ok := parsed.(map[string]any)
 	if !ok {
 		return nil, usage(label + " must contain a JSON object.")
+	}
+	if err := managementValidateJSON(result, true); err != nil {
+		return nil, err
 	}
 	return result, nil
 }
