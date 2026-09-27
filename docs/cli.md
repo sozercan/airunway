@@ -231,14 +231,16 @@ airunway agent create azure-assistant --framework langgraph \
   --prompt "Be helpful."
 
 # Existing gateway and served-model name
-airunway agent create gateway-assistant --framework langgraph \
+airunway agent create gateway-assistant --framework crewai \
   --model-gateway inference --gateway-listener https \
   --model-id team-chat --prompt "Be helpful."
 ```
 
 Supported API types are `openai`, `anthropic`, `azure-openai`, and `custom`, subject
 to framework compatibility. Credential references are namespace-local. The
-requesting identity must be allowed to read the referenced credential.
+requesting identity must be allowed to read the referenced credential. Referenced
+models and gateways must be in the agent's namespace. Use `--model-url` for an
+explicit endpoint elsewhere; cross-namespace resource grants are not implemented.
 
 ```bash
 airunway agent list
@@ -260,9 +262,9 @@ are rejected for frameworks that do not implement them.
 airunway framework list
 airunway framework get langgraph
 airunway catalog agent list
-airunway catalog agent get langgraph/basic-assistant
+airunway catalog agent get langgraph/langgraph-agent
 
-airunway agent create assistant --preset langgraph/basic-assistant --model-ref demo
+airunway agent create assistant --preset langgraph/langgraph-agent --model-ref demo
 
 airunway agent create research-assistant --framework langgraph --model-ref demo \
   --config-file ./langgraph.json --prompt-file ./instructions.md

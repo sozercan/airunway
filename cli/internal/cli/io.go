@@ -18,6 +18,9 @@ const maxInput = 4 * 1024 * 1024
 // decodeJSON preserves numbers in untyped configuration and rejects trailing
 // values just as json.Unmarshal does. Callers retain their own safe error text.
 func decodeJSON(data []byte, target any) error {
+	if err := validateJSONKeys(data); err != nil {
+		return err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
 	if err := decoder.Decode(target); err != nil {
@@ -25,6 +28,68 @@ func decodeJSON(data []byte, target any) error {
 	}
 	var trailing json.RawMessage
 	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err != nil {
+			return err
+		}
+		return errors.New("expected a single JSON value")
+	}
+	return nil
+}
+
+// The standard decoder accepts duplicate keys by overwriting earlier values.
+// Reject ambiguous documents before decoding into either typed or untyped data.
+func validateJSONKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var value func(int) error
+	value = func(depth int) error {
+		if depth > 1000 {
+			return errors.New("JSON nesting exceeds its limit")
+		}
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		delimiter, ok := token.(json.Delim)
+		if !ok {
+			return nil
+		}
+		switch delimiter {
+		case '{':
+			seen := map[string]bool{}
+			for decoder.More() {
+				key, err := decoder.Token()
+				if err != nil {
+					return err
+				}
+				name, ok := key.(string)
+				if !ok {
+					return errors.New("invalid JSON object key")
+				}
+				if seen[name] {
+					return errors.New("duplicate JSON object key")
+				}
+				seen[name] = true
+				if err := value(depth + 1); err != nil {
+					return err
+				}
+			}
+		case '[':
+			for decoder.More() {
+				if err := value(depth + 1); err != nil {
+					return err
+				}
+			}
+		default:
+			return errors.New("invalid JSON delimiter")
+		}
+		_, err = decoder.Token()
+		return err
+	}
+	if err := value(0); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
 		if err != nil {
 			return err
 		}

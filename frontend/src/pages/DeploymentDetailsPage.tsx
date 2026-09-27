@@ -229,7 +229,7 @@ export function DeploymentDetailsPage() {
                   {vol.size ? (
                     <p>
                       New disk &middot; {vol.size}
-                      {vol.storageClassName && ` &middot; ${vol.storageClassName}`}
+                      {vol.storageClassName && ` · ${vol.storageClassName}`}
                     </p>
                   ) : vol.claimName ? (
                     <p>Existing disk &middot; <code className="font-mono-code">{vol.claimName}</code></p>

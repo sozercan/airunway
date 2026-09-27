@@ -148,7 +148,7 @@ func (c *KubernetesClient) Raw(ctx context.Context, method, path string, body an
 			message = "Cluster credentials were rejected."
 			exit = 3
 		case 403:
-			message = "Your identity does not have permission for this operation."
+			message = "The cluster denied this operation. Check your permissions and admission policies."
 			exit = 3
 		case 404:
 			message = "The requested resource or API is not installed."

@@ -1216,6 +1216,32 @@ describe('Deployment Routes', () => {
       expect(data.podName).toBe('test-deploy-abc123');
     });
 
+    test('returns HTTP 200 with empty logs while the requested container is starting', async () => {
+      const service = kubernetesService as unknown as {
+        coreV1Api: { readNamespacedPodLog: () => Promise<string> };
+      };
+      restores.push(
+        mockServiceMethod(kubernetesService, 'getDeployment', async () => mockDeployment),
+        mockServiceMethod(kubernetesService, 'getDeploymentPods', async () => [{ name: 'test-deploy-abc123' }]),
+        mockServiceMethod(service.coreV1Api, 'readNamespacedPodLog', async () => {
+          throw Object.assign(new Error('Unknown API Status Code!'), {
+            code: 400,
+            body: JSON.stringify({
+              kind: 'Status',
+              message: 'container "vllm" in pod "test-deploy-abc123" is waiting to start: ContainerCreating',
+              reason: 'BadRequest',
+              code: 400,
+            }),
+          });
+        }),
+      );
+
+      const res = await app.request('/api/deployments/test-deploy/logs?namespace=default&container=vllm');
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ logs: '', podName: 'test-deploy-abc123', container: 'vllm' });
+    });
+
     test('returns empty logs when no pods found', async () => {
       restores.push(
         mockServiceMethod(kubernetesService, 'getDeployment', async () => mockDeployment),
