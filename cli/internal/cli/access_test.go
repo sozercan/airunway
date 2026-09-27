@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -14,7 +15,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"os/exec"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -451,12 +456,12 @@ func TestAccessSafeURLsAndPortSelection(t *testing.T) {
 
 // Serve the real SPDY pod port-forward protocol, relaying data streams to an
 // HTTP fixture. No kubectl, cluster, or replacement global tunnel hook is used.
-func accessTestForwardServer(t *testing.T, upstream string) (*httptest.Server, <-chan struct{}) {
+func accessTestForwardServer(t *testing.T, upstream, namespace string) (*httptest.Server, <-chan struct{}) {
 	t.Helper()
 	closed := make(chan struct{})
 	var once sync.Once
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v1/namespaces/test/pods/selected-pod/portforward" || r.Method != "POST" {
+		if r.URL.Path != "/api/v1/namespaces/"+namespace+"/pods/selected-pod/portforward" || r.Method != "POST" {
 			http.Error(w, "wrong pod", 400)
 			return
 		}
@@ -504,9 +509,9 @@ func accessTestReply(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(value)
 }
-func accessTestSetupForward(t *testing.T, client *accessFakeClient, upstream *httptest.Server) <-chan struct{} {
+func accessTestSetupForward(t *testing.T, client *accessFakeClient, upstream *httptest.Server, namespace string) <-chan struct{} {
 	t.Helper()
-	server, closed := accessTestForwardServer(t, strings.TrimPrefix(upstream.URL, "http://"))
+	server, closed := accessTestForwardServer(t, upstream.Listener.Addr().String(), namespace)
 	client.config = &rest.Config{Host: server.URL, BearerToken: "cluster-token"}
 	return closed
 }
@@ -533,7 +538,7 @@ func TestAccessChatOverRealPortForward(t *testing.T) {
 		}
 		accessTestReply(response, Object{"private-ingress-token": Object{"nested": []any{"private-ingress-token"}}, "choices": accessTestObjects(Object{"message": Object{"content": "answer private-ingress-token"}})})
 	})
-	closed := accessTestSetupForward(t, client, upstream)
+	closed := accessTestSetupForward(t, client, upstream, "test")
 	c, out, errout := accessTestContext(client, Flags{"message": {"hello"}})
 	accessTestCode(t, runAccess("agent", "chat", "helper", c), "")
 	if strings.Contains(out.String()+errout.String(), "private-ingress-token") || !strings.Contains(out.String(), "[redacted]") {
@@ -611,7 +616,7 @@ func TestAccessModelChatNamesAndHistory(t *testing.T) {
 				}
 				accessTestReply(w, Object{"choices": accessTestObjects(Object{"message": Object{"content": "reply"}})})
 			})
-			accessTestSetupForward(t, client, upstream)
+			accessTestSetupForward(t, client, upstream, "test")
 			c, out, stderr := accessTestContext(client, nil)
 			c.IO.Interactive = true
 			c.IO.In = strings.NewReader("first\nsecond\n/exit\nignored\n")
@@ -760,7 +765,7 @@ func TestAccessChatInputAndResponses(t *testing.T) {
 		}
 		accessTestReply(w, Object{"choices": accessTestObjects(Object{"message": Object{"content": "from stdin"}})})
 	})
-	accessTestSetupForward(t, client, server)
+	accessTestSetupForward(t, client, server, "test")
 	c, out, _ := accessTestContext(client, Flags{"message-file": {"-"}, "temperature": {"0.5"}, "max-tokens": {"25"}, "output": {"text"}})
 	c.IO.In = strings.NewReader("from stdin")
 	accessTestCode(t, runAccess("model", "chat", "llama", c), "")
@@ -936,7 +941,7 @@ func TestAccessConnectRawLoopback(t *testing.T) {
 		}
 		fmt.Fprint(w, "raw")
 	})
-	closed := accessTestSetupForward(t, client, server)
+	closed := accessTestSetupForward(t, client, server, "test")
 	// Test the same direct SDK tunnel used by connect without concurrently reading
 	// the command's writer while it emits its endpoint metadata.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1824,7 +1829,7 @@ func TestAccessConnectTLSIdentityMapping(t *testing.T) {
 				resource, noun, name = agent, "agent", "helper"
 			}
 			upstream := strings.TrimPrefix(server.URL, "https://")
-			forward, closed := accessTestForwardServer(t, upstream)
+			forward, closed := accessTestForwardServer(t, upstream, "test")
 			client.config = &rest.Config{Host: forward.URL}
 			c, _, stderr := accessTestContext(client, nil)
 			delete(c.Flags, "timeout")
@@ -1913,5 +1918,313 @@ func TestAccessConnectTLSIdentityMapping(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Plain owner references are forgeable. Blocking references do not prove a
+// pod's origin either: controllers can adopt attacker-created matching pods.
+func TestAccessGatewayCredentialTunnelRefusal(t *testing.T) {
+	for _, ownership := range []string{"labels only", "forged owner references", "blocking controller references"} {
+		t.Run(ownership, func(t *testing.T) {
+			model, gateway, _, service := accessTestGateway()
+			pod := accessTestPod(service, nil)
+			object(pod["metadata"])["namespace"] = "edge"
+			if ownership != "labels only" {
+				accessTestOwn(service, gateway)
+				accessTestOwn(pod, gateway)
+				if ownership == "blocking controller references" {
+					for _, child := range []Object{service, pod} {
+						objects(get(child, "metadata", "ownerReferences"))[0]["blockOwnerDeletion"] = true
+					}
+				}
+			}
+			// Both published-address and no-address internal fallbacks are Gateway
+			// tunnels. The public access label must not bypass the credential guard.
+			for _, access := range []string{"gateway", "internal"} {
+				e := &accessEndpoint{URL: &url.URL{Scheme: "http", Host: "endpoint.edge.svc"}, Access: access, Service: service}
+				client := &accessFakeClient{resources: []Object{model, gateway, service, pod}}
+				connection := &accessConnection{Endpoint: e, Tunnel: &accessTunnel{Pod: pod}}
+				token, err := accessIngressToken(context.Background(), client, "model", model, e, connection, Flags{"credential": {"ingress-key"}}, "test")
+				accessTestCode(t, err, "UNSUPPORTED")
+				if token != "" || !strings.Contains(err.Error(), "HTTPS") || !strings.Contains(err.Error(), "--server") {
+					t.Fatal("missing safe alternative", err)
+				}
+				if len(client.snapshot()) != 0 {
+					t.Fatal("Gateway refusal must not attempt ownership proof or read credentials")
+				}
+			}
+		})
+	}
+}
+
+func TestAccessModelEndpointCredentialHTTP(t *testing.T) {
+	var requests int
+	var mu sync.Mutex
+	server := accessTestUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		accessTestReply(w, Object{})
+	})
+	model, gateway, route, service := accessTestGateway()
+	u, _ := url.Parse(server.URL)
+	port, _ := strconv.Atoi(u.Port())
+	listener := objects(get(gateway, "spec", "listeners"))[0]
+	listener["protocol"], listener["port"] = "HTTP", port
+	gateway["status"] = Object{"addresses": accessTestObjects(Object{"type": "IPAddress", "value": u.Hostname()})}
+	objects(get(service, "spec", "ports"))[0]["port"] = port
+	client := &accessFakeClient{resources: []Object{model, gateway, route, service}}
+	c, out, errout := accessTestContext(client, Flags{"check": {"true"}, "server": {server.URL + "/models"}, "credential": {"ingress-key"}})
+	accessTestCode(t, runAccess("model", "endpoint", "llama", c), "UNSUPPORTED")
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 0 || out.Len() != 0 || errout.Len() != 0 {
+		t.Fatal("credential check contacted HTTP endpoint or produced output")
+	}
+	for _, call := range client.snapshot() {
+		if call.Type.Kind == "Secret" {
+			t.Fatal("HTTP check read credential")
+		}
+	}
+}
+
+// Install a test CA only in a subprocess, so other tests still exercise the
+// production system trust store. The child is the same race-instrumented binary
+// when the parent is running with -race. Certificate verification stays enabled.
+func accessTestTrustTLS(t *testing.T, server *httptest.Server) bool {
+	t.Helper()
+	if os.Getenv("AIRUNWAY_ACCESS_TLS_TEST") == t.Name() {
+		roots := x509.NewCertPool()
+		roots.AddCert(server.Certificate())
+		x509.SetFallbackRoots(roots)
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^"+regexp.QuoteMeta(t.Name())+"$", "-test.v", "-test.timeout=30s")
+	command.Env = append(os.Environ(), "AIRUNWAY_ACCESS_TLS_TEST="+t.Name(), "GODEBUG="+os.Getenv("GODEBUG")+",x509usefallbackroots=1")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("verified TLS subprocess failed: %v\n%s", err, output)
+	}
+	return false
+}
+
+func TestAccessModelCredentialHTTPS(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		if r.TLS == nil || r.TLS.ServerName != "example.com" || r.Header.Get("Authorization") != "Bearer private-ingress-token" {
+			t.Error("expected verified TLS and model ingress authentication")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/models/v1/models":
+			accessTestReply(w, Object{"data": accessTestObjects(Object{"id": "served-alias"})})
+		case "/models/v1/chat/completions":
+			accessTestReply(w, Object{"choices": accessTestObjects(Object{"message": Object{"content": "reply private-ingress-token"}})})
+		default:
+			t.Error("unexpected API path", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	if !accessTestTrustTLS(t, server) {
+		return
+	}
+	for _, mode := range []string{"direct", "tunnel", "wrong TLS hostname"} {
+		for _, action := range []string{"endpoint", "chat"} {
+			t.Run(mode+"/"+action, func(t *testing.T) {
+				model, gateway, route, service := accessTestGateway()
+				u, _ := url.Parse(server.URL)
+				port, _ := strconv.Atoi(u.Port())
+				gateway["status"] = Object{"addresses": accessTestObjects(Object{"type": "IPAddress", "value": u.Hostname()})}
+				objects(get(gateway, "spec", "listeners"))[0]["port"] = port
+				objects(get(service, "spec", "ports"))[0]["port"] = port
+				object(route["spec"])["hostnames"] = []any{"example.com"}
+				if mode == "wrong TLS hostname" {
+					object(route["spec"])["hostnames"] = []any{"wrong.example.test"}
+				}
+				pod := accessTestPod(service, nil)
+				object(pod["metadata"])["namespace"] = "edge"
+				secret := accessTestResource("Secret", "ingress-key")
+				secret["data"] = Object{"API_KEY": base64.StdEncoding.EncodeToString([]byte("private-ingress-token")), "HF_TOKEN": base64.StdEncoding.EncodeToString([]byte("not-an-ingress-token"))}
+				client := &accessFakeClient{resources: []Object{model, gateway, route, service, pod, secret}}
+				args := []string{"model", action, "llama", "--credential", "ingress-key", "--namespace", "test", "--output", "json", "--timeout", "2s"}
+				if action == "endpoint" {
+					args = append(args, "--check")
+				} else {
+					args = append(args, "--message", "hello")
+				}
+				if mode == "direct" {
+					args = append(args, "--server", server.URL+"/models")
+				} else {
+					accessTestSetupForward(t, client, server, "edge")
+				}
+				c, out, errout := accessTestContext(client, nil)
+				code := Run(context.Background(), args, RunOptions{Client: client, IO: c.IO, Config: &CLIConfig{}})
+				if mode == "wrong TLS hostname" {
+					if code != 1 || !strings.Contains(errout.String(), "CONNECTION") || out.Len() != 0 {
+						t.Fatal("invalid TLS identity was not rejected", code, out.String(), errout.String())
+					}
+				} else {
+					if code != 0 || errout.Len() != 0 {
+						t.Fatal(code, errout.String())
+					}
+					if action == "endpoint" && accessTestJSON(t, out)["reachable"] != true {
+						t.Fatal("authenticated check did not report reachability")
+					}
+				}
+				if strings.Contains(out.String()+errout.String(), "private-ingress-token") || strings.Contains(out.String()+errout.String(), "not-an-ingress-token") {
+					t.Fatal("credential leaked in output")
+				}
+				reads := 0
+				for _, call := range client.snapshot() {
+					if call.Type.Kind == "Secret" {
+						reads++
+						if call.Namespace != "test" || call.Name != "ingress-key" {
+							t.Fatal("wrong credential selected", call)
+						}
+					}
+				}
+				if reads != 1 {
+					t.Fatal("expected exactly one credential read", reads)
+				}
+			})
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 4 {
+		t.Fatal("expected only authenticated requests to the verified endpoint", requests)
+	}
+}
+
+func TestAccessGatewayCredentialHTTPRealTunnel(t *testing.T) {
+	for _, published := range []bool{true, false} {
+		for _, action := range []string{"endpoint", "chat"} {
+			for _, authenticated := range []bool{true, false} {
+				t.Run(fmt.Sprintf("published=%t/%s/credential=%t", published, action, authenticated), func(t *testing.T) {
+					var mu sync.Mutex
+					requests := 0
+					server := accessTestUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+						mu.Lock()
+						requests++
+						mu.Unlock()
+						if authenticated || r.Header.Get("Authorization") != "" {
+							t.Error("credential-bearing request reached attacker-controlled Gateway pod")
+						}
+						accessTestReply(w, Object{"data": accessTestObjects(Object{"id": "served-alias"}), "choices": accessTestObjects(Object{"message": Object{"content": "hello"}})})
+					})
+					model, gateway, route, service := accessTestGateway()
+					objects(get(gateway, "spec", "listeners"))[0]["protocol"] = "HTTP"
+					if !published {
+						gateway["status"] = Object{}
+					}
+					pod := accessTestPod(service, nil)
+					object(pod["metadata"])["namespace"] = "edge"
+					client := &accessFakeClient{resources: []Object{model, gateway, route, service, pod}}
+					closed := accessTestSetupForward(t, client, server, "edge")
+					flags := Flags{}
+					if authenticated {
+						flags["credential"] = []string{"ingress-key"}
+					}
+					if action == "endpoint" {
+						flags["check"] = []string{"true"}
+					} else {
+						flags["message"] = []string{"hello"}
+					}
+					c, out, _ := accessTestContext(client, flags)
+					err := runAccess("model", action, "llama", c)
+					if authenticated {
+						accessTestCode(t, err, "UNSUPPORTED")
+						if !strings.Contains(err.Error(), "HTTPS") || !strings.Contains(err.Error(), "--server") || out.Len() != 0 {
+							t.Fatal("missing HTTPS alternative or unexpected output", err)
+						}
+					} else {
+						accessTestCode(t, err, "")
+					}
+					for _, call := range client.snapshot() {
+						if call.Type.Kind == "Secret" {
+							t.Fatal("HTTP Gateway path read a credential")
+						}
+					}
+					select {
+					case <-closed:
+					case <-time.After(time.Second):
+						t.Fatal("tunnel not closed")
+					}
+					mu.Lock()
+					defer mu.Unlock()
+					if authenticated && requests != 0 || !authenticated && requests != 1 {
+						t.Fatal("unexpected upstream requests", requests)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestAccessInternalModelCredentialTunnel(t *testing.T) {
+	for _, override := range []bool{false, true} {
+		for _, action := range []string{"endpoint", "chat"} {
+			t.Run(fmt.Sprintf("gateway=false override=%t/%s", override, action), func(t *testing.T) {
+				model := accessTestModel()
+				service := accessTestService("actual-api", 8000)
+				pod := accessTestPod(service, nil)
+				secret := accessTestResource("Secret", "ingress-key")
+				secret["data"] = Object{"API_KEY": base64.StdEncoding.EncodeToString([]byte("private-ingress-token"))}
+				client := &accessFakeClient{resources: []Object{model, service, pod, secret}}
+				server := accessTestUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+					if r.Header.Get("Authorization") != "Bearer private-ingress-token" {
+						t.Error("missing internal model authentication")
+					}
+					accessTestReply(w, Object{"data": accessTestObjects(Object{"id": "configured-name"}), "choices": accessTestObjects(Object{"message": Object{"content": "hello"}})})
+				})
+				accessTestSetupForward(t, client, server, "test")
+				flags := Flags{"credential": {"ingress-key"}}
+				if override {
+					object(model["status"])["gateway"] = Object{"gatewayName": "shared", "gatewayNamespace": "edge"}
+					flags["gateway"] = []string{"false"}
+				}
+				if action == "endpoint" {
+					flags["check"] = []string{"true"}
+				} else {
+					flags["message"] = []string{"hello"}
+				}
+				c, _, _ := accessTestContext(client, flags)
+				accessTestCode(t, runAccess("model", action, "llama", c), "")
+			})
+		}
+	}
+}
+
+func TestAccessEndpointDisplayNeverReadsCredential(t *testing.T) {
+	for _, format := range []string{"text", "json", "yaml"} {
+		model, gateway, route, service := accessTestGateway()
+		client := &accessFakeClient{resources: []Object{model, gateway, route, service}}
+		for _, credential := range []bool{false, true} {
+			flags := Flags{"output": {format}}
+			if credential {
+				flags["credential"] = []string{"ingress-key"}
+			}
+			c, out, _ := accessTestContext(client, flags)
+			code := ""
+			if credential {
+				code = "USAGE"
+			}
+			accessTestCode(t, runAccess("model", "endpoint", "llama", c), code)
+			if credential && out.Len() != 0 {
+				t.Fatal("plain endpoint accepted a credential")
+			}
+			for _, call := range client.snapshot() {
+				if call.Type.Kind == "Secret" {
+					t.Fatal("endpoint display read a credential")
+				}
+			}
+		}
 	}
 }

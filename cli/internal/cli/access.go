@@ -591,7 +591,7 @@ func runAccess(noun, action, name string, c *CommandContext) error {
 		return usage("Unknown resource type.")
 	}
 	allowed := map[string][]string{
-		"endpoint": strings.Fields("gateway gateway-listener check server"), "connect": strings.Fields("gateway gateway-listener port"),
+		"endpoint": strings.Fields("gateway gateway-listener check server credential"), "connect": strings.Fields("gateway gateway-listener port"),
 		"chat": strings.Fields("gateway gateway-listener server message message-file temperature max-tokens credential"),
 		"logs": strings.Fields("pod container follow tail timestamps"), "events": {},
 	}
@@ -601,6 +601,9 @@ func runAccess(noun, action, name string, c *CommandContext) error {
 	}
 	if err := assertFlags(c.Flags, options); err != nil {
 		return err
+	}
+	if action == "endpoint" && c.Flags.Has("credential") && (noun != "model" || !c.Flags.Bool("check")) {
+		return usage("--credential is only supported for model endpoint --check.")
 	}
 	if err := validateName(name, "name"); err != nil {
 		return err
@@ -650,11 +653,17 @@ func runAccess(noun, action, name string, c *CommandContext) error {
 				return err
 			}
 			defer connection.Close()
-			path := "/v1/models"
+			path, token := "/v1/models", ""
 			if noun == "agent" {
+				// Agent readiness is deliberately unauthenticated.
 				path = "/readyz"
+			} else {
+				token, err = accessIngressToken(ctx, client, noun, resource, e, connection, c.Flags, c.Namespace)
+				if err != nil {
+					return err
+				}
 			}
-			if _, err := accessHTTPJSON(ctx, connection, path, nil, "", noun == "model"); err != nil {
+			if _, err := accessHTTPJSON(ctx, connection, path, nil, token, noun == "model"); err != nil {
 				return err
 			}
 		}

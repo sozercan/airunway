@@ -292,7 +292,7 @@ func managementManifest(value any, ns string) (Object, error) {
 	if !metaOK || !specOK {
 		return nil, usage("Each document requires metadata and spec objects.")
 	}
-	if _, err := managementIdentifier(metadata["name"], "resource name", 253); err != nil {
+	if err := validateName(stringAt(metadata, "name"), "resource name"); err != nil {
 		return nil, err
 	}
 	for key := range metadata {

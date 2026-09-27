@@ -1280,3 +1280,41 @@ func TestManagementApplyPartialFailureJSONThroughRun(t *testing.T) {
 		})
 	}
 }
+
+func TestApplyDeploymentNameMatchesImperativeConstraints(t *testing.T) {
+	for _, kind := range []string{"ModelDeployment", "AgentDeployment"} {
+		for _, name := range []string{"with.dot", strings.Repeat("a", 64), "1starts-with-digit", "-invalid"} {
+			resource := managementTestModel(name)
+			resource["kind"] = kind
+			h := managementTestContext("file", managementTestBatch(t, resource), "dry-run", "client")
+			managementTestError(t, h, "resource name", "apply")
+			if len(h.client.writes()) != 0 {
+				t.Fatal("invalid name submitted")
+			}
+		}
+	}
+}
+
+func TestCatalogSearchAcceptsBoundedFreeText(t *testing.T) {
+	for _, query := range []string{"large language model", "qwen & llama", "weights/quantized?sort=likes", "日本語モデル"} {
+		t.Run(query, func(t *testing.T) {
+			calls := 0
+			managementTestHTTP(t, func(r *http.Request) (*http.Response, error) {
+				calls++
+				if r.URL.Scheme != "https" || r.URL.Host != "huggingface.co" || r.URL.Path != "/api/models" || r.URL.Query().Get("search") != query || r.URL.Query().Get("limit") != "20" {
+					t.Fatalf("unsafe query URL: %s", r.URL)
+				}
+				return managementTestHTTPResponse(200, `[]`), nil
+			})
+			h := managementTestContext()
+			managementTestRun(t, h, "catalog", "model", "search", query)
+			if calls != 1 || h.connections != 0 {
+				t.Fatalf("calls=%d cluster=%d", calls, h.connections)
+			}
+		})
+	}
+	for _, query := range []string{"", "   ", strings.Repeat("q", 257), "query\nheader"} {
+		h := managementTestContext()
+		managementTestError(t, h, "search query", "catalog", "model", "search", query)
+	}
+}

@@ -3,8 +3,10 @@
 The `airunway` binary manages models and agents directly through the selected
 Kubernetes API. It does not need the dashboard to be running. Running `airunway`
 without arguments or running `airunway serve` starts the separate `airunway-web`
-executable. Keep it beside `airunway` or on `PATH` to use `serve`, `login`, and
-`logout`. Model and agent commands do not use the dashboard or Bun.
+executable. Matching version/platform-suffixed release assets work together when
+kept in the same directory, without renaming. A canonical `airunway-web` beside
+`airunway` or on `PATH` also supports `serve`, `login`, and `logout`. Model and
+agent commands do not use the dashboard or Bun.
 
 ## Build
 
@@ -287,8 +289,24 @@ with an explanation rather than a fabricated URL.
 `connect` binds loopback and stays in the foreground. Ctrl+C closes the connection,
 not the deployment. Authentication remains required by the upstream service.
 `chat` can resolve authorized agent ingress credentials internally; it never uses
-the model credential as an agent-call token. Chat requests may execute configured
-tools, so use trusted frameworks and deliberate prompts.
+the model credential as an agent-call token. The existing same-namespace agent
+workload, Service, Pod, and ingress Secret checks still apply, and these tunnels
+can use HTTP. Chat requests may execute configured tools, so use trusted
+frameworks and deliberate prompts.
+
+`model chat` and `model endpoint --check` accept `--credential NAME` to read the
+Secret's `API_KEY` in the model's namespace. Plain endpoint display never reads
+credentials; `model endpoint --credential` requires `--check`. Agent endpoint
+checks use the unauthenticated `/readyz` route, not the agent's ingress token.
+
+Direct external access requires the exact published URL in `--server`, and
+credentials require verified HTTPS. Model Gateway tunnels also require verified
+HTTPS when using `--credential`: their backends can be outside the Secret's
+namespace, and labels or owner references do not authenticate those backends.
+For an HTTP Gateway, publish an HTTPS endpoint, verify its address, and pass that
+exact URL with `--server`. Normal internal model tunnels, including
+`--gateway=false`, can still use HTTP with a credential. Unauthenticated endpoint
+checks and raw `connect` discovery are unchanged.
 
 Gateway access requires the selected HTTPRoute's matching parent to report current
 `Accepted=True` and `ResolvedRefs=True` conditions. The CLI reads the route by
@@ -366,6 +384,14 @@ keys use `API_KEY`, and artifact loaders use source-specific JSON in `credential
 CLI-managed credentials. Referenced credentials cannot be deleted through this
 command. No tokens belong in command arguments, model URLs, config files checked
 into Git, or machine-readable output.
+
+### Recovery after credential rotation
+
+Updating a credential changes its Secret contents without changing the model
+specification. A download Job that has already exhausted its retries does not
+restart automatically after that update. After fixing the credential, an
+operator must inspect and remove the failed AI Runway download Job to request a
+fresh attempt. The controller then recreates it using the current Secret.
 
 ## Files, previews, and automation
 

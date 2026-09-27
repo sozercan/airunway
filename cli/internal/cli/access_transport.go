@@ -381,6 +381,12 @@ func accessIngressToken(ctx context.Context, client ClusterClient, noun string, 
 	if c.Tunnel == nil && e.URL.Scheme != "https" {
 		return "", accessUnsupported("Credentials require verified HTTPS for direct external access. Use a cluster tunnel instead.")
 	}
+	// Gateway backends may live outside the credential's namespace. Labels and
+	// owner references do not authenticate them, even with blockOwnerDeletion:
+	// controllers can adopt label-matching pods. TLS must protect this boundary.
+	if noun == "model" && c.Tunnel != nil && flags.Text("gateway") != "false" && stringAt(resource, "status", "gateway", "gatewayName") != "" && e.URL.Scheme != "https" {
+		return "", accessUnsupported("Model credentials require verified HTTPS through Gateway tunnels; Service labels and owner references do not authenticate the backend. Publish an HTTPS endpoint, verify it, and pass its exact URL with --server.")
+	}
 	ns := accessNamespace(resource, fallback)
 	if noun == "agent" && c.Tunnel != nil {
 		root, err := accessWorkload(ctx, client, noun, resource, ns)

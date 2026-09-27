@@ -536,3 +536,24 @@ func TestModelDiscoveryFallbackPreservesCredentialChecks(t *testing.T) {
 		t.Fatal(client.calls)
 	}
 }
+
+func TestDashboardReleaseNames(t *testing.T) {
+	cases := []struct{ binary, version, platform, arch, want string }{
+		{"airunway-v1.2.3-linux-amd64", "v1.2.3", "linux", "amd64", "airunway-web-v1.2.3-linux-amd64"},
+		{"airunway-v1.2.3-windows-amd64.exe", "v1.2.3", "windows", "amd64", "airunway-web-v1.2.3-windows-amd64.exe"},
+		{"airunway", "v1.2.3", "darwin", "arm64", "airunway-web-v1.2.3-darwin-arm64"},
+		{"airunway", "dev", "linux", "amd64", "airunway-web"},
+		{"airunway", "../../other", "linux", "amd64", "airunway-web"},
+	}
+	for _, tc := range cases {
+		names := dashboardNames(tc.binary, tc.version, tc.platform, tc.arch)
+		if names[0] != tc.want {
+			t.Fatalf("%+v: %v", tc, names)
+		}
+		for _, name := range names {
+			if filepath.Base(name) != name || strings.ContainsAny(name, "/\\") {
+				t.Fatal("unsafe companion name", name)
+			}
+		}
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 )
 
 var managementModelSegment = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,95}$`)
@@ -115,9 +116,15 @@ func managementModelCatalog(words []string, ctx *CommandContext) error {
 	if err := managementArity(words, 4); err != nil {
 		return err
 	}
-	id, err := managementModelID(words[3])
-	if err != nil {
-		return err
+	id := strings.TrimSpace(strings.TrimPrefix(words[3], "hf://"))
+	if words[2] == "get" {
+		var err error
+		id, err = managementModelID(words[3])
+		if err != nil {
+			return err
+		}
+	} else if id == "" || len(id) > 256 || strings.IndexFunc(id, unicode.IsControl) >= 0 {
+		return usage("Provide a nonempty search query of at most 256 bytes without control characters.")
 	}
 	if err := managementCanceled(ctx.Context); err != nil {
 		return err

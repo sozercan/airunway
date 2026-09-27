@@ -14,7 +14,7 @@ Models:
   model update NAME [--replicas N] [--context-length N] [--gpus N] [--memory SIZE]
   model delete NAME [--wait=false]
   model wait NAME --for ready [--timeout 20m]
-  model endpoint NAME [--check]
+  model endpoint NAME [--check [--credential NAME]]
   model connect NAME [--port 8000]
   model chat NAME [--message TEXT | --message-file FILE|-]
   model logs NAME [--follow] [--tail N] [--pod NAME] [--container NAME]

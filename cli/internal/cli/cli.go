@@ -305,7 +305,7 @@ func runResource(words []string, c *CommandContext, config *CLIConfig, localPrev
 		return err
 	}
 	allowed := map[string][]string{
-		"get": {}, "create": createOptions, "update": {}, "delete": {"wait"}, "wait": {"for"}, "endpoint": {"check", "gateway", "gateway-listener", "server"}, "connect": {"port", "gateway", "gateway-listener"}, "chat": {"message", "message-file", "temperature", "max-tokens", "gateway", "gateway-listener", "server", "credential"}, "logs": {"follow", "tail", "pod", "container", "timestamps"}, "events": {},
+		"get": {}, "create": createOptions, "update": {}, "delete": {"wait"}, "wait": {"for"}, "endpoint": {"check", "gateway", "gateway-listener", "server", "credential"}, "connect": {"port", "gateway", "gateway-listener"}, "chat": {"message", "message-file", "temperature", "max-tokens", "gateway", "gateway-listener", "server", "credential"}, "logs": {"follow", "tail", "pod", "container", "timestamps"}, "events": {},
 	}
 	for _, key := range createOptions {
 		if key != "preset" {
@@ -646,16 +646,9 @@ func runDashboard(ctx context.Context, words []string, flags Flags, streams *IO)
 	if err != nil {
 		return cliError(1, "DASHBOARD", "Cannot locate the dashboard executable.")
 	}
-	name := "airunway-web"
-	if runtime.GOOS == "windows" {
-		name += ".exe"
-	}
-	path := filepath.Join(filepath.Dir(exe), name)
-	if _, err := os.Stat(path); err != nil {
-		path, err = exec.LookPath(name)
-		if err != nil {
-			return cliError(1, "DASHBOARD", "The dashboard is a separate executable. Run make compile to build airunway and airunway-web, or use airunway --help for CLI commands.")
-		}
+	path, err := findDashboard(exe)
+	if err != nil {
+		return err
 	}
 	args := []string{command}
 	for _, key := range []string{"server", "context"} {
@@ -675,4 +668,42 @@ func runDashboard(ctx context.Context, words []string, flags Flags, streams *IO)
 		return cliError(1, "DASHBOARD", "Cannot start the dashboard executable.")
 	}
 	return nil
+}
+
+// Prefer the matching release companion without requiring either asset to be
+// renamed. Canonical installations and PATH remain supported.
+func dashboardNames(executable, version, platform, arch string) []string {
+	extension := ""
+	if platform == "windows" {
+		extension = ".exe"
+	}
+	canonical := "airunway-web" + extension
+	names := []string{}
+	base := filepath.Base(executable)
+	if strings.HasPrefix(base, "airunway-") && !strings.HasPrefix(base, "airunway-web") {
+		names = append(names, "airunway-web-"+strings.TrimPrefix(base, "airunway-"))
+	}
+	if version != "" && version != "dev" && !strings.ContainsAny(version, "/\\") {
+		names = append(names, "airunway-web-"+version+"-"+platform+"-"+arch+extension)
+	}
+	return append(names, canonical)
+}
+
+func findDashboard(executable string) (string, error) {
+	current, _ := os.Stat(executable)
+	usable := func(path string) bool {
+		info, err := os.Stat(path)
+		return err == nil && info.Mode().IsRegular() && (current == nil || !os.SameFile(current, info))
+	}
+	names := dashboardNames(executable, Version, runtime.GOOS, runtime.GOARCH)
+	for _, name := range names {
+		path := filepath.Join(filepath.Dir(executable), name)
+		if usable(path) {
+			return path, nil
+		}
+	}
+	if path, err := exec.LookPath(names[len(names)-1]); err == nil && usable(path) {
+		return path, nil
+	}
+	return "", cliError(1, "DASHBOARD", "The dashboard is a separate executable. Keep the matching CLI and dashboard release assets together, run make compile, or use airunway --help for CLI commands.")
 }
