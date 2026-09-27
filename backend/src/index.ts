@@ -1,6 +1,4 @@
-import app from './hono-app';
 import logger from './lib/logger';
-import { authService } from './services/auth';
 
 const PORT = process.env.PORT || 3001;
 
@@ -8,6 +6,7 @@ const PORT = process.env.PORT || 3001;
  * CLI command handlers
  */
 async function handleLogin(args: string[]): Promise<void> {
+  const { authService } = await import('./services/auth');
   // Parse arguments
   let serverUrl = `http://localhost:${PORT}`;
   let contextName: string | undefined;
@@ -64,40 +63,15 @@ async function handleLogin(args: string[]): Promise<void> {
   }
 }
 
-function handleLogout(): void {
+async function handleLogout(): Promise<void> {
+  const { authService } = await import('./services/auth');
   authService.clearCredentials();
   console.log('✅ Logged out. Credentials cleared.');
 }
 
-function handleVersion(): void {
-  console.log('AI Runway v1.0.0');
-}
-
-function printUsage(): void {
-  console.log(`
-AI Runway - ML Model Deployment Platform
-
-Usage: airunway <command> [options]
-
-Commands:
-  serve              Start the AI Runway server (default)
-  login              Authenticate using kubeconfig credentials
-  logout             Clear stored credentials
-  version            Show version information
-
-Login Options:
-  --server, -s       Server URL (default: http://localhost:${PORT})
-  --context, -c      Kubeconfig context to use (default: current context)
-
-Examples:
-  airunway                         # Start server
-  airunway serve                   # Start server
-  airunway login                   # Login with current context
-  airunway login --context myaks   # Login with specific context
-`);
-}
-
 async function startServer(): Promise<void> {
+  const { default: app } = await import('./hono-app');
+  const { authService } = await import('./services/auth');
   const server = Bun.serve({
     port: Number(PORT),
     fetch: app.fetch,
@@ -119,6 +93,16 @@ async function startServer(): Promise<void> {
 // Main CLI entry point
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
+  const { isCLICommand, runCLI } = await import('./cli');
+  if (isCLICommand(args)) {
+    const controller = new AbortController();
+    const interrupt = () => controller.abort();
+    process.once('SIGINT', interrupt);
+    process.once('SIGTERM', interrupt);
+    try { process.exitCode = await runCLI(args, { signal: controller.signal }); }
+    finally { process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', interrupt); }
+    return;
+  }
   const command = args[0] || 'serve';
 
   switch (command) {
@@ -129,27 +113,9 @@ async function main(): Promise<void> {
       await handleLogin(args.slice(1));
       break;
     case 'logout':
-      handleLogout();
+      await handleLogout();
       break;
-    case 'version':
-    case '--version':
-    case '-v':
-      handleVersion();
-      break;
-    case 'help':
-    case '--help':
-    case '-h':
-      printUsage();
-      break;
-    default:
-      // If no recognized command, assume it's serve
-      if (command.startsWith('-')) {
-        await startServer();
-      } else {
-        console.error(`Unknown command: ${command}`);
-        printUsage();
-        process.exit(1);
-      }
+
   }
 }
 

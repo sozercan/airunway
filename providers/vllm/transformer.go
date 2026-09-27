@@ -86,6 +86,9 @@ func NewTransformer() *Transformer {
 // Disaggregated mode returns [decode Deployment, prefill Deployment, decode Service, prefill Service].
 // resources[0] is always the primary resource used for status tracking.
 func (t *Transformer) Transform(ctx context.Context, md *airunwayv1alpha1.ModelDeployment) ([]*unstructured.Unstructured, error) {
+	if err := md.Spec.ValidateArtifact(); err != nil {
+		return nil, err
+	}
 	if md.ResolvedEngineType() != airunwayv1alpha1.EngineTypeVLLM {
 		return nil, fmt.Errorf("vLLM provider only supports vllm engine, got %s", md.ResolvedEngineType())
 	}
@@ -699,14 +702,15 @@ func (t *Transformer) buildResourceLimits(spec *airunwayv1alpha1.ResourceSpec) m
 	return result
 }
 
-// buildEnvVars constructs environment variables including HF_TOKEN from secrets.
+// buildEnvVars constructs serving environment variables. Artifact credentials
+// belong only to the download Job; the serving process reads local files.
 func (t *Transformer) buildEnvVars(md *airunwayv1alpha1.ModelDeployment) []interface{} {
 	var envVars []interface{}
 
 	// When a HuggingFace token secret is configured we inject HF_TOKEN from it
 	// below; drop any user-supplied HF_TOKEN so the pod does not carry two
 	// same-named env entries (Kubernetes silently keeps the last one).
-	injectHFToken := md.Spec.Secrets != nil && md.Spec.Secrets.HuggingFaceToken != ""
+	injectHFToken := md.Spec.Model.Artifact == nil && md.Spec.Secrets != nil && md.Spec.Secrets.HuggingFaceToken != ""
 
 	// Add user-specified env vars
 	for _, e := range md.Spec.Env {

@@ -11,7 +11,7 @@ const sidebars = {
       type: 'category',
       label: 'Getting Started',
       collapsed: false,
-      items: ['architecture', 'development'],
+      items: ['architecture', 'cli', 'development'],
     },
     {
       type: 'category',

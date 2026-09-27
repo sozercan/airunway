@@ -66,7 +66,9 @@ func SetupModelDeploymentWebhookWithManager(mgr ctrl.Manager) error {
 			// Reader returns NotFound, to disambiguate "truly absent" from
 			// "informer hasn't yet observed a freshly-created provider".
 			// In steady state it is never called.
-			APIReader: mgr.GetAPIReader(),
+			APIReader:         mgr.GetAPIReader(),
+			SecretAccess:      &sarReviewer{client: mgr.GetClient()},
+			ArtifactPodAccess: &artifactPodSARReviewer{client: mgr.GetClient()},
 		}).
 		WithDefaulter(&ModelDeploymentCustomDefaulter{}).
 		Complete()
@@ -180,6 +182,10 @@ func (d *ModelDeploymentCustomDefaulter) Default(_ context.Context, obj *airunwa
 // ModelDeploymentCustomValidator struct is responsible for validating the ModelDeployment resource
 // when it is created, updated, or deleted.
 type ModelDeploymentCustomValidator struct {
+	// Artifact privileges are checked against the admission caller on every edit.
+	SecretAccess      SecretAccessReviewer
+	ArtifactPodAccess ArtifactPodAccessReviewer
+
 	// Reader is used to look up InferenceProviderConfig resources for
 	// provider compatibility validation at admission time. In production
 	// this is the manager's cached client so admission does not synchronously
@@ -213,6 +219,7 @@ func (v *ModelDeploymentCustomValidator) ValidateCreate(ctx context.Context, obj
 	specWarnings, specErrs := v.validateSpec(ctx, obj)
 	warnings = append(warnings, specWarnings...)
 	allErrs = append(allErrs, specErrs...)
+	allErrs = append(allErrs, v.validateArtifactAccess(ctx, obj)...)
 
 	// Check for warnings
 	warnings = append(warnings, v.checkWarnings(obj)...)
@@ -234,6 +241,9 @@ func (v *ModelDeploymentCustomValidator) ValidateUpdate(ctx context.Context, old
 	specWarnings, specErrs := v.validateSpec(ctx, newObj)
 	warnings = append(warnings, specWarnings...)
 	allErrs = append(allErrs, specErrs...)
+	if !artifactBookkeepingOnly(oldObj, newObj) {
+		allErrs = append(allErrs, v.validateArtifactAccess(ctx, newObj)...)
+	}
 
 	// Validate immutable fields (identity fields that trigger delete+recreate)
 	allErrs = append(allErrs, v.validateImmutableFields(oldObj, newObj)...)
@@ -282,6 +292,10 @@ func (v *ModelDeploymentCustomValidator) validateSpec(ctx context.Context, obj *
 			spec.Engine.ExtraArgs,
 			err.Error(),
 		))
+	}
+
+	if err := spec.ValidateArtifact(); err != nil {
+		allErrs = append(allErrs, field.Forbidden(specPath.Child("model", "artifact"), err.Error()))
 	}
 
 	// Validate model.id is required for huggingface source
@@ -530,6 +544,10 @@ func (v *ModelDeploymentCustomValidator) validateImmutableFields(oldObj, newObj 
 	oldSpec := &oldObj.Spec
 	newSpec := &newObj.Spec
 
+	if err := newSpec.ValidateArtifactUpdate(oldSpec); err != nil {
+		allErrs = append(allErrs, field.Forbidden(specPath.Child("model", "artifact"), err.Error()))
+	}
+
 	// model.id is an identity field
 	if oldSpec.Model.ID != newSpec.Model.ID {
 		allErrs = append(allErrs, field.Invalid(
@@ -699,7 +717,7 @@ func (v *ModelDeploymentCustomValidator) checkWarnings(obj *airunwayv1alpha1.Mod
 	spec := &obj.Spec
 
 	// Warn if servedName is specified with custom source
-	if spec.Model.Source == airunwayv1alpha1.ModelSourceCustom && spec.Model.ServedName != "" {
+	if spec.Model.Source == airunwayv1alpha1.ModelSourceCustom && spec.Model.Artifact == nil && spec.Model.ServedName != "" {
 		warnings = append(warnings, "servedName is ignored for custom source (model name is defined by the container)")
 	}
 

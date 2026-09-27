@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,6 +41,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	airunwayv1alpha1 "github.com/ai-runway/airunway/controller/api/v1alpha1"
+	"github.com/ai-runway/airunway/controller/pkg/storage"
 )
 
 const (
@@ -249,6 +251,9 @@ func NewVLLMProviderReconciler(c client.Client, scheme *runtime.Scheme) *VLLMPro
 // +kubebuilder:rbac:groups=apps,resources=deployments/status,verbs=get
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
+
 // Reconcile handles the reconciliation loop for ModelDeployments assigned to the vLLM provider
 func (r *VLLMProviderReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -320,6 +325,12 @@ func (r *VLLMProviderReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		md.Status.Phase = airunwayv1alpha1.DeploymentPhaseFailed
 		md.Status.Message = fmt.Sprintf("Failed to generate vLLM resources: %s", err.Error())
 		return ctrl.Result{}, r.Status().Update(ctx, &md)
+	}
+
+	// Validate and render first, but do not start serving until storage and model
+	// downloads are ready. The download Job is the first consumer for delayed PVC binding.
+	if ready, result, storageErr := r.reconcileStorage(ctx, &md); !ready || storageErr != nil {
+		return result, storageErr
 	}
 
 	// Status may be preserved after an ambiguous update failure only when every required
@@ -453,7 +464,75 @@ func (r *VLLMProviderReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return ctrl.Result{RequeueAfter: RequeueInterval}, nil
 }
 
-// validateCompatibility checks if the ModelDeployment configuration is compatible with vLLM
+// reconcileStorage shares the PVC and download lifecycle used by other model providers.
+func (r *VLLMProviderReconciler) reconcileStorage(
+	ctx context.Context, md *airunwayv1alpha1.ModelDeployment,
+) (bool, ctrl.Result, error) {
+	if !storage.HasStorageVolumes(md) {
+		return true, ctrl.Result{}, nil
+	}
+	before := md.DeepCopy()
+	ready, err := storage.EnsurePVCs(ctx, r.Client, md)
+	if err != nil {
+		return r.storagePending(
+			ctx, md, before, airunwayv1alpha1.ConditionTypeStorageReady,
+			"StorageFailed", "Cannot prepare model storage. Check the referenced volumes and provider permissions.", true,
+		)
+	}
+	if !ready {
+		return r.storagePending(
+			ctx, md, before, airunwayv1alpha1.ConditionTypeStorageReady,
+			"StoragePending", "Waiting for model storage to become usable.", false,
+		)
+	}
+	r.setCondition(
+		md, airunwayv1alpha1.ConditionTypeStorageReady, metav1.ConditionTrue, "StorageAvailable",
+		"Model storage is available for consumers.",
+	)
+	if storage.NeedsDownloadJob(md) {
+		complete, downloadErr := storage.EnsureDownloadJob(ctx, r.Client, md, storage.DefaultDownloadJobImage)
+		if downloadErr != nil {
+			return r.storagePending(
+				ctx, md, before, airunwayv1alpha1.ConditionTypeModelDownloaded,
+				"DownloadFailed", "Model download failed. Inspect the download Job and its credentials.", true,
+			)
+		}
+		if !complete {
+			return r.storagePending(
+				ctx, md, before, airunwayv1alpha1.ConditionTypeModelDownloaded,
+				"DownloadInProgress", "Model download is in progress.", false,
+			)
+		}
+		r.setCondition(
+			md, airunwayv1alpha1.ConditionTypeModelDownloaded, metav1.ConditionTrue, "DownloadComplete",
+			"Model download completed.",
+		)
+	}
+	return true, ctrl.Result{}, nil
+}
+
+func (r *VLLMProviderReconciler) storagePending(
+	ctx context.Context, md, before *airunwayv1alpha1.ModelDeployment,
+	condition, reason, message string, failed bool,
+) (bool, ctrl.Result, error) {
+	r.setCondition(md, condition, metav1.ConditionFalse, reason, message)
+	r.setCondition(md, airunwayv1alpha1.ConditionTypeReady, metav1.ConditionFalse, reason, message)
+	md.Status.Endpoint = nil
+	md.Status.Replicas = nil
+	md.Status.Phase = airunwayv1alpha1.DeploymentPhasePending
+	if failed {
+		md.Status.Phase = airunwayv1alpha1.DeploymentPhaseFailed
+	}
+	md.Status.Message = message
+	if !equality.Semantic.DeepEqual(before.Status, md.Status) {
+		if err := r.Status().Update(ctx, md); err != nil {
+			return false, ctrl.Result{}, err
+		}
+	}
+	return false, ctrl.Result{RequeueAfter: RequeueInterval}, nil
+}
+
+// validateCompatibility checks if the ModelDeployment configuration is compatible with vLLM.
 func (r *VLLMProviderReconciler) validateCompatibility(md *airunwayv1alpha1.ModelDeployment) error {
 	// vLLM only supports vLLM
 	if md.ResolvedEngineType() != airunwayv1alpha1.EngineTypeVLLM {

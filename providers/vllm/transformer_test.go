@@ -1419,3 +1419,49 @@ func TestTransformMountsModelStorageVolumes(t *testing.T) {
 		t.Errorf("expected claimName shared-model-cache, got %v", pvc["claimName"])
 	}
 }
+
+func TestTransformArtifactPreservesLocalModelPath(t *testing.T) {
+	md := newTestMD("artifact-model", "default")
+	md.Spec.Provider = &airunwayv1alpha1.ProviderSpec{Name: "vllm"}
+	md.Spec.Model.Source = airunwayv1alpha1.ModelSourceCustom
+	md.Spec.Model.ID = "/model-cache/artifacts/quant/model.gguf"
+	md.Spec.Model.ServedName = "my-model"
+	md.Spec.Secrets = &airunwayv1alpha1.SecretsSpec{HuggingFaceToken: "download-only"}
+	md.Spec.Model.Artifact = &airunwayv1alpha1.ModelArtifactSpec{URI: "hf://org/model", File: "quant/model.gguf"}
+	md.Spec.Model.Storage = &airunwayv1alpha1.StorageSpec{Volumes: []airunwayv1alpha1.StorageVolume{{Name: "weights", ClaimName: "weights", Purpose: airunwayv1alpha1.VolumePurposeModelCache}}}
+	resources, err := NewTransformer().Transform(context.Background(), md)
+	if err != nil {
+		t.Fatal(err)
+	}
+	containers, _, _ := unstructured.NestedSlice(resources[0].Object, "spec", "template", "spec", "containers")
+	var container corev1.Container
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(containers[0].(map[string]any), &container); err != nil {
+		t.Fatal(err)
+	}
+	for flag, want := range map[string]string{
+		"--model":             md.Spec.Model.ID,
+		"--served-model-name": md.Spec.Model.ServedName,
+	} {
+		if got, found := argValue(container.Args, flag); !found || got != want {
+			t.Fatalf("%s = %q, want %q", flag, got, want)
+		}
+	}
+	for _, env := range container.Env {
+		if env.Name == "HF_TOKEN" {
+			t.Fatal("download-only HF credential reached serving container")
+		}
+	}
+	foundMount := false
+	for _, mount := range container.VolumeMounts {
+		if mount.MountPath == "/model-cache" {
+			foundMount = true
+		}
+	}
+	if !foundMount {
+		t.Fatal("artifact cache was not mounted")
+	}
+	md.Spec.Model.Storage.Volumes[0].ReadOnly = true
+	if _, err := NewTransformer().Transform(context.Background(), md); err == nil {
+		t.Fatal("invalid artifact contract was accepted")
+	}
+}

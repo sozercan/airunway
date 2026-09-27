@@ -1,5 +1,7 @@
 # Development Guide
 
+For deployment commands, see the [command-line guide](cli.md). The existing single-binary build includes the CLI and dashboard.
+
 ## Prerequisites
 
 - [Go](https://go.dev) 1.23+ (for controller development)

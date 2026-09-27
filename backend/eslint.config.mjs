@@ -7,7 +7,7 @@ import tseslint from '@typescript-eslint/eslint-plugin'
 
 export default [
   // Build artifacts, compiled binaries, and generated output are never linted.
-  { ignores: ['dist/**', 'build/**', 'coverage/**'] },
+  { ignores: ['dist/**', 'build/**', 'coverage/**', 'src/embedded-assets.ts'] },
 
   // typescript-eslint's recommended flat config wires up the TS parser, the
   // `@typescript-eslint` plugin, and a sensible rule set. It also turns off

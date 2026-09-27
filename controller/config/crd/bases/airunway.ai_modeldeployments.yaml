@@ -300,6 +300,62 @@ spec:
               model:
                 description: model defines the model specification
                 properties:
+                  artifact:
+                    description: artifact stages model files before serving. Requires
+                      source=custom and provider=vllm.
+                    properties:
+                      credentialsRef:
+                        description: |-
+                          credentialsRef selects JSON credentials. When omitted, SDK default credentials
+                          or anonymous access are used. Credentials are only passed to the download Job.
+                        properties:
+                          key:
+                            default: credentials
+                            description: |-
+                              key contains source-specific JSON credentials, not environment variable names.
+                              Defaults to credentials. For HF_TOKEN secrets use secrets.huggingFaceToken instead.
+                            type: string
+                          name:
+                            description: name is the Secret in the ModelDeployment
+                              namespace.
+                            minLength: 1
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      file:
+                        description: file selects a relative file within HF/S3/GCS/OCI,
+                          or names the HTTPS output file.
+                        maxLength: 1024
+                        type: string
+                      image:
+                        description: image overrides the model-downloader image; it
+                          must implement the artifact command.
+                        maxLength: 512
+                        type: string
+                      revision:
+                        description: revision selects an HF branch, tag, or commit.
+                          Other schemes encode identity in uri.
+                        maxLength: 256
+                        type: string
+                      serviceAccountName:
+                        description: |-
+                          serviceAccountName selects a preconfigured workload identity for the download Job.
+                          No service account or cloud identity is created by AI Runway.
+                        type: string
+                      uri:
+                        description: |-
+                          uri is an hf://, s3://, gs://, https://, or oci:// source without inline credentials.
+                          OCI sources require an explicit tag or sha256 digest.
+                        maxLength: 4096
+                        minLength: 1
+                        type: string
+                    required:
+                    - uri
+                    type: object
+                    x-kubernetes-validations:
+                    - message: artifact is immutable; delete and recreate the deployment
+                      rule: self == oldSelf
                   id:
                     description: |-
                       id is the model identifier (e.g., HuggingFace model ID)
@@ -399,6 +455,10 @@ spec:
                         x-kubernetes-list-type: map
                     type: object
                 type: object
+                x-kubernetes-validations:
+                - message: artifact cannot be added or removed; delete and recreate
+                    the deployment
+                  rule: has(self.artifact) == has(oldSelf.artifact)
               nodeSelector:
                 additionalProperties:
                   type: string

@@ -9,6 +9,8 @@ Deploy and manage large language models on Kubernetes — no YAML required.
 
 AI Runway gives you a web UI and a unified Kubernetes CRD (`ModelDeployment`) to deploy models across multiple inference providers. Browse [HuggingFace](https://huggingface.co/), pick a model, click deploy.
 
+See the [command-line guide](docs/cli.md) to manage models and agents without the dashboard.
+
 ## Demo
 
 [![AI Runway Demo](https://img.youtube.com/vi/Pe0sLv7v2FM/maxresdefault.jpg)](https://youtu.be/Pe0sLv7v2FM)

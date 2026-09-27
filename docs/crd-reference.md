@@ -87,6 +87,27 @@ spec:
       trust-remote-code: ""
 ```
 
+### spec.model.artifact
+
+Stages remote model files before Direct vLLM starts. Requires `source: custom`,
+`provider.name: vllm`, and one writable `modelCache` volume. `model.id` must point
+at the staged directory or selected file within `<mountPath>/artifacts`.
+The source and download settings are immutable after creation.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `uri` | string | yes | `hf://`, `s3://`, `gs://`, `https://`, or `oci://` source. No inline credentials, signed query strings, or traversal paths. OCI requires a tag or SHA-256 digest. |
+| `revision` | string | no | Hugging Face branch, tag, or commit. |
+| `file` | string | no | Relative file selector, or output filename for HTTPS. |
+| `credentialsRef` | object | no | Namespace-local Secret `name` and optional `key`, defaulting to `credentials`, containing source-specific JSON. |
+| `image` | string | no | Downloader image implementing the `artifact` command. |
+| `serviceAccountName` | string | no | Existing download-job service account for workload identity. |
+
+The caller must be allowed to read referenced credentials. Selecting a custom
+downloader image or service account also requires permission to create Pods. Download credentials are not passed to the serving
+container. Configure cloud access separately. See the [CLI source and credential
+examples](cli.md#source-references-and-artifacts) for supported credential formats.
+
 ### spec.model.storage.volumes[]
 
 Each entry is a `StorageVolume`. Maximum 8 volumes per deployment.

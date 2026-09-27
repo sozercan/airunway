@@ -19,6 +19,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	airunwayv1alpha1 "github.com/ai-runway/airunway/controller/api/v1alpha1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -56,6 +57,9 @@ const (
 // - A volume with purpose=modelCache exists
 // - The modelCache volume is not readOnly (readOnly implies pre-populated data)
 func NeedsDownloadJob(md *airunwayv1alpha1.ModelDeployment) bool {
+	if md.Spec.Model.Artifact != nil {
+		return md.Spec.ValidateArtifact() == nil
+	}
 	if md.Spec.Model.Source != airunwayv1alpha1.ModelSourceHuggingFace {
 		return false
 	}
@@ -100,7 +104,18 @@ func deleteStaleJob(ctx context.Context, c client.Client, job *batchv1.Job) erro
 
 // EnsureDownloadJob ensures a model download Job exists and tracks its completion.
 // Returns completed=true when the Job has succeeded.
-func EnsureDownloadJob(ctx context.Context, c client.Client, md *airunwayv1alpha1.ModelDeployment, downloadJobImage string) (bool, error) {
+func EnsureDownloadJob(
+	ctx context.Context, c client.Client, md *airunwayv1alpha1.ModelDeployment, downloadJobImage string,
+) (bool, error) {
+	if err := md.Spec.ValidateArtifact(); err != nil {
+		return false, err
+	}
+	return ensureDownloadJob(ctx, c, md, downloadJobImage)
+}
+
+func ensureDownloadJob(
+	ctx context.Context, c client.Client, md *airunwayv1alpha1.ModelDeployment, downloadJobImage string,
+) (bool, error) {
 	logger := log.FromContext(ctx)
 
 	vol := findModelCacheVolume(md)
@@ -180,7 +195,8 @@ func EnsureDownloadJob(ctx context.Context, c client.Client, md *airunwayv1alpha
 	return false, nil
 }
 
-// buildDownloadJob creates a batch Job that downloads a HuggingFace model.
+// buildDownloadJob preserves the legacy HF CLI invocation and dispatches staged
+// artifacts through the downloader image's artifact command.
 func buildDownloadJob(md *airunwayv1alpha1.ModelDeployment, vol *airunwayv1alpha1.StorageVolume, downloadJobImage string) *batchv1.Job {
 	claimName := vol.ResolvedClaimName(md.Name)
 	backoffLimit := defaultBackoffLimit
@@ -257,6 +273,54 @@ func buildDownloadJob(md *airunwayv1alpha1.ModelDeployment, vol *airunwayv1alpha
 				},
 			},
 		},
+	}
+
+	if a := md.Spec.Model.Artifact; a != nil {
+		artifactPath := md.Spec.ArtifactPath()
+		pod := &job.Spec.Template.Spec
+		container := &pod.Containers[0]
+		container.Args = []string{"artifact"}
+		container.Env = []corev1.EnvVar{
+			{Name: "ARTIFACT_URI", Value: a.URI},
+			{Name: "ARTIFACT_REVISION", Value: a.Revision},
+			{Name: "ARTIFACT_FILE", Value: a.File},
+			{Name: "ARTIFACT_DESTINATION", Value: artifactPath},
+		}
+		container.VolumeMounts[0].MountPath = strings.TrimSuffix(artifactPath, "/"+airunwayv1alpha1.ArtifactDirectory)
+		if a.Image != "" {
+			container.Image = a.Image
+		}
+		if a.CredentialsRef != nil {
+			key := a.CredentialsRef.Key
+			if key == "" {
+				key = "credentials"
+			}
+			container.Env = append(container.Env, corev1.EnvVar{
+				Name: "ARTIFACT_CREDENTIALS_JSON",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: a.CredentialsRef.Name}, Key: key,
+				}},
+			})
+		}
+		if strings.HasPrefix(a.URI, "hf://") && md.Spec.Secrets != nil && md.Spec.Secrets.HuggingFaceToken != "" {
+			container.Env = append(container.Env, corev1.EnvVar{
+				Name: "HF_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: md.Spec.Secrets.HuggingFaceToken}, Key: "HF_TOKEN",
+				}},
+			})
+		}
+		pod.ServiceAccountName = a.ServiceAccountName
+		pod.AutomountServiceAccountToken = boolPtr(false)
+		if a.ServiceAccountName != "" {
+			// Identity admission may inject a projected token for the selected account.
+			// AWS/GCP can also use the service account's existing identity binding.
+			pod.AutomountServiceAccountToken = boolPtr(true)
+			container.Env = append(container.Env, corev1.EnvVar{Name: "ARTIFACT_WORKLOAD_IDENTITY", Value: "true"})
+			job.Spec.Template.Labels = map[string]string{"azure.workload.identity/use": "true"}
+		}
+		deadline := int64(24 * 60 * 60)
+		job.Spec.ActiveDeadlineSeconds = &deadline
+		return job
 	}
 
 	// Add HuggingFace token secret if configured

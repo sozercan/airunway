@@ -814,3 +814,83 @@ func TestIsOwnedByMD(t *testing.T) {
 		})
 	}
 }
+
+func artifactDownloadMD() *airunwayv1alpha1.ModelDeployment {
+	md := newDownloadMD("artifact-model", "default")
+	md.Spec.Model.Source = airunwayv1alpha1.ModelSourceCustom
+	md.Spec.Model.ID = "/model-cache/artifacts"
+	md.Spec.Provider = &airunwayv1alpha1.ProviderSpec{Name: "vllm"}
+	md.Spec.Model.Artifact = &airunwayv1alpha1.ModelArtifactSpec{URI: "s3://bucket/prefix", CredentialsRef: &airunwayv1alpha1.ArtifactCredentialsRef{Name: "artifact-auth"}, Image: "example.com/downloader:v1", ServiceAccountName: "model-reader"}
+	return md
+}
+
+func TestArtifactDownloadJob(t *testing.T) {
+	md := artifactDownloadMD()
+	if !NeedsDownloadJob(md) {
+		t.Fatal("artifact download was skipped")
+	}
+	job := buildDownloadJob(md, findModelCacheVolume(md), DefaultDownloadJobImage)
+	pod := job.Spec.Template.Spec
+	container := pod.Containers[0]
+	if container.Image != md.Spec.Model.Artifact.Image || len(container.Args) != 1 || container.Args[0] != "artifact" {
+		t.Fatal("wrong artifact invocation", container.Args)
+	}
+	if pod.ServiceAccountName != "model-reader" || job.Spec.Template.Labels["azure.workload.identity/use"] != "true" || job.Spec.ActiveDeadlineSeconds == nil {
+		t.Fatal("missing identity/deadline")
+	}
+	if len(container.EnvFrom) != 0 {
+		t.Fatal("must not inject entire Secret")
+	}
+	found := false
+	for _, env := range container.Env {
+		if env.Name == "ARTIFACT_CREDENTIALS_JSON" {
+			found = true
+			if env.Value != "" || env.ValueFrom.SecretKeyRef.Name != "artifact-auth" || env.ValueFrom.SecretKeyRef.Key != "credentials" {
+				t.Fatal("wrong Secret selector")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("missing credentials")
+	}
+}
+
+func TestArtifactDownloadJobRejectsInvalidSpec(t *testing.T) {
+	md := artifactDownloadMD()
+	for _, mutate := range []func(*airunwayv1alpha1.ModelDeployment){
+		func(m *airunwayv1alpha1.ModelDeployment) { m.Spec.Model.Storage = nil },
+		func(m *airunwayv1alpha1.ModelDeployment) { m.Spec.Model.Storage.Volumes[0].ReadOnly = true },
+		func(m *airunwayv1alpha1.ModelDeployment) { m.Spec.Provider = nil },
+	} {
+		bad := md.DeepCopy()
+		mutate(bad)
+		if NeedsDownloadJob(bad) {
+			t.Fatal("invalid cache/provider accepted")
+		}
+		scheme := newScheme()
+		_ = batchv1.AddToScheme(scheme)
+		if _, err := EnsureDownloadJob(context.Background(), fake.NewClientBuilder().WithScheme(scheme).Build(), bad, DefaultDownloadJobImage); err == nil {
+			t.Fatal("bypassed artifact validation")
+		}
+	}
+}
+
+func TestStagedHFDownloadJob(t *testing.T) {
+	md := artifactDownloadMD()
+	md.Spec.Model.Artifact = &airunwayv1alpha1.ModelArtifactSpec{URI: "hf://org/model", Revision: "v1", File: "weights/model.gguf"}
+	md.Spec.Secrets = &airunwayv1alpha1.SecretsSpec{HuggingFaceToken: "hf-auth"}
+	job := buildDownloadJob(md, findModelCacheVolume(md), DefaultDownloadJobImage)
+	pod := job.Spec.Template.Spec
+	if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
+		t.Fatal("unneeded API token mounted")
+	}
+	for _, env := range pod.Containers[0].Env {
+		if env.Name == "HF_TOKEN" {
+			if env.ValueFrom.SecretKeyRef.Key != "HF_TOKEN" || env.ValueFrom.SecretKeyRef.Name != "hf-auth" {
+				t.Fatal("incorrect HF selector")
+			}
+			return
+		}
+	}
+	t.Fatal("HF token missing")
+}
