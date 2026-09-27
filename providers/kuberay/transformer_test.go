@@ -577,7 +577,11 @@ func TestTransformAggregatedReplicaIntent(t *testing.T) {
 				t.Fatal(err)
 			}
 			serveConfig, found, err := unstructured.NestedString(resources[0].Object, "spec", "serveConfigV2")
-			if err != nil || !found || !strings.Contains(serveConfig, fmt.Sprintf("num_replicas: %d\n", tt.want)) {
+			wantConfig := fmt.Sprintf("num_replicas: %d\n", tt.want)
+			if tt.want == 0 {
+				wantConfig = "applications: []\n"
+			}
+			if err != nil || !found || !strings.Contains(serveConfig, wantConfig) {
 				t.Fatalf("Serve replicas must be %d: %q, found=%v, err=%v", tt.want, serveConfig, found, err)
 			}
 			assertWorkerReplicaBounds(t, resources[0], tt.want)
