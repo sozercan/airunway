@@ -168,6 +168,7 @@ spec:
       - args:
         - --leader-elect
         - --health-probe-bind-address=:8081
+        - --download-job-image=ghcr.io/ai-runway/airunway/model-downloader:latest
         command:
         - /provider
         image: ghcr.io/ai-runway/airunway/vllm-provider:latest

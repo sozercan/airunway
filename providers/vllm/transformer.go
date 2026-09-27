@@ -706,6 +706,7 @@ func (t *Transformer) buildResourceLimits(spec *airunwayv1alpha1.ResourceSpec) m
 // belong only to the download Job; the serving process reads local files.
 func (t *Transformer) buildEnvVars(md *airunwayv1alpha1.ModelDeployment) []interface{} {
 	var envVars []interface{}
+	hasHFHome := false
 
 	// When a HuggingFace token secret is configured we inject HF_TOKEN from it
 	// below; drop any user-supplied HF_TOKEN so the pod does not carry two
@@ -714,6 +715,9 @@ func (t *Transformer) buildEnvVars(md *airunwayv1alpha1.ModelDeployment) []inter
 
 	// Add user-specified env vars
 	for _, e := range md.Spec.Env {
+		if e.Name == "HF_HOME" {
+			hasHFHome = true
+		}
 		if injectHFToken && e.Name == "HF_TOKEN" {
 			continue
 		}
@@ -742,6 +746,19 @@ func (t *Transformer) buildEnvVars(md *airunwayv1alpha1.ModelDeployment) []inter
 				},
 			},
 		})
+	}
+
+	// Use the same HF cache as the download Job, including pre-populated read-only
+	// caches. Local artifacts do not use HF's cache layout; explicit env wins.
+	if !hasHFHome && md.Spec.Model.Artifact == nil && md.Spec.Model.Source == airunwayv1alpha1.ModelSourceHuggingFace && md.Spec.Model.Storage != nil {
+		for _, vol := range md.Spec.Model.Storage.Volumes {
+			if vol.Purpose == airunwayv1alpha1.VolumePurposeModelCache {
+				envVars = append(envVars, map[string]interface{}{
+					"name": "HF_HOME", "value": storageVolumeMountPath(vol),
+				})
+				break
+			}
+		}
 	}
 
 	return envVars

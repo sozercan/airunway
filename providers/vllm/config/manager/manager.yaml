@@ -33,6 +33,7 @@ spec:
         args:
         - --leader-elect
         - --health-probe-bind-address=:8081
+        - --download-job-image=ghcr.io/ai-runway/airunway/model-downloader:latest
         image: IMAGE_PLACEHOLDER
         name: manager
         ports:

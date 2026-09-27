@@ -229,6 +229,7 @@ type VLLMProviderReconciler struct {
 	Transformer      *Transformer
 	StatusTranslator *StatusTranslator
 	ImageResolver    ImageResolver
+	DownloadJobImage string
 }
 
 // NewVLLMProviderReconciler creates a new vLLM provider reconciler
@@ -239,6 +240,7 @@ func NewVLLMProviderReconciler(c client.Client, scheme *runtime.Scheme) *VLLMPro
 		Transformer:      NewTransformer(),
 		StatusTranslator: NewStatusTranslator(),
 		ImageResolver:    NewRemoteImageResolver(),
+		DownloadJobImage: storage.DefaultDownloadJobImage,
 	}
 }
 
@@ -490,7 +492,7 @@ func (r *VLLMProviderReconciler) reconcileStorage(
 		"Model storage is available for consumers.",
 	)
 	if storage.NeedsDownloadJob(md) {
-		complete, downloadErr := storage.EnsureDownloadJob(ctx, r.Client, md, storage.DefaultDownloadJobImage)
+		complete, downloadErr := storage.EnsureDownloadJob(ctx, r.Client, md, r.DownloadJobImage)
 		if downloadErr != nil {
 			return r.storagePending(
 				ctx, md, before, airunwayv1alpha1.ConditionTypeModelDownloaded,

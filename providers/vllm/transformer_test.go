@@ -2,6 +2,7 @@ package vllm
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1450,6 +1451,9 @@ func TestTransformArtifactPreservesLocalModelPath(t *testing.T) {
 		if env.Name == "HF_TOKEN" {
 			t.Fatal("download-only HF credential reached serving container")
 		}
+		if env.Name == "HF_HOME" {
+			t.Fatal("local artifacts must not use the HF cache layout")
+		}
 	}
 	foundMount := false
 	for _, mount := range container.VolumeMounts {
@@ -1463,5 +1467,56 @@ func TestTransformArtifactPreservesLocalModelPath(t *testing.T) {
 	md.Spec.Model.Storage.Volumes[0].ReadOnly = true
 	if _, err := NewTransformer().Transform(context.Background(), md); err == nil {
 		t.Fatal("invalid artifact contract was accepted")
+	}
+}
+
+func TestTransformHuggingFaceCacheHome(t *testing.T) {
+	fromConfig := &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "cache-settings"}, Key: "home",
+	}}
+	for _, tt := range []struct {
+		name      string
+		mountPath string
+		readOnly  bool
+		purpose   airunwayv1alpha1.VolumePurpose
+		env       []corev1.EnvVar
+		want      []corev1.EnvVar
+	}{
+		{name: "default path", want: []corev1.EnvVar{{Name: "HF_HOME", Value: "/model-cache"}}},
+		{name: "custom path", mountPath: "/weights/hf", want: []corev1.EnvVar{{Name: "HF_HOME", Value: "/weights/hf"}}},
+		{name: "read-only cache", readOnly: true, want: []corev1.EnvVar{{Name: "HF_HOME", Value: "/model-cache"}}},
+		{name: "explicit value", env: []corev1.EnvVar{{Name: "HF_HOME", Value: "/custom/hf"}}, want: []corev1.EnvVar{{Name: "HF_HOME", Value: "/custom/hf"}}},
+		{name: "explicit valueFrom", env: []corev1.EnvVar{{Name: "HF_HOME", ValueFrom: fromConfig}}, want: []corev1.EnvVar{{Name: "HF_HOME", ValueFrom: fromConfig}}},
+		{name: "explicit empty value", env: []corev1.EnvVar{{Name: "HF_HOME"}}, want: []corev1.EnvVar{{Name: "HF_HOME"}}},
+		{name: "compilation cache only", purpose: airunwayv1alpha1.VolumePurposeCompilationCache},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			md := newTestMD("cached-model", "team")
+			purpose := tt.purpose
+			if purpose == "" {
+				purpose = airunwayv1alpha1.VolumePurposeModelCache
+			}
+			md.Spec.Model.Storage = &airunwayv1alpha1.StorageSpec{Volumes: []airunwayv1alpha1.StorageVolume{{
+				Name: "cache", ClaimName: "existing-cache", Purpose: purpose, MountPath: tt.mountPath, ReadOnly: tt.readOnly,
+			}}}
+			md.Spec.Env = tt.env
+			resources, err := NewTransformer().Transform(context.Background(), md)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var container corev1.Container
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(getContainer(t, resources[0]), &container); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(container.Env, tt.want) {
+				t.Fatalf("env = %#v, want %#v", container.Env, tt.want)
+			}
+			if len(container.VolumeMounts) != 1 || container.VolumeMounts[0].ReadOnly != tt.readOnly {
+				t.Fatalf("cache mount changed: %+v", container.VolumeMounts)
+			}
+			if container.VolumeMounts[0].MountPath != storageVolumeMountPath(md.Spec.Model.Storage.Volumes[0]) {
+				t.Fatalf("unexpected cache mount: %+v", container.VolumeMounts[0])
+			}
+		})
 	}
 }
