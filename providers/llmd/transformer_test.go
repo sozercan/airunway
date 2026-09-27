@@ -1113,3 +1113,33 @@ func assertHTTPProbe(t *testing.T, container map[string]any, name string, initia
 		t.Errorf("expected %s port %d, got %v", name, DefaultVLLMPort, httpGet["port"])
 	}
 }
+
+func TestTransformAggregatedReplicaIntent(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		scaling *airunwayv1alpha1.ScalingSpec
+		want    int64
+	}{
+		{name: "omitted", want: 1},
+		{name: "zero", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 0}, want: 0},
+		{name: "one", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 1}, want: 1},
+		{name: "multiple", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 3}, want: 3},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			md := newTestMD("replica-intent", "default")
+			md.Spec.Scaling = tt.scaling
+			resources, err := NewTransformer().Transform(context.Background(), md)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, found, err := unstructured.NestedInt64(resources[0].Object, "spec", "replicas")
+			if err != nil || !found || got != tt.want {
+				t.Fatalf("Deployment replicas = %d, found=%v, err=%v; want %d", got, found, err, tt.want)
+			}
+			status := NewStatusTranslator().extractReplicas(resources[0])
+			if status.Desired != int32(tt.want) {
+				t.Errorf("status desired = %d; want %d", status.Desired, tt.want)
+			}
+		})
+	}
+}

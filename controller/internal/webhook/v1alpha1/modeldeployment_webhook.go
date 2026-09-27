@@ -100,15 +100,11 @@ func (d *ModelDeploymentCustomDefaulter) Default(_ context.Context, obj *airunwa
 		spec.Serving.Mode = airunwayv1alpha1.ServingModeAggregated
 	}
 
-	// Default scaling replicas to 1 for aggregated mode
-	if spec.Serving.Mode == airunwayv1alpha1.ServingModeAggregated {
-		if spec.Scaling == nil {
-			spec.Scaling = &airunwayv1alpha1.ScalingSpec{
-				Replicas: 1,
-			}
-		} else if spec.Scaling.Replicas == 0 {
-			// Allow 0 for scale-to-zero, but default to 1 if not explicitly set
-			// This is handled by the kubebuilder default tag
+	// Default only absent scaling. The API server defaults omitted replicas in a
+	// supplied scaling object, so an existing zero is an explicit scale-to-zero.
+	if spec.Serving.Mode == airunwayv1alpha1.ServingModeAggregated && spec.Scaling == nil {
+		spec.Scaling = &airunwayv1alpha1.ScalingSpec{
+			Replicas: 1,
 		}
 	}
 

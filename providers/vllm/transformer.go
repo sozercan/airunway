@@ -107,7 +107,7 @@ func (t *Transformer) Transform(ctx context.Context, md *airunwayv1alpha1.ModelD
 // transformAggregated creates a single Deployment + Service for aggregated serving.
 func (t *Transformer) transformAggregated(md *airunwayv1alpha1.ModelDeployment) ([]*unstructured.Unstructured, error) {
 	replicas := int64(1)
-	if md.Spec.Scaling != nil && md.Spec.Scaling.Replicas > 0 {
+	if md.Spec.Scaling != nil {
 		replicas = int64(md.Spec.Scaling.Replicas)
 	}
 
@@ -275,6 +275,15 @@ func (t *Transformer) buildDeployment(md *airunwayv1alpha1.ModelDeployment, name
 
 	spec := map[string]interface{}{
 		"replicas": replicas,
+		// Release an old replica's GPUs before starting its replacement. A surge
+		// can deadlock updates when no spare GPUs are available.
+		"strategy": map[string]any{
+			"type": "RollingUpdate",
+			"rollingUpdate": map[string]any{
+				"maxSurge":       int64(0),
+				"maxUnavailable": int64(1),
+			},
+		},
 		"selector": map[string]interface{}{
 			"matchLabels": selectorLabels,
 		},
@@ -902,6 +911,11 @@ func applyOverrides(obj *unstructured.Unstructured, md *airunwayv1alpha1.ModelDe
 		return fmt.Errorf("unsupported provider.overrides key(s) %q: only \"spec\" is supported", unsupported)
 	}
 
+	// Recreate cannot include rollingUpdate settings. Remove our defaults before
+	// merging so an explicit strategy override remains authoritative.
+	if strategy, _, _ := unstructured.NestedString(overrides, "spec", "strategy", "type"); strategy == "Recreate" {
+		unstructured.RemoveNestedField(obj.Object, "spec", "strategy", "rollingUpdate")
+	}
 	obj.Object = deepMerge(obj.Object, overrides)
 	return nil
 }

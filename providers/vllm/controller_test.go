@@ -282,46 +282,78 @@ func TestReconcileIgnoresNoProvider(t *testing.T) {
 }
 
 func TestReconcileHappyPathCreatesDeploymentAndService(t *testing.T) {
-	scheme := newScheme()
-	md := newMDForController("test-model", "default")
+	for _, tc := range []struct {
+		name    string
+		scaling *airunwayv1alpha1.ScalingSpec
+		want    int32
+	}{
+		{name: "omitted", want: 1},
+		{name: "zero", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 0}, want: 0},
+		{name: "multiple", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 3}, want: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := newScheme()
+			md := newMDForController("test-model", "default")
+			md.Spec.Scaling = tc.scaling
 
-	c := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(md).
-		WithStatusSubresource(md).
-		Build()
+			c := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(md).
+				WithStatusSubresource(md).
+				Build()
 
-	r := NewVLLMProviderReconciler(c, scheme)
-	r.ImageResolver = successfulFakeResolver(fakeResolvedImage(DefaultVLLMImage, "sha256:default"))
+			r := NewVLLMProviderReconciler(c, scheme)
+			r.ImageResolver = successfulFakeResolver(fakeResolvedImage(DefaultVLLMImage, "sha256:default"))
 
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-model"}}
-	// First reconcile adds the finalizer and requeues; the second creates resources.
-	if _, err := r.Reconcile(context.Background(), req); err != nil {
-		t.Fatalf("unexpected reconcile error (finalizer pass): %v", err)
-	}
-	if _, err := r.Reconcile(context.Background(), req); err != nil {
-		t.Fatalf("unexpected reconcile error (apply pass): %v", err)
-	}
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "test-model"}}
+			// First reconcile adds the finalizer and requeues; the second creates resources.
+			if _, err := r.Reconcile(context.Background(), req); err != nil {
+				t.Fatalf("unexpected reconcile error (finalizer pass): %v", err)
+			}
+			if _, err := r.Reconcile(context.Background(), req); err != nil {
+				t.Fatalf("unexpected reconcile error (apply pass): %v", err)
+			}
 
-	// The finalizer must be added so cleanup runs on delete.
-	var got airunwayv1alpha1.ModelDeployment
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "test-model"}, &got); err != nil {
-		t.Fatalf("failed to get ModelDeployment: %v", err)
-	}
-	if !controllerutil.ContainsFinalizer(&got, FinalizerName) {
-		t.Errorf("expected finalizer %s to be added", FinalizerName)
-	}
+			if _, err := r.Reconcile(context.Background(), req); err != nil {
+				t.Fatalf("unexpected reconcile error (update pass): %v", err)
+			}
 
-	// The Deployment and Service must be created and owned by the MD.
-	deploy := &unstructured.Unstructured{}
-	deploy.SetGroupVersionKind(deploymentGVK)
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "test-model"}, deploy); err != nil {
-		t.Fatalf("expected Deployment to be created: %v", err)
-	}
-	svc := &unstructured.Unstructured{}
-	svc.SetGroupVersionKind(serviceGVK)
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "test-model"}, svc); err != nil {
-		t.Fatalf("expected Service to be created: %v", err)
+			// The finalizer must be added so cleanup runs on delete.
+			var got airunwayv1alpha1.ModelDeployment
+			if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "test-model"}, &got); err != nil {
+				t.Fatalf("failed to get ModelDeployment: %v", err)
+			}
+			if !controllerutil.ContainsFinalizer(&got, FinalizerName) {
+				t.Errorf("expected finalizer %s to be added", FinalizerName)
+			}
+
+			if tc.scaling == nil {
+				if got.Spec.Scaling != nil {
+					t.Errorf("unexpected scaling mutation: %+v", got.Spec.Scaling)
+				}
+			} else if got.Spec.Scaling == nil || got.Spec.Scaling.Replicas != tc.want {
+				t.Errorf("replica intent changed after finalizer and reconciliation: %+v", got.Spec.Scaling)
+			}
+			if got.Status.Replicas == nil || got.Status.Replicas.Desired != tc.want {
+				t.Errorf("desired replica status = %+v; want %d", got.Status.Replicas, tc.want)
+			}
+
+			// The Deployment and Service must be created and owned by the MD.
+			deploy := &unstructured.Unstructured{}
+			deploy.SetGroupVersionKind(deploymentGVK)
+			if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "test-model"}, deploy); err != nil {
+				t.Fatalf("expected Deployment to be created: %v", err)
+			}
+			replicas, found, err := unstructured.NestedInt64(deploy.Object, "spec", "replicas")
+			if err != nil || !found || replicas != int64(tc.want) {
+				t.Errorf("Deployment replicas = %d, found=%v, err=%v; want %d", replicas, found, err, tc.want)
+			}
+			svc := &unstructured.Unstructured{}
+			svc.SetGroupVersionKind(serviceGVK)
+			if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "test-model"}, svc); err != nil {
+				t.Fatalf("expected Service to be created: %v", err)
+			}
+		})
 	}
 }
 
@@ -504,9 +536,13 @@ func TestSyncStatusRunningUpdatesMessage(t *testing.T) {
 	deploy.SetName("test")
 	deploy.SetNamespace("default")
 	deploy.Object["spec"] = map[string]interface{}{"replicas": int64(1)}
+	deploy.SetGeneration(1)
 	deploy.Object["status"] = map[string]interface{}{
-		"readyReplicas":     int64(1),
-		"availableReplicas": int64(1),
+		"observedGeneration": int64(1),
+		"replicas":           int64(1),
+		"updatedReplicas":    int64(1),
+		"readyReplicas":      int64(1),
+		"availableReplicas":  int64(1),
 		"conditions": []interface{}{
 			map[string]interface{}{"type": "Available", "status": "True"},
 		},
@@ -577,5 +613,87 @@ func TestSyncStatusStaleAvailableConditionIsNotReady(t *testing.T) {
 	ready := meta.FindStatusCondition(md.Status.Conditions, airunwayv1alpha1.ConditionTypeReady)
 	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "DeploymentInProgress" {
 		t.Errorf("Ready = %+v, want False with reason DeploymentInProgress", ready)
+	}
+}
+
+func TestSyncStatusWaitsForCurrentRollout(t *testing.T) {
+	scheme := newScheme()
+	deploy := newTestDeployment("test", "default")
+	deploy.SetGeneration(2)
+	setDeploymentReplicas(deploy, 1, 1, 1)
+	_ = unstructured.SetNestedField(deploy.Object, int64(2), "status", "observedGeneration")
+	_ = unstructured.SetNestedField(deploy.Object, int64(2), "status", "replicas")
+	_ = unstructured.SetNestedField(deploy.Object, int64(1), "status", "updatedReplicas")
+	setDeploymentConditions(deploy, []map[string]any{
+		{"type": "Available", "status": "True"},
+		{"type": "Progressing", "status": "True"},
+	})
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(deploy).WithStatusSubresource(deploy).Build()
+	r := NewVLLMProviderReconciler(c, scheme)
+	md := newMDForController("test", "default")
+	md.Generation = 2
+	md.Status.Phase = airunwayv1alpha1.DeploymentPhaseRunning
+	md.Status.Message = "Deployments created, pods are ready"
+
+	for _, tt := range []struct {
+		total     int64
+		wantPhase airunwayv1alpha1.DeploymentPhase
+		wantReady metav1.ConditionStatus
+	}{
+		{total: 2, wantPhase: airunwayv1alpha1.DeploymentPhaseDeploying, wantReady: metav1.ConditionFalse},
+		{total: 1, wantPhase: airunwayv1alpha1.DeploymentPhaseRunning, wantReady: metav1.ConditionTrue},
+	} {
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(deploy), deploy); err != nil {
+			t.Fatal(err)
+		}
+		_ = unstructured.SetNestedField(deploy.Object, tt.total, "status", "replicas")
+		if err := c.Status().Update(context.Background(), deploy); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.syncStatus(context.Background(), md, deploy); err != nil {
+			t.Fatal(err)
+		}
+		if md.Status.Phase != tt.wantPhase {
+			t.Errorf("total=%d: phase = %s; want %s", tt.total, md.Status.Phase, tt.wantPhase)
+		}
+		ready := meta.FindStatusCondition(md.Status.Conditions, airunwayv1alpha1.ConditionTypeReady)
+		if ready == nil || ready.Status != tt.wantReady || ready.ObservedGeneration != md.Generation {
+			t.Errorf("total=%d: Ready = %+v; want %s at generation %d", tt.total, ready, tt.wantReady, md.Generation)
+		}
+		if strings.Contains(md.Status.Message, "pods are ready") != (tt.wantReady == metav1.ConditionTrue) {
+			t.Errorf("total=%d: stale message %q", tt.total, md.Status.Message)
+		}
+		if md.Status.Replicas == nil || md.Status.Replicas.Desired != 1 || md.Status.Replicas.Ready != 1 || md.Status.Replicas.Available != 1 {
+			t.Errorf("total=%d: public replica status changed: %+v", tt.total, md.Status.Replicas)
+		}
+	}
+}
+
+func TestApplyUpdatesExistingDeploymentStrategy(t *testing.T) {
+	md := newTestMD("test", "default")
+	resources, err := NewTransformer().Transform(context.Background(), md)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing := resources[0].DeepCopy()
+	if err := unstructured.SetNestedMap(existing.Object, map[string]any{
+		"maxSurge": "25%", "maxUnavailable": "25%",
+	}, "spec", "strategy", "rollingUpdate"); err != nil {
+		t.Fatal(err)
+	}
+	scheme := newScheme()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
+	r := NewVLLMProviderReconciler(c, scheme)
+	if err := r.createOrUpdateResource(context.Background(), resources[0], md); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(existing), existing); err != nil {
+		t.Fatal(err)
+	}
+	for field, want := range map[string]int64{"maxSurge": 0, "maxUnavailable": 1} {
+		got, found, err := unstructured.NestedInt64(existing.Object, "spec", "strategy", "rollingUpdate", field)
+		if err != nil || !found || got != want {
+			t.Errorf("applied %s = %d, found=%v, err=%v; want %d", field, got, found, err, want)
+		}
 	}
 }

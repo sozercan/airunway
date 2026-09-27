@@ -400,7 +400,7 @@ type ScalingSpec struct {
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:default=1
 	// +optional
-	Replicas int32 `json:"replicas,omitempty"`
+	Replicas int32 `json:"replicas"`
 
 	// prefill defines prefill worker configuration for disaggregated mode
 	// +optional

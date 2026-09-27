@@ -131,7 +131,7 @@ func (t *Transformer) buildResource(md *airunwayv1alpha1.ModelDeployment) map[st
 
 	// Map scaling.replicas → spec.resource.count
 	count := int64(1)
-	if md.Spec.Scaling != nil && md.Spec.Scaling.Replicas > 0 {
+	if md.Spec.Scaling != nil {
 		count = int64(md.Spec.Scaling.Replicas)
 	}
 	resource["count"] = count

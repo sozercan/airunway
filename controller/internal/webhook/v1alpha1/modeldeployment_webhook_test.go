@@ -29,6 +29,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -106,7 +107,78 @@ var _ = Describe("ModelDeployment Webhook", func() {
 	AfterEach(func() {
 	})
 
+	Context("Replica defaulting through the API server", func() {
+		for _, tc := range []struct {
+			name    string
+			scaling string
+			want    int32
+		}{
+			{name: "omitted scaling", want: 1},
+			{name: "empty scaling", scaling: `,"scaling":{}`, want: 1},
+			{name: "explicit zero", scaling: `,"scaling":{"replicas":0}`, want: 0},
+			{name: "explicit replicas", scaling: `,"scaling":{"replicas":3}`, want: 3},
+		} {
+			It("Should preserve replica intent for "+tc.name+" across typed updates", func() {
+				// Use an unstructured create so omitted replicas stay absent on the wire.
+				raw := &unstructured.Unstructured{}
+				Expect(raw.UnmarshalJSON([]byte(`{
+					"apiVersion":"airunway.ai/v1alpha1",
+					"kind":"ModelDeployment",
+					"metadata":{"generateName":"replica-defaults-","namespace":"default"},
+					"spec":{"model":{"id":"test/model"},"engine":{"type":"vllm"}` + tc.scaling + `}
+				}`))).To(Succeed())
+				Expect(k8sClient.Create(ctx, raw)).To(Succeed())
+				key := client.ObjectKeyFromObject(raw)
+				DeferCleanup(func() {
+					var current airunwayv1alpha1.ModelDeployment
+					Expect(k8sClient.Get(ctx, key, &current)).To(Succeed())
+					current.Finalizers = nil
+					Expect(k8sClient.Update(ctx, &current)).To(Succeed())
+					Expect(k8sClient.Delete(ctx, &current)).To(Succeed())
+				})
+				var stored airunwayv1alpha1.ModelDeployment
+				Expect(k8sClient.Get(ctx, key, &stored)).To(Succeed())
+				Expect(stored.Spec.Scaling).NotTo(BeNil())
+				Expect(stored.Spec.Scaling.Replicas).To(Equal(tc.want))
+				generation := stored.Generation
+
+				// This is the same typed full-object update used by provider finalizers.
+				stored.Finalizers = []string{"airunway.ai/test-provider"}
+				Expect(k8sClient.Update(ctx, &stored)).To(Succeed())
+				Expect(k8sClient.Get(ctx, key, &stored)).To(Succeed())
+				Expect(stored.Spec.Scaling.Replicas).To(Equal(tc.want))
+				Expect(stored.Generation).To(Equal(generation))
+
+				// A spec edit must preserve an existing zero and allow scaling down to zero.
+				stored.Spec.Scaling.Replicas = 0
+				stored.Spec.Engine.Args = map[string]string{"max-model-len": "1024"}
+				Expect(k8sClient.Update(ctx, &stored)).To(Succeed())
+				Expect(k8sClient.Get(ctx, key, &stored)).To(Succeed())
+				Expect(stored.Spec.Scaling.Replicas).To(BeZero())
+				Expect(stored.Generation).To(Equal(generation + 1))
+			})
+		}
+	})
+
 	Context("When creating ModelDeployment under Defaulting Webhook", func() {
+		It("Should default only absent scaling and preserve explicit replicas", func() {
+			for _, tc := range []struct {
+				scaling *airunwayv1alpha1.ScalingSpec
+				want    int32
+			}{
+				{want: 1},
+				{scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 0}, want: 0},
+				{scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 3}, want: 3},
+			} {
+				obj.Spec.Scaling = tc.scaling
+				Expect(defaulter.Default(ctx, obj)).To(Succeed())
+				Expect(obj.Spec.Scaling).NotTo(BeNil())
+				Expect(obj.Spec.Scaling.Replicas).To(Equal(tc.want))
+				Expect(defaulter.Default(ctx, obj)).To(Succeed())
+				Expect(obj.Spec.Scaling.Replicas).To(Equal(tc.want))
+			}
+		})
+
 		It("Should default mountPath for modelCache purpose", func() {
 			obj.Spec.Model.ID = "meta-llama/Llama-2-7b-chat-hf"
 			obj.Spec.Model.Storage = &airunwayv1alpha1.StorageSpec{

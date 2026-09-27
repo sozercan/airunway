@@ -115,7 +115,7 @@ func (t *Transformer) buildSpec(md *airunwayv1alpha1.ModelDeployment) (map[strin
 
 	// Build serveConfigV2
 	replicas := int64(1)
-	if md.Spec.Scaling != nil && md.Spec.Scaling.Replicas > 0 {
+	if md.Spec.Scaling != nil {
 		replicas = int64(md.Spec.Scaling.Replicas)
 	}
 
@@ -223,7 +223,7 @@ func (t *Transformer) buildHeadGroupSpec(md *airunwayv1alpha1.ModelDeployment) m
 func (t *Transformer) buildAggregatedWorkerGroup(md *airunwayv1alpha1.ModelDeployment) []interface{} {
 	image := t.getImage(md)
 	replicas := int64(1)
-	if md.Spec.Scaling != nil && md.Spec.Scaling.Replicas > 0 {
+	if md.Spec.Scaling != nil {
 		replicas = int64(md.Spec.Scaling.Replicas)
 	}
 

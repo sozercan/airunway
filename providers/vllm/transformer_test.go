@@ -1520,3 +1520,87 @@ func TestTransformHuggingFaceCacheHome(t *testing.T) {
 		})
 	}
 }
+
+func TestTransformAggregatedReplicaIntent(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		scaling *airunwayv1alpha1.ScalingSpec
+		want    int64
+	}{
+		{name: "omitted", want: 1},
+		{name: "zero", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 0}, want: 0},
+		{name: "one", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 1}, want: 1},
+		{name: "multiple", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 3}, want: 3},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			md := newTestMD("replica-intent", "default")
+			md.Spec.Scaling = tt.scaling
+			resources, err := NewTransformer().Transform(context.Background(), md)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, found, err := unstructured.NestedInt64(resources[0].Object, "spec", "replicas")
+			if err != nil || !found || got != tt.want {
+				t.Fatalf("Deployment replicas = %d, found=%v, err=%v; want %d", got, found, err, tt.want)
+			}
+			status := NewStatusTranslator().extractReplicas(resources[0])
+			if status.Desired != int32(tt.want) {
+				t.Errorf("status desired = %d; want %d", status.Desired, tt.want)
+			}
+		})
+	}
+}
+
+func TestTransformDeploymentStrategy(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		overrides   string
+		wantType    string
+		wantRolling map[string]any
+	}{
+		{
+			name: "default needs no spare GPU", wantType: "RollingUpdate",
+			wantRolling: map[string]any{"maxSurge": int64(0), "maxUnavailable": int64(1)},
+		},
+		{
+			name: "intentional surge", wantType: "RollingUpdate",
+			overrides:   `{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}`,
+			wantRolling: map[string]any{"maxSurge": float64(1), "maxUnavailable": float64(0)},
+		},
+		{
+			name: "percentage override", wantType: "RollingUpdate",
+			overrides:   `{"spec":{"strategy":{"rollingUpdate":{"maxSurge":"25%","maxUnavailable":"25%"}}}}`,
+			wantRolling: map[string]any{"maxSurge": "25%", "maxUnavailable": "25%"},
+		},
+		{
+			name: "partial override retains defaults", wantType: "RollingUpdate",
+			overrides:   `{"spec":{"strategy":{"rollingUpdate":{"maxUnavailable":2}}}}`,
+			wantRolling: map[string]any{"maxSurge": int64(0), "maxUnavailable": float64(2)},
+		},
+		{
+			name: "recreate override drops rolling defaults", wantType: "Recreate",
+			overrides: `{"spec":{"strategy":{"type":"Recreate"}}}`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			md := newTestMD("strategy", "default")
+			if tt.overrides != "" {
+				md.Spec.Provider = &airunwayv1alpha1.ProviderSpec{
+					Overrides: &runtime.RawExtension{Raw: []byte(tt.overrides)},
+				}
+			}
+			resources, err := NewTransformer().Transform(context.Background(), md)
+			if err != nil {
+				t.Fatal(err)
+			}
+			strategy, _, err := unstructured.NestedString(resources[0].Object, "spec", "strategy", "type")
+			if err != nil || strategy != tt.wantType {
+				t.Fatalf("strategy type = %q, err=%v; want %q", strategy, err, tt.wantType)
+			}
+			rolling, found, err := unstructured.NestedMap(resources[0].Object, "spec", "strategy", "rollingUpdate")
+			if err != nil || found != (tt.wantRolling != nil) || !reflect.DeepEqual(rolling, tt.wantRolling) {
+				t.Errorf("rollingUpdate = %v, found=%v, err=%v; want %v", rolling, found, err, tt.wantRolling)
+			}
+		})
+	}
+}
