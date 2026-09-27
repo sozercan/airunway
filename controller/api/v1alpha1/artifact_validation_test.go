@@ -171,3 +171,22 @@ func TestValidateArtifactUpdate(t *testing.T) {
 		t.Fatal("accepted artifact addition")
 	}
 }
+
+func TestArtifactURIPortRange(t *testing.T) {
+	for _, scheme := range []string{"https", "oci"} {
+		for _, port := range []string{"0", "70000", "999999999999999999999999999", ""} {
+			uri := scheme + "://registry.example.test:" + port + "/model:v1"
+			artifact := &ModelArtifactSpec{URI: uri}
+			if _, err := artifact.parseURI(); err == nil {
+				t.Fatalf("accepted invalid port in %s", uri)
+			}
+		}
+		for _, port := range []string{"1", "443", "65535"} {
+			uri := scheme + "://registry.example.test:" + port + "/model:v1"
+			artifact := &ModelArtifactSpec{URI: uri}
+			if _, err := artifact.parseURI(); err != nil {
+				t.Fatalf("valid port rejected in %s: %v", uri, err)
+			}
+		}
+	}
+}

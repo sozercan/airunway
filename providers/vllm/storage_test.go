@@ -196,7 +196,11 @@ func TestExistingModelVolumeIsNotDownloadedOrAdopted(t *testing.T) {
 	md.Spec.Model.Storage.Volumes[0].Size = nil
 	md.Spec.Model.Storage.Volumes[0].ClaimName = "existing-weights"
 	md.Spec.Model.Storage.Volumes[0].ReadOnly = true
-	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "existing-weights", Namespace: md.Namespace}, Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound}}
+	// A prepopulated claim may still need its first consumer to bind.
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "existing-weights", Namespace: md.Namespace},
+		Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimPending},
+	}
 	r, c, req := storageReconciler(t, md, pvc)
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatal(err)
@@ -208,13 +212,51 @@ func TestExistingModelVolumeIsNotDownloadedOrAdopted(t *testing.T) {
 	if err := c.Get(ctx, client.ObjectKeyFromObject(pvc), pvc); err != nil {
 		t.Fatal(err)
 	}
-	if len(pvc.OwnerReferences) != 0 {
-		t.Fatal("existing storage must not be adopted")
+	if len(pvc.OwnerReferences) != 0 || len(pvc.Labels) != 0 || pvc.Status.Phase != corev1.ClaimPending {
+		t.Fatal("existing storage must not be adopted or modified")
 	}
 	deployment := &unstructured.Unstructured{}
 	deployment.SetGroupVersionKind(deploymentGVK)
 	if err := c.Get(ctx, req.NamespacedName, deployment); err != nil {
 		t.Fatal(err)
+	}
+	volumes, found, err := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "volumes")
+	if err != nil || !found {
+		t.Fatalf("missing serving pod volumes: %v", err)
+	}
+	consumesClaim := false
+	for _, raw := range volumes {
+		volume := raw.(map[string]any)
+		claim, _, _ := unstructured.NestedString(volume, "persistentVolumeClaim", "claimName")
+		if claim == pvc.Name {
+			consumesClaim = true
+		}
+	}
+	if !consumesClaim {
+		t.Fatal("serving pod must reference the Pending existing PVC to trigger binding")
+	}
+}
+
+func TestPendingExistingVolumeStartsArtifactDownload(t *testing.T) {
+	ctx := context.Background()
+	md := stagedModel()
+	md.Spec.Model.Storage.Volumes[0].Size = nil
+	md.Spec.Model.Storage.Volumes[0].ClaimName = "existing-cache"
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "existing-cache", Namespace: md.Namespace},
+		Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimPending},
+	}
+	r, c, req := storageReconciler(t, md, pvc)
+	job := startArtifactDownload(t, r, c, req, pvc, md)
+	volumes := job.Spec.Template.Spec.Volumes
+	if len(volumes) != 1 || volumes[0].PersistentVolumeClaim == nil || volumes[0].PersistentVolumeClaim.ClaimName != pvc.Name {
+		t.Fatal("download pod must reference the Pending existing PVC to trigger binding")
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(pvc), pvc); err != nil {
+		t.Fatal(err)
+	}
+	if len(pvc.OwnerReferences) != 0 || len(pvc.Labels) != 0 || pvc.Status.Phase != corev1.ClaimPending {
+		t.Fatal("existing storage must not be adopted or modified")
 	}
 }
 

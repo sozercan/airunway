@@ -6,6 +6,7 @@ import (
 	"path"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -180,6 +181,14 @@ func (a *ModelArtifactSpec) parseURI() (*url.URL, error) {
 	if err != nil || len(a.URI) > 4096 || u.Host == "" || u.Opaque != "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.ContainsAny(a.URI, "\\# \t\r\n") {
 		return nil, fmt.Errorf("artifact.uri must be a supported URL without inline credentials, query, or fragment")
 	}
+	if port := u.Port(); port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return nil, fmt.Errorf("artifact.uri port must be between 1 and 65535")
+		}
+	} else if strings.HasSuffix(u.Host, ":") {
+		return nil, fmt.Errorf("artifact.uri port must not be empty")
+	}
 	return u, nil
 }
 
@@ -268,7 +277,8 @@ func (s *ModelDeploymentSpec) validateArtifactDestination(u *url.URL) error {
 }
 
 // ValidateArtifactUpdate prevents reusing a completed download Job for a changed
-// artifact or destination. Secret contents can still be rotated in place.
+// artifact or destination. Secret contents can still be rotated in place; this
+// does not restart a download Job that has already failed.
 func (s *ModelDeploymentSpec) ValidateArtifactUpdate(old *ModelDeploymentSpec) error {
 	if !reflect.DeepEqual(s.Model.Artifact, old.Model.Artifact) {
 		return fmt.Errorf("model.artifact is immutable; delete and recreate the deployment")

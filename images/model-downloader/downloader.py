@@ -597,9 +597,14 @@ def main():
     if sys.argv[1:2] != ["artifact"]:
         os.execvp("hf", ["hf", *sys.argv[1:]])
     logging.disable(logging.CRITICAL)
-    def timeout(_signum, _frame):
-        raise DownloadError("Artifact download timed out")
-    signal.signal(signal.SIGALRM, timeout)
+    def interrupted(_signum, _frame):
+        # The Job deadline can send SIGTERM before our own alarm expires.
+        # Neither that alarm nor repeated termination should interrupt cleanup.
+        signal.alarm(0)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise DownloadError("Artifact download interrupted")
+    signal.signal(signal.SIGALRM, interrupted)
+    signal.signal(signal.SIGTERM, interrupted)
     signal.alarm(MAX_SECONDS)
     try:
         stage(os.environ["ARTIFACT_URI"], os.environ.get("ARTIFACT_REVISION", ""),

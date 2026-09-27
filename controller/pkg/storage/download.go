@@ -40,6 +40,8 @@ const (
 	// downloadJobSuffix is the suffix appended to the ModelDeployment name to form the Job name
 	downloadJobSuffix = "-model-download"
 
+	downloadJobManagedBy = "airunway"
+
 	// defaultBackoffLimit is the number of retries for the download Job
 	defaultBackoffLimit int32 = 6
 
@@ -96,6 +98,7 @@ func deleteStaleJob(ctx context.Context, c client.Client, job *batchv1.Job) erro
 	propagation := metav1.DeletePropagationBackground
 	if err := c.Delete(ctx, job, &client.DeleteOptions{
 		PropagationPolicy: &propagation,
+		Preconditions:     &metav1.Preconditions{UID: &job.UID},
 	}); err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete stale download Job %s: %w", job.Name, err)
 	}
@@ -153,6 +156,14 @@ func ensureDownloadJob(
 	// race window where the old Job still exists. Delete it and requeue so the
 	// next reconcile creates a fresh Job.
 	if !IsOwnedByMD(existing, md.UID) {
+		// A name collision alone does not prove this is one of our stale Jobs.
+		if existing.Labels[airunwayv1alpha1.LabelManagedBy] != downloadJobManagedBy ||
+			existing.Labels[airunwayv1alpha1.LabelModelDeployment] != md.Name ||
+			existing.Labels[airunwayv1alpha1.LabelJobType] != "model-download" {
+			return false, fmt.Errorf(
+				"job %s exists but is not an AI Runway download Job for this model; refusing to delete", jobName,
+			)
+		}
 		if err := deleteStaleJob(ctx, c, existing); err != nil {
 			return false, err
 		}
@@ -215,7 +226,7 @@ func buildDownloadJob(md *airunwayv1alpha1.ModelDeployment, vol *airunwayv1alpha
 			Name:      downloadJobName(md.Name),
 			Namespace: md.Namespace,
 			Labels: map[string]string{
-				airunwayv1alpha1.LabelManagedBy:       "airunway",
+				airunwayv1alpha1.LabelManagedBy:       downloadJobManagedBy,
 				airunwayv1alpha1.LabelModelDeployment: md.Name,
 				airunwayv1alpha1.LabelJobType:         "model-download",
 			},
@@ -320,6 +331,10 @@ func buildDownloadJob(md *airunwayv1alpha1.ModelDeployment, vol *airunwayv1alpha
 		}
 		deadline := int64(24 * 60 * 60)
 		job.Spec.ActiveDeadlineSeconds = &deadline
+		// The Job deadline starts before the downloader's own 24-hour timer.
+		// Allow its SIGTERM handler time to remove partial artifacts before SIGKILL.
+		cleanupGrace := int64(5 * 60)
+		pod.TerminationGracePeriodSeconds = &cleanupGrace
 		return job
 	}
 
@@ -354,7 +369,7 @@ func DeleteManagedJobs(ctx context.Context, c client.Client, md *airunwayv1alpha
 	if err := c.List(ctx, jobList,
 		client.InNamespace(md.Namespace),
 		client.MatchingLabels{
-			airunwayv1alpha1.LabelManagedBy:       "airunway",
+			airunwayv1alpha1.LabelManagedBy:       downloadJobManagedBy,
 			airunwayv1alpha1.LabelModelDeployment: md.Name,
 		},
 	); err != nil {

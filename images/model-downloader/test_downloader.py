@@ -138,6 +138,48 @@ class DownloaderTests(unittest.TestCase):
         self.assertEqual((destination / "model.gguf").read_bytes(), b"ok")
         self.assertEqual(destination.stat().st_mode & 0o777, 0o755)
 
+    def test_signal_cleans_partial_download(self):
+        script = """
+import os
+import signal
+import sys
+import downloader as d
+
+def interrupted_download(uri, file, credentials, output):
+    output.write("partial", [b"partial"])
+    print("Partial download staged", flush=True)
+    os.kill(os.getpid(), getattr(signal, sys.argv[2]))
+
+remove = d.shutil.rmtree
+def cleanup(path):
+    assert signal.alarm(0) == 0, "download alarm must be cancelled before cleanup"
+    os.kill(os.getpid(), signal.SIGTERM)
+    remove(path)
+
+d.download_https = interrupted_download
+d.shutil.rmtree = cleanup
+sys.exit(d.main())
+"""
+        for name in ("SIGTERM", "SIGALRM"):
+            with self.subTest(signal=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                # Cleanup must not touch another attempt or existing cache data.
+                other = root / ".airunway-download-other"
+                other.mkdir()
+                (other / "partial").write_bytes(b"keep partial")
+                (root / "cached-model").write_bytes(b"keep model")
+                env = {**os.environ, "ARTIFACT_URI": "https://example.com/model.gguf",
+                       "ARTIFACT_DESTINATION": str(root / "artifacts"), "ARTIFACT_CREDENTIALS_JSON": "{}"}
+                result = subprocess.run([sys.executable, "-c", script, "artifact", name],
+                                        cwd=Path(d.__file__).parent, env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("Partial download staged", result.stdout)
+                self.assertIn("Artifact download failed", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(set(root.iterdir()), {other, root / "cached-model"})
+                self.assertEqual((other / "partial").read_bytes(), b"keep partial")
+                self.assertEqual((root / "cached-model").read_bytes(), b"keep model")
+
     def test_hf_snapshot_and_selected_revision(self):
         entries = [SimpleNamespace(path="weights/model.gguf", size=3), SimpleNamespace(path="config.json", size=2)]
         api = MagicMock(token="test-token")
