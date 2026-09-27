@@ -93,16 +93,6 @@ async function startServer(): Promise<void> {
 // Main CLI entry point
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
-  const { isCLICommand, runCLI } = await import('./cli');
-  if (isCLICommand(args)) {
-    const controller = new AbortController();
-    const interrupt = () => controller.abort();
-    process.once('SIGINT', interrupt);
-    process.once('SIGTERM', interrupt);
-    try { process.exitCode = await runCLI(args, { signal: controller.signal }); }
-    finally { process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', interrupt); }
-    return;
-  }
   const command = args[0] || 'serve';
 
   switch (command) {
@@ -115,7 +105,21 @@ async function main(): Promise<void> {
     case 'logout':
       await handleLogout();
       break;
-
+    case 'version':
+    case '--version':
+    case '-v': {
+      const { BUILD_INFO } = await import('./build-info');
+      console.log(`AI Runway dashboard ${BUILD_INFO.version} (${BUILD_INFO.gitCommit})`);
+      break;
+    }
+    case 'help':
+    case '--help':
+    case '-h':
+      console.log('Usage: airunway-web [serve|login|logout|version]\n\nModel and agent commands are provided by the standalone Go airunway CLI.');
+      break;
+    default:
+      console.error('Unknown dashboard command. Run airunway-web --help.');
+      process.exitCode = 2;
   }
 }
 

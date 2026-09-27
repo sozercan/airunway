@@ -79,12 +79,14 @@ the rollout check succeed against old pods.
 cd controller && make manifests generate
 ```
 
-## Building a Single Binary
+## Building the CLI and dashboard
 
-The project can be compiled to a standalone executable that includes both the backend API and embedded frontend assets:
+The build produces a standalone Go CLI, `airunway`, and a dashboard executable,
+`airunway-web`, containing the backend API and embedded frontend assets. Keep
+them together to use dashboard commands through the CLI:
 
 ```bash
-# Compile to single binary (includes frontend)
+# Compile both executables (requires Go and Bun)
 bun run compile
 
 # Run the binary (serves both API and frontend on port 3001)
@@ -375,9 +377,20 @@ airunway help               # Show help
 ```bash
 bun run dev           # Start both frontend and backend
 bun run build         # Build all packages
-bun run compile       # Build single binary (frontend + backend) to dist/airunway
+bun run compile       # Build dist/airunway (Go CLI) and dist/airunway-web (dashboard)
 bun run lint          # Lint all packages
 ```
+
+### CLI (Go)
+
+```bash
+make cli-build              # Build dist/airunway without Bun
+make cli-test               # Run Go CLI tests
+make cli-cross              # Cross-compile the standalone CLI
+```
+
+The Go CLI is in `cli/`. Dashboard commands launch the separate `airunway-web`
+executable. See [the CLI guide](cli.md) for commands and build details.
 
 ### Controller (Go)
 
@@ -402,7 +415,7 @@ bun run build:frontend  # Build for production
 ```bash
 bun run dev:backend     # Start with watch mode
 bun run build:backend   # Compile TypeScript
-bun run compile         # Build single binary executable
+bun run compile         # Build the dashboard executable from backend/
 ```
 
 The backend pins TypeScript to `5.3.3` to keep Bun/import-meta compilation behavior stable.

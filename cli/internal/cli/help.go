@@ -1,6 +1,8 @@
-import { CLIError } from './types';
+package cli
 
-export const help = `AI Runway
+import "strings"
+
+const help = `AI Runway
 
 Usage: airunway <resource> <action> [name] [options]
 
@@ -92,7 +94,7 @@ Settings: namespace, agent.framework, agent.model-ref. Agent defaults are per
 context and namespace. Explicit model bindings replace the entire saved binding.
 
 Other commands:
-  serve                   Start the existing dashboard (also the no-argument default)
+  serve                   Start airunway-web (also the no-argument default)
   login --server URL      Existing dashboard authentication
   logout                  Clear existing dashboard authentication
   version                 Show version information
@@ -101,12 +103,23 @@ Other commands:
 Exit codes: 0 success, 1 operation failed, 2 invalid input, 3 auth/connectivity,
 4 timeout, 5 conflict, 130 interrupted. Progress goes to stderr. Local connections
 stay in the foreground and preserve upstream authentication. Chat may invoke tools.
-`;
+`
 
-export function completion(shell: string): string {
-  const words = 'model agent context config doctor credential provider framework catalog apply serve login logout version completion';
-  if (shell === 'bash') return `complete -W '${words}' airunway\n`;
-  if (shell === 'zsh') return `#compdef airunway\n_arguments '1:command:(${words})' '*:arguments:_files'\n`;
-  if (shell === 'fish') return `complete -c airunway -f -a '${words}'\n`;
-  throw new CLIError('Choose bash, zsh, or fish.', 2, 'USAGE');
+func completion(shell string) (string, error) {
+	commands := "model agent context config doctor credential provider framework catalog apply completion version serve login logout"
+	flags := append(append(append([]string{}, booleanFlags...), valueFlags...), "engine-arg")
+	for i := range flags {
+		flags[i] = "--" + flags[i]
+	}
+	words := commands + " " + strings.Join(flags, " ")
+	switch shell {
+	case "bash":
+		return "complete -W '" + words + "' airunway\n", nil
+	case "zsh":
+		return "#compdef airunway\n_arguments '*: :(" + words + ")'\n", nil
+	case "fish":
+		return "complete -c airunway -f -a '" + words + "'\n", nil
+	default:
+		return "", usage("Supported shells: bash, zsh, fish.")
+	}
 }

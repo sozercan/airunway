@@ -1,4 +1,4 @@
-.PHONY: install dev dev-frontend dev-backend build compile lint test test-coverage test-coverage-backend test-coverage-frontend clean help providers-test gpu-e2e gpu-e2e-check verify-versions test-verify-versions
+.PHONY: install dev dev-frontend dev-backend build compile cli-build cli-test cli-cross lint test test-coverage test-coverage-backend test-coverage-frontend clean help providers-test gpu-e2e gpu-e2e-check verify-versions test-verify-versions
 .PHONY: controller-build controller-docker-build controller-install controller-deploy controller-generate generate-deploy-manifests
 .PHONY: model-downloader-docker-build agent-images-docker-build agent-images-test setup-gateway cleanup-gateway
 .PHONY: agent-crewai-docker-build agent-langgraph-docker-build agent-openclaw-docker-build agent-hermes-docker-build
@@ -46,7 +46,10 @@ help:
 	@echo "  dev-frontend           Start frontend dev server only"
 	@echo "  dev-backend            Start backend dev server only"
 	@echo "  build                  Build all packages"
-	@echo "  compile                Build single binary executable"
+	@echo "  cli-build              Build the standalone Go CLI"
+	@echo "  cli-test               Run Go CLI tests"
+	@echo "  cli-cross              Cross-compile the Go CLI for all platforms"
+	@echo "  compile                Build Go CLI and dashboard executables"
 	@echo "  compile-all            Cross-compile for all platforms"
 	@echo "  compile-linux          Cross-compile for Linux (x64 + arm64)"
 	@echo "  compile-darwin         Cross-compile for macOS (x64 + arm64)"
@@ -104,12 +107,22 @@ dev-backend:
 build: verify-versions
 	bun run build
 
-# Compile single binary (includes frontend)
+# Build the Go CLI and dashboard with embedded frontend assets
 compile: verify-versions
 	bun run compile
 	@echo ""
-	@echo "✅ Binary created: dist/airunway (includes frontend)"
-	@ls -lh dist/airunway
+	@echo "✅ Binaries created: dist/airunway and dist/airunway-web"
+	@ls -lh dist/airunway dist/airunway-web
+
+# The standalone CLI needs only Go, not Bun or frontend assets.
+cli-build:
+	$(MAKE) -C cli build
+
+cli-test:
+	$(MAKE) -C cli test
+
+cli-cross:
+	$(MAKE) -C cli cross
 
 # Cross-compile for all platforms
 compile-all: compile-linux compile-darwin compile-windows
@@ -118,18 +131,23 @@ compile-all: compile-linux compile-darwin compile-windows
 	@ls -lh dist/
 
 compile-linux: verify-versions
+	$(MAKE) -C cli build GOOS=linux GOARCH=amd64 OUTPUT=../dist/airunway-linux-x64
+	$(MAKE) -C cli build GOOS=linux GOARCH=arm64 OUTPUT=../dist/airunway-linux-arm64
 	bun run build:frontend
 	cd backend && bun run compile:linux-x64
 	cd backend && bun run compile:linux-arm64
 	@echo "✅ Linux binaries created"
 
 compile-darwin: verify-versions
+	$(MAKE) -C cli build GOOS=darwin GOARCH=amd64 OUTPUT=../dist/airunway-darwin-x64
+	$(MAKE) -C cli build GOOS=darwin GOARCH=arm64 OUTPUT=../dist/airunway-darwin-arm64
 	bun run build:frontend
 	cd backend && bun run compile:darwin-x64
 	cd backend && bun run compile:darwin-arm64
 	@echo "✅ macOS binaries created"
 
 compile-windows: verify-versions
+	$(MAKE) -C cli build GOOS=windows GOARCH=amd64 OUTPUT=../dist/airunway-windows-x64.exe
 	bun run build:frontend
 	cd backend && bun run compile:windows-x64
 	@echo "✅ Windows binary created"

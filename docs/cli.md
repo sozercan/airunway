@@ -2,7 +2,27 @@
 
 The `airunway` binary manages models and agents directly through the selected
 Kubernetes API. It does not need the dashboard to be running. Running `airunway`
-without arguments or running `airunway serve` still starts the dashboard.
+without arguments or running `airunway serve` starts the separate `airunway-web`
+executable. Keep it beside `airunway` or on `PATH` to use `serve`, `login`, and
+`logout`. Model and agent commands do not use the dashboard or Bun.
+
+## Build
+
+The CLI is written in Go and uses Kubernetes `client-go` for kubeconfig,
+authentication, API requests, and port forwarding. It does not shell out to
+`kubectl`.
+
+```bash
+make cli-build        # Build only the Go CLI to dist/airunway
+make cli-test         # Run its Go tests
+make cli-cross        # Build Linux, macOS, and Windows CLI binaries
+make compile          # Build both the Go CLI and the Bun dashboard
+./dist/airunway --help
+```
+
+Use the Go toolchain version in `cli/go.mod` or newer. Building the CLI does not
+require Node.js, Bun, or frontend assets. The dashboard still requires Bun when
+building from source.
 
 Install the controller, matching CRDs, and the model/agent providers before using
 creation commands. The CLI never creates clusters, namespaces, providers, cloud

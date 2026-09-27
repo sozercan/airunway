@@ -22,7 +22,7 @@
     "prebuild:backend": "bun run verify-versions",
     "build:backend": "bun run --filter '@airunway/backend' build",
     "precompile": "bun run verify-versions",
-    "compile": "bun run build:frontend && bun run --filter '@airunway/backend' compile",
+    "compile": "make cli-build && bun run build:frontend && bun run --filter '@airunway/backend' compile",
     "lint": "bun run --filter '@airunway/frontend' lint && bun run --filter '@airunway/backend' lint",
     "pretest": "bun run verify-versions",
     "test": "bun run --filter '@airunway/frontend' test && bun run --filter '@airunway/backend' test",
