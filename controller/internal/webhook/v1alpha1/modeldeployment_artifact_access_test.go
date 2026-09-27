@@ -202,3 +202,31 @@ func TestArtifactGatewayMarkerCannotHideWorkloadChanges(t *testing.T) {
 		})
 	}
 }
+
+func TestDeletingInvalidArtifactAllowsFinalizerCleanup(t *testing.T) {
+	old := artifactWithAccess()
+	old.Spec.Model.Artifact.URI = "s3://a/prefix" // Admitted by the older bucket validator.
+	old.Finalizers = []string{"airunway.ai/provider-cleanup"}
+	now := metav1.Now()
+	old.DeletionTimestamp = &now
+	next := old.DeepCopy()
+	next.Finalizers = nil
+	validator := &ModelDeploymentCustomValidator{}
+	if _, err := validator.ValidateUpdate(context.Background(), old, next); err != nil {
+		t.Fatalf("new validation trapped an existing deleting resource: %v", err)
+	}
+	changed := next.DeepCopy()
+	changed.Spec.Engine.Image = "changed:v1"
+	if _, err := validator.ValidateUpdate(context.Background(), old, changed); err == nil {
+		t.Fatal("deletion allowed a workload-affecting spec change")
+	}
+	changed = next.DeepCopy()
+	changed.Annotations = map[string]string{"workload-setting": "changed"}
+	if _, err := validator.ValidateUpdate(context.Background(), old, changed); err == nil {
+		t.Fatal("deletion allowed workload annotation changes")
+	}
+	old.DeletionTimestamp = nil
+	if _, err := validator.ValidateUpdate(context.Background(), old, next); err == nil {
+		t.Fatal("newly supplied deletion timestamp bypassed validation")
+	}
+}

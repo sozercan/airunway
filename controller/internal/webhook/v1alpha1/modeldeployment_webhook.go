@@ -231,6 +231,13 @@ func (v *ModelDeploymentCustomValidator) ValidateCreate(ctx context.Context, obj
 func (v *ModelDeploymentCustomValidator) ValidateUpdate(ctx context.Context, oldObj, newObj *airunwayv1alpha1.ModelDeployment) (admission.Warnings, error) {
 	modeldeploymentlog.Info("Validation for ModelDeployment upon update", "name", newObj.GetName())
 
+	// Stricter validation must not trap cleanup of previously admitted resources.
+	// Spec, ownership, labels, and workload annotations still must be unchanged.
+	if !oldObj.DeletionTimestamp.IsZero() && !newObj.DeletionTimestamp.IsZero() &&
+		artifactBookkeepingOnly(oldObj, newObj) {
+		return nil, nil
+	}
+
 	var warnings admission.Warnings
 	var allErrs field.ErrorList
 
