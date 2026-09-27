@@ -254,7 +254,7 @@ func TestManifestModelSources(t *testing.T) {
 	for _, uri := range []string{"s3://bucket/models/demo", "s3://bucket/", "gs://bucket/models/demo", "oci://registry.example.test/models/demo:v1", "oci://registry.example.test/models/demo@sha256:" + strings.Repeat("a", 64), "oci://localhost:5000/model:v1"} {
 		t.Run(uri, func(t *testing.T) {
 			result := manifestTestModel(t, Flags{"id": {uri}})
-			manifestTestEqual(t, get(result, "spec", "model"), Object{"source": "custom", "id": "/model-cache/artifacts", "artifact": Object{"uri": uri}, "storage": Object{"volumes": []any{Object{"name": "model-cache", "purpose": "modelCache", "mountPath": "/model-cache", "readOnly": false, "size": "100Gi"}}}})
+			manifestTestEqual(t, get(result, "spec", "model"), Object{"source": "custom", "id": "/model-cache/artifacts", "artifact": Object{"uri": uri}, "storage": Object{"volumes": []any{Object{"name": "model-cache", "purpose": "modelCache", "mountPath": "/model-cache", "readOnly": false, "size": "100Gi", "accessMode": "ReadWriteOnce"}}}})
 			manifestTestEqual(t, get(result, "spec", "provider"), Object{"name": "vllm"})
 			manifestTestEqual(t, get(result, "spec", "engine", "type"), "vllm")
 		})
@@ -272,7 +272,7 @@ func TestManifestModelSources(t *testing.T) {
 		manifestTestEqual(t, get(result, "spec", "model", "artifact"), Object{"uri": "s3://bucket/prefix", "file": "weights/chat.gguf", "credentialsRef": Object{"name": "cloud", "key": "key.json"}, "image": "registry.example.test/loader:v2", "serviceAccountName": "model-loader"})
 		manifestTestEqual(t, get(result, "spec", "model", "id"), "/model-cache/artifacts/weights/chat.gguf")
 		manifestTestEqual(t, get(result, "spec", "model", "servedName"), "chat")
-		manifestTestEqual(t, array(get(result, "spec", "model", "storage", "volumes"))[0], Object{"name": "model-cache", "purpose": "modelCache", "mountPath": "/model-cache", "readOnly": false, "size": "250Gi", "storageClassName": "fast-rwx"})
+		manifestTestEqual(t, array(get(result, "spec", "model", "storage", "volumes"))[0], Object{"name": "model-cache", "purpose": "modelCache", "mountPath": "/model-cache", "readOnly": false, "size": "250Gi", "storageClassName": "fast-rwx", "accessMode": "ReadWriteOnce"})
 		manifestTestEqual(t, get(result, "spec", "engine", "image"), "vllm/runtime:v1")
 		manifestTestEqual(t, get(result, "spec", "secrets"), nil)
 	})
@@ -320,6 +320,62 @@ func TestManifestModelSources(t *testing.T) {
 			manifestTestEqual(t, get(result, "spec", "provider", "name"), "vllm")
 		})
 	}
+}
+
+func TestManifestStagedStorageAccessMode(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		flags Flags
+		want  string
+	}{
+		{"default replica", nil, "ReadWriteOnce"},
+		{"one replica", Flags{"replicas": {"1"}}, "ReadWriteOnce"},
+		{"zero replicas", Flags{"replicas": {"0"}}, "ReadWriteOnce"},
+		{"multiple replicas", Flags{"replicas": {"2"}}, "ReadWriteMany"},
+		{"explicit shared single replica", Flags{"replicas": {"1"}, "storage-access-mode": {"ReadWriteMany"}}, "ReadWriteMany"},
+		{"explicit single writer multiple replicas", Flags{"replicas": {"2"}, "storage-access-mode": {"ReadWriteOnce"}}, "ReadWriteOnce"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			flags := manifestTestDefaults(Flags{"id": {"hf://Qwen/Qwen3-0.6B"}, "revision": {"main"}, "storage-class": {"managed-csi"}, "storage-size": {"10Gi"}}, tc.flags)
+			result := manifestTestModel(t, flags)
+			manifestTestEqual(t, get(result, "spec", "model", "storage", "volumes"), []any{Object{"name": "model-cache", "purpose": "modelCache", "mountPath": "/model-cache", "readOnly": false, "size": "10Gi", "storageClassName": "managed-csi", "accessMode": tc.want}})
+		})
+	}
+	for _, mode := range []string{"", "rwo", "rwx", "readwriteonce", "ReadOnlyMany", "ReadWriteOncePod", "ReadWriteOnce,ReadWriteMany", " ReadWriteOnce", "ReadWriteMany "} {
+		t.Run("invalid mode "+mode, func(t *testing.T) {
+			_, err := manifestTestModelResult(Flags{"revision": {"main"}, "storage-access-mode": {mode}}, nil)
+			manifestTestUsage(t, err, "--storage-access-mode must be ReadWriteOnce or ReadWriteMany")
+		})
+	}
+	for _, tc := range []struct {
+		name  string
+		flags Flags
+		want  string
+	}{
+		{"ordinary HF", Flags{"id": {"hf://org/model"}}, "unstaged Hugging Face models"},
+		{"bare HF", nil, "unstaged Hugging Face models"},
+		{"bundled", Flags{"id": nil, "image": {"demo:v1"}, "model-path": {"/models/demo"}}, "bundled models"},
+		{"existing PVC", Flags{"id": {"pvc://weights/model"}}, "existing storage references"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			flags := tc.flags.Copy()
+			flags["storage-access-mode"] = []string{"ReadWriteOnce"}
+			_, err := manifestTestModelResult(flags, nil)
+			manifestTestUsage(t, err, "--storage-access-mode is not supported for "+tc.want)
+		})
+	}
+	t.Run("agent", func(t *testing.T) {
+		_, err := manifestTestAgentResult(Flags{"storage-access-mode": {"ReadWriteOnce"}}, nil)
+		manifestTestUsage(t, err, "--storage-access-mode is not supported for agent creation")
+	})
+	t.Run("immutable staged volume", func(t *testing.T) {
+		existing := manifestTestModel(t, Flags{"revision": {"main"}})
+		_, err := updateResource("model", existing, Flags{"storage-access-mode": {"ReadWriteMany"}}, nil)
+		manifestTestUsage(t, err, "--storage-access-mode is immutable")
+		patch := manifestTestUpdate(t, "model", existing, Flags{"replicas": {"2"}}, "")
+		manifestTestEqual(t, patch["spec"], Object{"scaling": Object{"replicas": 2}})
+		manifestTestEqual(t, get(manifestTestMergePatch(existing, patch), "spec", "model", "storage"), get(existing, "spec", "model", "storage"))
+	})
 }
 
 func TestManifestModelSourceValidation(t *testing.T) {

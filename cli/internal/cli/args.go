@@ -11,9 +11,9 @@ import (
 )
 
 var booleanFlags = strings.Fields("help version all-namespaces follow check wait trust-remote-code gateway timestamps")
-var valueFlags = strings.Fields("kubeconfig context namespace output timeout id gpus cpu memory provider engine image model-path served-name context-length replicas credential revision file storage-size storage-class artifact-image service-account framework model-ref prompt prompt-file model-url model-api model-id model-credential model-gateway gateway-listener mode task task-file config-file preset dry-run for tail pod container port message message-file type from-file server temperature max-tokens")
+var valueFlags = strings.Fields("kubeconfig context namespace output timeout id gpus cpu memory provider engine image model-path served-name context-length replicas credential revision file storage-size storage-class storage-access-mode artifact-image service-account framework model-ref prompt prompt-file model-url model-api model-id model-credential model-gateway gateway-listener mode task task-file config-file preset dry-run for tail pod container port message message-file type from-file server temperature max-tokens")
 var globalOptions = strings.Fields("kubeconfig context namespace output timeout help version")
-var createOptions = strings.Fields("id gpus cpu memory provider engine image model-path served-name context-length replicas credential revision file storage-size storage-class artifact-image service-account engine-arg trust-remote-code gateway framework model-ref prompt prompt-file model-url model-api model-id model-credential model-gateway gateway-listener mode task task-file config-file preset dry-run wait")
+var createOptions = strings.Fields("id gpus cpu memory provider engine image model-path served-name context-length replicas credential revision file storage-size storage-class storage-access-mode artifact-image service-account engine-arg trust-remote-code gateway framework model-ref prompt prompt-file model-url model-api model-id model-credential model-gateway gateway-listener mode task task-file config-file preset dry-run wait")
 var namePattern = regexp.MustCompile(`^[a-z]([-a-z0-9]*[a-z0-9])?$`)
 var durationPattern = regexp.MustCompile(`^\d+(ms|s|m|h)$`)
 

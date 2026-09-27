@@ -210,6 +210,53 @@ func TestOfflineCommands(t *testing.T) {
 		}
 	}
 }
+func TestStorageAccessModeCLI(t *testing.T) {
+	t.Setenv("AIRUNWAY_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "absent"))
+	for _, tc := range []struct {
+		name  string
+		extra []string
+		want  string
+	}{
+		{"default", nil, "ReadWriteOnce"},
+		{"one replica", []string{"--replicas", "1"}, "ReadWriteOnce"},
+		{"multiple replicas", []string{"--replicas", "2"}, "ReadWriteMany"},
+		{"shared override", []string{"--storage-access-mode", "ReadWriteMany"}, "ReadWriteMany"},
+		{"single writer override", []string{"--replicas", "2", "--storage-access-mode=ReadWriteOnce"}, "ReadWriteOnce"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append([]string{"model", "create", "demo", "--id", "hf://Qwen/Qwen3-0.6B", "--revision", "main", "--storage-class", "managed-csi", "--storage-size", "10Gi", "--dry-run=client", "-ojson"}, tc.extra...)
+			code, stdout, stderr := coreRun(t, args...)
+			var result Object
+			if code != 0 || stderr != "" || json.Unmarshal([]byte(stdout), &result) != nil {
+				t.Fatalf("preview failed: %d %s %s", code, stdout, stderr)
+			}
+			volumes := array(get(result, "spec", "model", "storage", "volumes"))
+			if len(volumes) != 1 || stringAt(object(volumes[0]), "accessMode") != tc.want {
+				t.Fatalf("got volumes %v, want accessMode %s", volumes, tc.want)
+			}
+		})
+	}
+	for _, args := range [][]string{
+		{"model", "create", "demo", "--id", "hf://org/model", "--revision", "main", "--storage-access-mode", "invalid"},
+		{"model", "create", "demo", "--id", "hf://org/model", "--storage-access-mode", "ReadWriteOnce"},
+		{"model", "create", "demo", "--id", "pvc://weights/model", "--storage-access-mode", "ReadWriteOnce"},
+		{"model", "create", "demo", "--image", "demo:v1", "--model-path", "/models/demo", "--storage-access-mode", "ReadWriteOnce"},
+		{"agent", "create", "helper", "--framework", "langgraph", "--model-ref", "demo", "--storage-access-mode", "ReadWriteOnce"},
+	} {
+		code, stdout, stderr := coreRun(t, append(args, "--dry-run=client", "-ojson")...)
+		if code != 2 || stdout != "" || !strings.Contains(stderr, "--storage-access-mode") {
+			t.Errorf("%v: %d %s %s", args, code, stdout, stderr)
+		}
+	}
+	for _, args := range [][]string{{"--help"}, {"completion", "bash"}, {"completion", "zsh"}, {"completion", "fish"}} {
+		code, stdout, stderr := coreRun(t, args...)
+		if code != 0 || stderr != "" || !strings.Contains(stdout, "--storage-access-mode") {
+			t.Errorf("%v: %d %s %s", args, code, stdout, stderr)
+		}
+	}
+}
+
 func TestCLILifecycleThroughHTTP(t *testing.T) {
 	var mu sync.Mutex
 	var resource Object

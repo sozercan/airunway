@@ -149,7 +149,32 @@ airunway model create registry-demo \
 airunway model create volume-demo --id pvc://model-store/qwen3-8b/ --gpus 1
 ```
 
-`--storage-class` selects the staged artifact volume's class.
+`--storage-size` sets the staged artifact volume's capacity, defaulting to `100Gi`.
+`--storage-class` selects its storage class. The CLI sets `accessMode` to
+`ReadWriteOnce` for zero or one replica, including the default of one, and
+`ReadWriteMany` for multiple replicas. Use
+`--storage-access-mode ReadWriteOnce|ReadWriteMany` to override this choice.
+The selected storage class must support the access mode. `ReadWriteOnce` permits
+writers on one node; use `ReadWriteMany` with compatible shared storage when
+replicas need to run on different nodes.
+
+For example, stage a single-replica model on an AKS managed disk:
+
+```bash
+airunway model create disk-demo --id hf://Qwen/Qwen3-0.6B \
+  --revision main --storage-class managed-csi --storage-size 10Gi \
+  --replicas 1 --storage-access-mode ReadWriteOnce \
+  --artifact-image "$ARTIFACT_DOWNLOADER_IMAGE"
+```
+
+These storage flags apply only to generated staged caches. They are rejected for
+ordinary Hugging Face models without `--revision` or `--file`, bundled models,
+and existing `pvc://` references. Storage settings are immutable after creation.
+Changing `--replicas` with `model update` does not change the existing volume's
+access mode. Create a new model with compatible storage to change that mode.
+These CLI defaults do not change the controller's shared-storage default for
+other deployments, including Dynamo.
+
 `--artifact-image` overrides the downloader image, not the inference image.
 `--service-account` selects an existing download-job workload identity. Configure
 cloud identity and permissions separately; the CLI cannot infer or create them.

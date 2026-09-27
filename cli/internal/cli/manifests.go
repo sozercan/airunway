@@ -21,10 +21,10 @@ const manifestInt32Max = 2147483647
 var (
 	manifestCommonFlags       = []string{"kubeconfig", "context", "namespace", "output", "timeout", "help", "version", "dry-run", "wait"}
 	manifestModelMutableFlags = []string{"gpus", "cpu", "memory", "replicas", "served-name", "context-length", "credential", "image", "engine-arg", "trust-remote-code", "gateway"}
-	manifestSourceFlags       = []string{"id", "model-path", "revision", "file", "storage-size", "storage-class", "artifact-image", "service-account"}
+	manifestSourceFlags       = []string{"id", "model-path", "revision", "file", "storage-size", "storage-class", "storage-access-mode", "artifact-image", "service-account"}
 	manifestBindingFlags      = []string{"model-ref", "model-url", "model-api", "model-id", "model-credential", "model-gateway", "gateway-listener"}
 	manifestPromptFlags       = []string{"prompt", "prompt-file"}
-	manifestImmutableFlags    = []string{"id", "provider", "engine", "model-source", "framework", "mode", "model-path", "revision", "file", "storage-size", "storage-class", "artifact-image", "service-account"}
+	manifestImmutableFlags    = []string{"id", "provider", "engine", "model-source", "framework", "mode", "model-path", "revision", "file", "storage-size", "storage-class", "storage-access-mode", "artifact-image", "service-account"}
 	manifestDNSPattern        = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*$`)
 	manifestQuantityPattern   = regexp.MustCompile(`^(\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+|[numkMGTPE]|[KMGTPE]i)?$`)
 	manifestSecretKeyPattern  = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
@@ -406,7 +406,7 @@ func buildModel(name string, flags Flags, namespace string, streams *IO) (Object
 	model := object(spec["model"])
 	spec["model"] = model
 	if flags.Has("model-path") {
-		if err := manifestRejectOptions(flags, []string{"id", "revision", "file", "credential", "storage-size", "storage-class", "artifact-image", "service-account"}, "bundled models"); err != nil {
+		if err := manifestRejectOptions(flags, []string{"id", "revision", "file", "credential", "storage-size", "storage-class", "storage-access-mode", "artifact-image", "service-account"}, "bundled models"); err != nil {
 			return nil, err
 		}
 		if _, err := manifestNonempty(flags, "image"); err != nil {
@@ -452,7 +452,7 @@ func buildModel(name string, flags Flags, namespace string, streams *IO) (Object
 		}
 		uri = "hf://" + repository
 		if !manifestAnyFlag(flags, []string{"revision", "file"}) {
-			if err := manifestRejectOptions(flags, []string{"storage-size", "storage-class", "artifact-image", "service-account"}, "unstaged Hugging Face models"); err != nil {
+			if err := manifestRejectOptions(flags, []string{"storage-size", "storage-class", "storage-access-mode", "artifact-image", "service-account"}, "unstaged Hugging Face models"); err != nil {
 				return nil, err
 			}
 			model["source"], model["id"] = "huggingface", repository
@@ -471,7 +471,7 @@ func buildModel(name string, flags Flags, namespace string, streams *IO) (Object
 		if err != nil {
 			return nil, err
 		}
-		if err := manifestRejectOptions(flags, []string{"revision", "file", "credential", "storage-size", "storage-class", "artifact-image", "service-account"}, "existing storage references"); err != nil {
+		if err := manifestRejectOptions(flags, []string{"revision", "file", "credential", "storage-size", "storage-class", "storage-access-mode", "artifact-image", "service-account"}, "existing storage references"); err != nil {
 			return nil, err
 		}
 		claim, err := manifestDNSName(host, "PVC claim")
@@ -588,7 +588,17 @@ func buildModel(name string, flags Flags, namespace string, streams *IO) (Object
 			return nil, err
 		}
 	}
-	volume := Object{"name": "model-cache", "purpose": "modelCache", "mountPath": "/model-cache", "readOnly": false, "size": size}
+	accessMode := "ReadWriteOnce"
+	if replicas > 1 {
+		accessMode = "ReadWriteMany"
+	}
+	if flags.Has("storage-access-mode") {
+		accessMode = flags.Text("storage-access-mode")
+		if !slices.Contains([]string{"ReadWriteOnce", "ReadWriteMany"}, accessMode) {
+			return nil, usage("--storage-access-mode must be ReadWriteOnce or ReadWriteMany.")
+		}
+	}
+	volume := Object{"name": "model-cache", "purpose": "modelCache", "mountPath": "/model-cache", "readOnly": false, "size": size, "accessMode": accessMode}
 	if flags.Has("storage-class") {
 		class := flags.Text("storage-class")
 		if class != "" {

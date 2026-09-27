@@ -40,6 +40,8 @@ Model creation options:
   --credential NAME       Source credential in the selected namespace
   --storage-size SIZE     Staged artifact volume capacity (default 100Gi)
   --storage-class NAME    Volume storage class for staged artifacts
+  --storage-access-mode MODE  ReadWriteOnce|ReadWriteMany for staged artifact volumes
+                              Default ReadWriteOnce for 0 or 1 replicas, ReadWriteMany for 2+
   --artifact-image IMAGE  Override the artifact downloader image
   --service-account NAME Preconfigured artifact download workload identity
   --image IMAGE           Inference runtime image, not model artifacts
