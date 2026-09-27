@@ -491,9 +491,8 @@ func pause(ctx context.Context, d time.Duration) error {
 	}
 }
 func preflight(resource Object, noun string, c *CommandContext, client ClusterClient) error {
-	if _, err := client.List(c.Context, resourceTypes[noun], c.Namespace, nil); err != nil {
-		return err
-	}
+	// The write itself proves the deployment API exists. Collection-wide read
+	// permission is not required just to submit a resource.
 	if noun == "agent" {
 		framework, err := client.Get(c.Context, resourceTypes["framework"], "", stringAt(resource, "spec", "framework", "name"))
 		if err != nil {
@@ -544,19 +543,32 @@ func preflight(resource Object, noun string, c *CommandContext, client ClusterCl
 			return err
 		}
 	} else {
-		providers, err := client.List(c.Context, resourceTypes["provider"], "", nil)
-		if err != nil {
+		requested := stringAt(resource, "spec", "provider", "name")
+		var providers []Object
+		var err error
+		if requested != "" {
+			var provider Object
+			provider, err = client.Get(c.Context, resourceTypes["provider"], "", requested)
+			providers = []Object{provider}
+		} else {
+			providers, err = client.List(c.Context, resourceTypes["provider"], "", nil)
+		}
+		// Discovery is advisory. The shipped editor role can submit models
+		// without reading cluster-scoped provider registrations; admission and
+		// reconciliation remain authoritative for selection and compatibility.
+		if err != nil && !accessHasCode(err, "HTTP_403") {
 			return err
 		}
-		requested := stringAt(resource, "spec", "provider", "name")
-		found := false
-		for _, p := range providers {
-			if boolAt(p, "status", "ready") && (requested == "" || stringAt(p, "metadata", "name") == requested) {
-				found = true
+		if err == nil {
+			found := false
+			for _, provider := range providers {
+				if boolAt(provider, "status", "ready") {
+					found = true
+				}
 			}
-		}
-		if !found {
-			return cliError(1, "NOT_READY", "No matching model provider is ready. Run airunway provider list.")
+			if !found {
+				return cliError(1, "NOT_READY", "No matching model provider is ready. Run airunway provider list.")
+			}
 		}
 		for _, name := range []string{stringAt(resource, "spec", "secrets", "huggingFaceToken"), stringAt(resource, "spec", "model", "artifact", "credentialsRef", "name")} {
 			if name != "" {

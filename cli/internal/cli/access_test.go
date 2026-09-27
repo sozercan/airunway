@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -199,6 +200,7 @@ func TestAccessWaitFreshness(t *testing.T) {
 		{"missing generation", func(r Object) { delete(object(r["metadata"]), "generation") }, "model", "ready", "TIMEOUT"},
 		{"phase is not readiness", func(r Object) { object(r["status"])["conditions"] = []any{} }, "model", "ready", "TIMEOUT"},
 		{"stale failure", func(r Object) {
+			object(r["status"])["observedGeneration"] = 1
 			object(r["status"])["phase"] = "Failed"
 			object(r["status"])["conditions"] = accessTestObjects(Object{"type": "Ready", "status": "False", "observedGeneration": 1}, Object{"type": "Validated", "status": "True", "observedGeneration": 2})
 		}, "model", "ready", "TIMEOUT"},
@@ -207,6 +209,7 @@ func TestAccessWaitFreshness(t *testing.T) {
 			object(r["status"])["conditions"] = accessTestObjects(Object{"type": "Validated", "status": "False", "observedGeneration": 2})
 		}, "model", "ready", "FAILED"},
 		{"old agent provider failure", func(r Object) {
+			object(r["status"])["observedGeneration"] = 1
 			object(r["status"])["phase"] = "Failed"
 			object(r["status"])["conditions"] = accessTestObjects(Object{"type": "Ready", "status": "False", "observedGeneration": 2}, Object{"type": "ProviderReady", "status": "False", "observedGeneration": 1})
 		}, "agent", "ready", "TIMEOUT"},
@@ -299,10 +302,18 @@ func accessTestGateway() (Object, Object, Object, Object) {
 	object(gateway["metadata"])["namespace"] = "edge"
 	gateway["spec"] = Object{"listeners": accessTestObjects(Object{"name": "secure", "protocol": "HTTPS", "port": 8443})}
 	gateway["status"] = Object{"addresses": accessTestObjects(Object{"type": "IPAddress", "value": "203.0.113.3"})}
-	route := accessTestResource("HTTPRoute", "route")
+	route := accessTestResource("HTTPRoute", "llama")
 	route["apiVersion"] = "gateway.networking.k8s.io/v1"
 	accessTestOwn(route, model)
 	route["spec"] = Object{"parentRefs": accessTestObjects(Object{"name": "shared", "namespace": "edge", "sectionName": "secure"}), "hostnames": []any{"inference.example.test"}, "rules": accessTestObjects(Object{"matches": accessTestObjects(Object{"path": Object{"type": "PathPrefix", "value": "/models"}, "headers": accessTestObjects(Object{"name": "x-gateway-model-name", "value": "served-alias"})})})}
+	route["status"] = Object{"parents": accessTestObjects(Object{
+		"parentRef":      Object{"group": accessRouteType.Group, "kind": "Gateway", "name": "shared", "namespace": "edge", "sectionName": "secure"},
+		"controllerName": "example.test/gateway-controller",
+		"conditions": accessTestObjects(
+			Object{"type": "Accepted", "status": "True", "reason": "Accepted", "observedGeneration": 2},
+			Object{"type": "ResolvedRefs", "status": "True", "reason": "ResolvedRefs", "observedGeneration": 2},
+		),
+	})}
 	service := accessTestService("implementation-generated-42", 8443)
 	object(service["metadata"])["namespace"] = "edge"
 	object(service["metadata"])["labels"] = Object{"gateway.envoyproxy.io/owning-gateway-name": "shared", "gateway.envoyproxy.io/owning-gateway-namespace": "edge"}
@@ -377,7 +388,11 @@ func TestAccessEndpointDiscovery(t *testing.T) {
 				object(get(s, "metadata", "labels"))["gateway.envoyproxy.io/owning-gateway-namespace"] = "elsewhere"
 			}
 			c, _, _ := accessTestContext(&accessFakeClient{resources: []Object{m, g, r, s}}, nil)
-			accessTestCode(t, runAccess("model", "endpoint", "llama", c), "UNSUPPORTED")
+			code := "UNSUPPORTED"
+			if scenario == "missing route" {
+				code = "HTTP_404"
+			}
+			accessTestCode(t, runAccess("model", "endpoint", "llama", c), code)
 		})
 	}
 	t.Run("agent reference only", func(t *testing.T) {
@@ -1148,7 +1163,7 @@ func TestAccessConfiguredHTTPRoute(t *testing.T) {
 	for _, mismatch := range []string{"name", "namespace", "kind", "group", "sectionName", "port", "selected listener"} {
 		t.Run("still validates "+mismatch, func(t *testing.T) {
 			model, gateway, route, service := accessTestGateway()
-			object(model["spec"])["gateway"] = Object{"httpRouteRef": "route"}
+			object(model["spec"])["gateway"] = Object{"httpRouteRef": "llama"}
 			delete(object(route["metadata"]), "ownerReferences")
 			parent := objects(get(route, "spec", "parentRefs"))[0]
 			flags := Flags{}
@@ -1559,5 +1574,344 @@ func TestAccessStructuredFollowBoundsEachLine(t *testing.T) {
 	line, err = accessReadLogLine(reader)
 	if !accessHasCode(err, "LOGS") || line != "" {
 		t.Fatalf("oversized line accepted: size=%d err=%v", len(line), err)
+	}
+}
+
+func TestAccessManagedRouteGetOnly(t *testing.T) {
+	for _, owned := range []bool{true, false} {
+		t.Run(fmt.Sprint("owned=", owned), func(t *testing.T) {
+			model, gateway, route, service := accessTestGateway()
+			if !owned {
+				delete(object(route["metadata"]), "ownerReferences")
+			}
+			other := cloneObject(route)
+			object(other["metadata"])["name"] = "unrelated-route"
+			accessTestOwn(other, model)
+			client := &accessFakeClient{resources: []Object{model, gateway, route, service, other}, onList: func(_ context.Context, typ ResourceType, _ string, _ url.Values) error {
+				if typ.Kind == "HTTPRoute" {
+					return cliError(1, "HTTP_403", "get-only route access")
+				}
+				return nil
+			}}
+			c, _, _ := accessTestContext(client, nil)
+			code := ""
+			if !owned {
+				code = "UNSUPPORTED"
+			}
+			accessTestCode(t, runAccess("model", "endpoint", "llama", c), code)
+			found := false
+			for _, call := range client.snapshot() {
+				if call.Type.Kind == "GatewayClass" {
+					t.Fatal("unnecessary GatewayClass read")
+				}
+				if call.Type.Kind == "HTTPRoute" {
+					found = true
+					if call.Method != "get" || call.Name != "llama" || call.Namespace != "test" {
+						t.Fatal(call)
+					}
+				}
+			}
+			if !found {
+				t.Fatal("managed route not fetched")
+			}
+		})
+	}
+}
+
+func TestAccessRouteParentReadiness(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		for _, scenario := range []string{"current", "missing status", "missing accepted", "missing resolved", "rejected", "unresolved", "unknown", "stale accepted", "stale resolved", "missing generation", "different gateway", "different namespace", "different listener", "different port", "different group", "different kind", "conflicting status"} {
+			t.Run(fmt.Sprintf("explicit=%v/%s", explicit, scenario), func(t *testing.T) {
+				model, gateway, route, service := accessTestGateway()
+				if explicit {
+					object(model["spec"])["gateway"] = Object{"httpRouteRef": "llama"}
+					delete(object(route["metadata"]), "ownerReferences")
+				}
+				status := objects(get(route, "status", "parents"))[0]
+				conditions := objects(status["conditions"])
+				ref := object(status["parentRef"])
+				switch scenario {
+				case "missing status":
+					route["status"] = Object{}
+				case "missing accepted":
+					status["conditions"] = accessTestObjects(conditions[1])
+				case "missing resolved":
+					status["conditions"] = accessTestObjects(conditions[0])
+				case "rejected":
+					conditions[0]["status"] = "False"
+				case "unresolved":
+					conditions[1]["status"] = "False"
+				case "unknown":
+					conditions[0]["status"] = "Unknown"
+				case "stale accepted":
+					conditions[0]["observedGeneration"] = 1
+				case "stale resolved":
+					conditions[1]["observedGeneration"] = 1
+				case "missing generation":
+					delete(object(route["metadata"]), "generation")
+				case "different gateway":
+					ref["name"] = "other"
+				case "different namespace":
+					ref["namespace"] = "test"
+				case "different listener":
+					ref["sectionName"] = "other"
+				case "different port":
+					ref["port"] = 443
+				case "different group":
+					ref["group"] = ""
+				case "different kind":
+					ref["kind"] = "Service"
+				case "conflicting status":
+					rejected := cloneObject(status)
+					objects(rejected["conditions"])[0]["status"] = "False"
+					object(route["status"])["parents"] = append(array(get(route, "status", "parents")), rejected)
+				}
+				c, out, _ := accessTestContext(&accessFakeClient{resources: []Object{model, gateway, route, service}}, nil)
+				code := "UNSUPPORTED"
+				if scenario == "current" {
+					code = ""
+				}
+				accessTestCode(t, runAccess("model", "endpoint", "llama", c), code)
+				if code != "" && out.Len() != 0 {
+					t.Fatal("advertised rejected route", out.String())
+				}
+			})
+		}
+	}
+	t.Run("parent reference defaults match", func(t *testing.T) {
+		model, gateway, route, service := accessTestGateway()
+		object(get(model, "status", "gateway"))["gatewayNamespace"] = "test"
+		object(gateway["metadata"])["namespace"] = "test"
+		parent := objects(get(route, "spec", "parentRefs"))[0]
+		delete(parent, "namespace")
+		object(objects(get(route, "status", "parents"))[0]["parentRef"])["namespace"] = "test"
+		object(service["metadata"])["namespace"] = "test"
+		object(get(service, "metadata", "labels"))["gateway.envoyproxy.io/owning-gateway-namespace"] = "test"
+		c, _, _ := accessTestContext(&accessFakeClient{resources: []Object{model, gateway, route, service}}, nil)
+		accessTestCode(t, runAccess("model", "endpoint", "llama", c), "")
+	})
+}
+
+func TestAccessWaitFreshRootFailure(t *testing.T) {
+	for _, noun := range []string{"model", "agent"} {
+		for _, phase := range []string{"Failed", "Error"} {
+			for _, condition := range []Object{{"type": "DynamoStorageReady", "status": "False", "reason": "PVCFailed"}, {"type": "ModelDownloaded", "status": "False", "reason": "DownloadFailed"}, {"type": "Ready", "status": "True"}} {
+				for _, fresh := range []bool{true, false} {
+					t.Run(fmt.Sprintf("%s/%s/%s/fresh=%v", noun, phase, condition["type"], fresh), func(t *testing.T) {
+						resource := accessTestModel()
+						if noun == "agent" {
+							resource, _, _, _, _ = accessTestAgent()
+						}
+						object(resource["status"])["phase"] = phase
+						current := cloneObject(condition)
+						current["observedGeneration"] = 1
+						object(resource["status"])["conditions"] = accessTestObjects(current)
+						if !fresh {
+							object(resource["status"])["observedGeneration"] = 1
+						}
+						client := &accessFakeClient{resources: []Object{resource}}
+						c, out, stderr := accessTestContext(client, nil)
+						result := Run(context.Background(), []string{noun, "wait", stringAt(resource, "metadata", "name"), "--namespace", "test", "--timeout", "5ms", "--output", "json"}, RunOptions{Client: client, IO: c.IO, Config: &CLIConfig{}})
+						code, exit := "FAILED", 1
+						if !fresh {
+							code, exit = "TIMEOUT", 4
+						}
+						if result != exit || stringAt(accessTestJSON(t, stderr), "error", "code") != code || out.Len() != 0 {
+							t.Fatal(result, out.String(), stderr.String())
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestAccessSessionDeadlineSelection(t *testing.T) {
+	for _, scenario := range []struct {
+		name, action         string
+		flags                Flags
+		interactive, session bool
+	}{
+		{"connect", "connect", nil, false, true},
+		{"follow logs", "logs", Flags{"follow": {"true"}}, false, true},
+		{"non-follow logs", "logs", Flags{"follow": {"false"}}, false, false},
+		{"interactive chat", "chat", nil, true, true},
+		{"one-shot chat in terminal", "chat", Flags{"message": {"hello"}}, true, false},
+		{"file chat in terminal", "chat", Flags{"message-file": {"-"}}, true, false},
+		{"noninteractive chat", "chat", nil, false, false},
+		{"endpoint", "endpoint", nil, false, false},
+		{"checked endpoint", "endpoint", Flags{"check": {"true"}}, false, false},
+		{"events", "events", nil, false, false},
+	} {
+		for _, explicit := range []bool{false, true} {
+			for _, parentBound := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/explicit=%v/parent=%v", scenario.name, explicit, parentBound), func(t *testing.T) {
+					var deadline time.Time
+					var bounded bool
+					client := &accessFakeClient{onGet: func(ctx context.Context, _ ResourceType, _, _ string) (Object, error) {
+						deadline, bounded = ctx.Deadline()
+						return nil, cliError(1, "SETUP_PROBE", "stop before side effects")
+					}}
+					c, _, _ := accessTestContext(client, scenario.flags)
+					delete(c.Flags, "timeout")
+					c.IO.Interactive = scenario.interactive
+					if explicit {
+						c.Flags["timeout"] = []string{"1h"}
+					}
+					if parentBound {
+						var cancel context.CancelFunc
+						c.Context, cancel = context.WithTimeout(context.Background(), 20*time.Second)
+						defer cancel()
+					}
+					start := time.Now()
+					accessTestCode(t, runAccess("model", scenario.action, "llama", c), "SETUP_PROBE")
+					if scenario.session && !explicit && !parentBound {
+						if bounded {
+							t.Fatal("unexpected session deadline", deadline)
+						}
+						return
+					}
+					expected := 10 * time.Minute
+					if explicit {
+						expected = time.Hour
+					}
+					if parentBound {
+						expected = 20 * time.Second
+					}
+					if !bounded || deadline.Sub(start) < expected-time.Second || deadline.Sub(start) > expected+time.Second {
+						t.Fatal("wrong deadline", bounded, deadline.Sub(start), "want", expected)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestAccessConnectTLSIdentityMapping(t *testing.T) {
+	for _, scenario := range []string{"https gateway IP", "https agent DNS", "http agent"} {
+		t.Run(scenario, func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.TLS == nil || r.TLS.ServerName != "example.com" {
+					t.Error("wrong SNI", r.TLS)
+				}
+				fmt.Fprint(w, "verified TLS")
+			}))
+			defer server.Close()
+			var noun, name string
+			var resource Object
+			var client *accessFakeClient
+			expectedURL := ""
+			if scenario == "https gateway IP" {
+				model, gateway, route, service := accessTestGateway()
+				object(get(model, "status", "gateway"))["gatewayNamespace"] = "test"
+				object(gateway["metadata"])["namespace"] = "test"
+				objects(get(route, "spec", "parentRefs"))[0]["namespace"] = "test"
+				object(objects(get(route, "status", "parents"))[0]["parentRef"])["namespace"] = "test"
+				object(route["spec"])["hostnames"] = []any{"example.com"}
+				object(service["metadata"])["namespace"] = "test"
+				object(get(service, "metadata", "labels"))["gateway.envoyproxy.io/owning-gateway-namespace"] = "test"
+				client = &accessFakeClient{resources: []Object{model, gateway, route, service, accessTestPod(service, nil)}}
+				resource, noun, name = model, "model", "llama"
+				expectedURL = "https://example.com:8443/models"
+			} else {
+				agent, service, pod, root, secret := accessTestAgent()
+				if scenario == "https agent DNS" {
+					object(get(agent, "status", "runtime"))["address"] = "https://actual-agent-api.test.svc/base"
+					objects(get(service, "spec", "ports"))[0]["port"] = 443
+					expectedURL = "https://actual-agent-api.test.svc/base"
+				}
+				client = &accessFakeClient{resources: []Object{agent, service, pod, root, secret}}
+				resource, noun, name = agent, "agent", "helper"
+			}
+			upstream := strings.TrimPrefix(server.URL, "https://")
+			forward, closed := accessTestForwardServer(t, upstream)
+			client.config = &rest.Config{Host: forward.URL}
+			c, _, stderr := accessTestContext(client, nil)
+			delete(c.Flags, "timeout")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			c.Context = ctx
+			chunks := make(chan string, 4)
+			c.IO.Out = &accessLogChunkWriter{chunks: chunks}
+			done := make(chan error, 1)
+			go func() { done <- runAccess(noun, "connect", name, c) }()
+			var metadata Object
+			select {
+			case raw := <-chunks:
+				if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
+					t.Fatal(err)
+				}
+			case err := <-done:
+				t.Fatal("connect stopped", err)
+			case <-time.After(2 * time.Second):
+				t.Fatal("connect did not publish metadata")
+			}
+			if metadata["access"] != "loopback" {
+				t.Fatal(metadata)
+			}
+			if scenario == "http agent" {
+				local, err := url.Parse(stringAt(metadata, "url"))
+				if err != nil || local.Scheme != "http" || local.Hostname() != "127.0.0.1" || local.Port() == "" || metadata["connectTo"] != nil {
+					t.Fatal(metadata, err)
+				}
+			} else {
+				if metadata["url"] != expectedURL {
+					t.Fatalf("TLS identity changed: %v", metadata)
+				}
+				mapping := strings.Split(stringAt(metadata, "connectTo"), ":")
+				identity, _ := url.Parse(expectedURL)
+				port := identity.Port()
+				if port == "" {
+					port = "443"
+				}
+				if len(mapping) != 4 || mapping[0] != identity.Hostname() || mapping[1] != port || mapping[2] != "127.0.0.1" || mapping[3] == "" {
+					t.Fatal("invalid connect-to mapping", metadata)
+				}
+				if scenario == "https gateway IP" {
+					// Apply the advertised mapping to a normal TLS client. Only its test CA
+					// is added; URL hostname verification and SNI remain enabled.
+					transport := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: server.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs}, DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+						if address != net.JoinHostPort(mapping[0], mapping[1]) {
+							return nil, fmt.Errorf("unexpected dial address %s", address)
+						}
+						return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(mapping[2], mapping[3]))
+					}}
+					httpClient := &http.Client{Transport: transport}
+					defer httpClient.CloseIdleConnections()
+					response, err := httpClient.Get(expectedURL)
+					if err != nil {
+						t.Fatal(err)
+					}
+					data, err := io.ReadAll(response.Body)
+					response.Body.Close()
+					if err != nil || string(data) != "verified TLS" {
+						t.Fatal(string(data), err)
+					}
+					if metadata["upstream"] != "https://203.0.113.3:8443/models" {
+						t.Fatal("lost published address", metadata)
+					}
+				}
+			}
+			cancel()
+			select {
+			case err := <-done:
+				accessTestCode(t, err, "CANCELED")
+			case <-time.After(time.Second):
+				t.Fatal("connect did not cancel")
+			}
+			select {
+			case <-closed:
+			case <-time.After(time.Second):
+				t.Fatal("tunnel not closed")
+			}
+			if stringAt(resource, "kind") == "AgentDeployment" && !strings.Contains(stderr.String(), "no token is printed") {
+				t.Fatal(stderr.String())
+			}
+			for _, call := range client.snapshot() {
+				if call.Type.Kind == "Secret" {
+					t.Fatal("raw tunnel read a token")
+				}
+			}
+		})
 	}
 }

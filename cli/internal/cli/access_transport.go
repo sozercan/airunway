@@ -273,16 +273,19 @@ func accessTransport(ctx context.Context, client ClusterClient, e *accessEndpoin
 	connection.HTTP = accessHTTPClient(connection)
 	return connection, nil
 }
+func accessTLSHost(endpoint *accessEndpoint) string {
+	if h := endpoint.Headers["host"]; h != "" {
+		if u, err := accessSafeURL(endpoint.URL.Scheme + "://" + h); err == nil {
+			return u.Hostname()
+		}
+	}
+	return endpoint.URL.Hostname()
+}
+
 func accessHTTPClient(c *accessConnection) *http.Client {
 	// Inference HTTP never inherits kubeconfig auth, CA roots, proxies, or insecure
 	// TLS settings. Dial loopback while retaining the original URL identity.
-	host := c.Endpoint.URL.Hostname()
-	if h := c.Endpoint.Headers["host"]; h != "" {
-		u, err := accessSafeURL(c.Endpoint.URL.Scheme + "://" + h)
-		if err == nil {
-			host = u.Hostname()
-		}
-	}
+	host := accessTLSHost(c.Endpoint)
 	d := &net.Dialer{}
 	transport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host}, TLSHandshakeTimeout: 10 * time.Second}
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {

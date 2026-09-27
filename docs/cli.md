@@ -290,6 +290,45 @@ not the deployment. Authentication remains required by the upstream service.
 the model credential as an agent-call token. Chat requests may execute configured
 tools, so use trusted frameworks and deliberate prompts.
 
+Gateway access requires the selected HTTPRoute's matching parent to report current
+`Accepted=True` and `ResolvedRefs=True` conditions. The CLI reads the route by
+name: `spec.gateway.httpRouteRef` when configured, otherwise the model name. It
+also checks ownership for controller-managed routes.
+
+`connect`, `logs --follow`, and interactive chat have no default session timeout.
+Use an explicit `--timeout` to limit the entire operation, including setup. A
+calling process's deadline still applies, and Ctrl+C cancels setup or closes the
+session. Waits and finite access operations, including endpoint checks, non-follow
+logs, and one-shot chat, retain the default 10-minute timeout.
+
+### HTTPS tunnels
+
+For HTTP, `connect` returns a loopback URL. For HTTPS, `url` retains the hostname
+needed for certificate verification and SNI. This can be the route's `headers.host`
+when the Gateway publishes an IP address. The `connectTo` field maps that hostname
+and upstream port to the loopback listener using curl's `--connect-to` format.
+Apply the mapping rather than replacing the URL hostname or disabling TLS checks.
+
+Keep the tunnel running in one terminal:
+
+```bash
+airunway model connect demo --port 8443 --output json
+```
+
+In another terminal, replace these example values with `url`, `connectTo`, and any
+required routing headers from the output. Do not put credentials in these values.
+
+```bash
+url='https://inference.example.test:8443/models'
+connect_to='inference.example.test:8443:127.0.0.1:8443'
+route_header='x-gateway-model-name: demo'
+base_url=${url%/}
+curl --connect-to "$connect_to" --header "$route_header" "${base_url%/v1}/v1/models"
+```
+
+The raw tunnel does not inject or print an authentication token. Use the upstream
+service's authentication requirements separately.
+
 ### Logs
 
 ```bash

@@ -85,7 +85,8 @@ Declarative files:
 Global options:
   --kubeconfig FILE --context NAME --namespace NAME, -n NAME
   --output text|json|yaml, -o FORMAT
-  --timeout DURATION      10m by default; supports ms, s, m, h (maximum 24h)
+  --timeout DURATION      Waits and finite access default to 10m (maximum 24h)
+                          Foreground sessions have no default timeout; supports ms, s, m, h
   --wait=false            Return after submission; timeouts do not delete resources
   --dry-run client|server Preview create/apply without persisting anything
   --help, -h              Show help without connecting to a cluster

@@ -459,3 +459,80 @@ func TestPresetConfigPreservesLargeInteger(t *testing.T) {
 		t.Fatalf("preset precision: %v %v", presets, err)
 	}
 }
+
+func TestModelCreateWithoutProviderDiscoveryAccess(t *testing.T) {
+	for _, provider := range []string{"", "vllm"} {
+		for _, dry := range []string{"", "server"} {
+			t.Run(provider+"/"+dry, func(t *testing.T) {
+				var mu sync.Mutex
+				paths := []string{}
+				writes := 0
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					mu.Lock()
+					defer mu.Unlock()
+					paths = append(paths, r.Method+" "+r.URL.Path)
+					if r.Method == http.MethodGet {
+						w.WriteHeader(http.StatusForbidden)
+						fmt.Fprint(w, `{}`)
+						return
+					}
+					if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/modeldeployments") {
+						t.Error("unexpected write", r.Method, r.URL.Path)
+						w.WriteHeader(400)
+						return
+					}
+					writes++
+					if (r.URL.Query().Get("dryRun") == "All") != (dry == "server") {
+						t.Error("dry-run lost")
+					}
+					var resource Object
+					_ = json.NewDecoder(r.Body).Decode(&resource)
+					w.WriteHeader(http.StatusCreated)
+					_ = json.NewEncoder(w).Encode(resource)
+				}))
+				defer server.Close()
+				client, err := NewKubernetesClient(&rest.Config{Host: server.URL}, "team")
+				if err != nil {
+					t.Fatal(err)
+				}
+				args := []string{"model", "create", "demo", "--id", "hf://Qwen/Qwen3-8B", "--namespace", "team", "--wait=false", "--output=json"}
+				if provider != "" {
+					args = append(args, "--provider", provider)
+				}
+				if dry != "" {
+					args = append(args, "--dry-run", dry)
+				}
+				var out, stderr bytes.Buffer
+				code := Run(context.Background(), args, RunOptions{IO: &IO{Out: &out, Err: &stderr}, Client: client, Config: &CLIConfig{Version: 1, Contexts: map[string]*ContextDefaults{}}})
+				if code != 0 {
+					t.Fatalf("editor create failed: %d %s", code, stderr.String())
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				if writes != 1 || len(paths) != 2 {
+					t.Fatalf("unexpected requests: %v", paths)
+				}
+				expected := "GET /apis/airunway.ai/v1alpha1/inferenceproviderconfigs"
+				if provider != "" {
+					expected += "/vllm"
+				}
+				if paths[0] != expected {
+					t.Fatalf("discovery required excess access: %v", paths)
+				}
+			})
+		}
+	}
+}
+
+func TestModelDiscoveryFallbackPreservesCredentialChecks(t *testing.T) {
+	resource := Object{"spec": Object{"model": Object{"id": "org/model", "source": "huggingface"}, "secrets": Object{"huggingFaceToken": "private"}}}
+	client := &managementFakeClient{failure: func(c managementCall) error { return cliError(3, "HTTP_403", "Forbidden") }}
+	ctx := &CommandContext{Context: context.Background(), Namespace: "team"}
+	err := preflight(resource, "model", ctx, client)
+	if !accessHasCode(err, "HTTP_403") {
+		t.Fatalf("credential authorization bypassed: %v", err)
+	}
+	if len(client.calls) != 2 || client.calls[1].typ.Kind != "Secret" {
+		t.Fatal(client.calls)
+	}
+}

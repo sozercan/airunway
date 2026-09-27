@@ -99,6 +99,9 @@ func waitForResource(parent context.Context, client ClusterClient, noun string, 
 		generation := intAt(current, "metadata", "generation")
 		fresh := generation > 0 && intAt(current, "status", "observedGeneration") >= generation
 		phase := stringAt(current, "status", "phase")
+		if fresh && (phase == "Failed" || phase == "Error") {
+			return nil, cliError(1, "FAILED", "The resource failed. Inspect its logs and events for details.")
+		}
 		ready, completed := false, false
 		for _, condition := range objects(get(current, "status", "conditions")) {
 			if generation <= 0 || intAt(condition, "observedGeneration") < generation {
@@ -282,6 +285,56 @@ func accessServedModelName(ctx context.Context, client ClusterClient, resource O
 	return declared, nil
 }
 
+// Parent status corresponds to the spec reference, including its listener/port
+// constraints. Defaults apply only to omitted fields, not an explicit core group.
+func accessRouteParentKey(ref Object, namespace string) [6]string {
+	group, kind := accessRouteType.Group, "Gateway"
+	if ref["group"] != nil {
+		group = stringAt(ref, "group")
+	}
+	if ref["kind"] != nil {
+		kind = stringAt(ref, "kind")
+	}
+	if ref["namespace"] != nil {
+		namespace = stringAt(ref, "namespace")
+	}
+	return [6]string{group, kind, namespace, stringAt(ref, "name"), stringAt(ref, "sectionName"), strconv.FormatInt(intAt(ref, "port"), 10)}
+}
+
+func accessRouteParentCurrent(route, parent Object, namespace string) bool {
+	generation := intAt(route, "metadata", "generation")
+	if generation <= 0 {
+		return false
+	}
+	key := accessRouteParentKey(parent, namespace)
+	if key[0] != accessRouteType.Group || key[1] != "Gateway" {
+		return false
+	}
+	matched := false
+	for _, status := range objects(get(route, "status", "parents")) {
+		if accessRouteParentKey(object(status["parentRef"]), namespace) != key {
+			continue
+		}
+		matched = true
+		accepted, resolved := false, false
+		for _, condition := range objects(status["conditions"]) {
+			kind := stringAt(condition, "type")
+			if kind != "Accepted" && kind != "ResolvedRefs" {
+				continue
+			}
+			if stringAt(condition, "status") != "True" || intAt(condition, "observedGeneration") < generation {
+				return false
+			}
+			accepted = accepted || kind == "Accepted"
+			resolved = resolved || kind == "ResolvedRefs"
+		}
+		if !accepted || !resolved {
+			return false
+		}
+	}
+	return matched
+}
+
 func accessGatewayEndpoint(ctx context.Context, client ClusterClient, resource Object, flags Flags, fallback string, requireService bool) (*accessEndpoint, error) {
 	status := object(get(resource, "status", "gateway"))
 	ns := stringAt(status, "gatewayNamespace")
@@ -292,66 +345,62 @@ func accessGatewayEndpoint(ctx context.Context, client ClusterClient, resource O
 	if err != nil {
 		return nil, err
 	}
-	// HTTPRouteRef is a name in the ModelDeployment namespace. An explicitly
-	// configured route is user-owned; do not list or substitute other routes.
+	// Both route variants have a known name in the model namespace. Only the
+	// managed route requires ownership; neither needs namespace-wide list access.
 	routeName := stringAt(resource, "spec", "gateway", "httpRouteRef")
-	var routes []Object
-	if routeName != "" {
-		route, err := accessGet(ctx, client, accessRouteType, accessNamespace(resource, fallback), routeName)
-		if err != nil {
-			return nil, err
-		}
-		routes = []Object{route}
-	} else {
-		routes, err = accessList(ctx, client, accessRouteType, accessNamespace(resource, fallback), nil)
-		if err != nil {
-			return nil, err
-		}
+	managed := routeName == ""
+	if managed {
+		routeName = stringAt(resource, "metadata", "name")
+	}
+	route, err := accessGet(ctx, client, accessRouteType, accessNamespace(resource, fallback), routeName)
+	if err != nil {
+		return nil, err
 	}
 	type candidate struct{ route, listener, match Object }
 	candidates := []candidate{}
-	for _, route := range routes {
-		if routeName == "" && !accessOwnedBy(route, resource) {
+	if managed && !accessOwnedBy(route, resource) {
+		return nil, accessUnsupported("The managed HTTPRoute is not owned by this ModelDeployment.")
+	}
+	for _, parent := range objects(get(route, "spec", "parentRefs")) {
+		if !accessRouteParentCurrent(route, parent, accessNamespace(route, fallback)) {
 			continue
 		}
-		for _, parent := range objects(get(route, "spec", "parentRefs")) {
-			parentNS := stringAt(parent, "namespace")
-			if parentNS == "" {
-				parentNS = accessNamespace(route, fallback)
-			}
-			if stringAt(parent, "name") != stringAt(gateway, "metadata", "name") || parentNS != ns || (stringAt(parent, "kind") != "" && stringAt(parent, "kind") != "Gateway") || (stringAt(parent, "group") != "" && stringAt(parent, "group") != accessRouteType.Group) {
+		parentNS := stringAt(parent, "namespace")
+		if parentNS == "" {
+			parentNS = accessNamespace(route, fallback)
+		}
+		if stringAt(parent, "name") != stringAt(gateway, "metadata", "name") || parentNS != ns || (stringAt(parent, "kind") != "" && stringAt(parent, "kind") != "Gateway") || (stringAt(parent, "group") != "" && stringAt(parent, "group") != accessRouteType.Group) {
+			continue
+		}
+		for _, listener := range objects(get(gateway, "spec", "listeners")) {
+			protocol, name := stringAt(listener, "protocol"), stringAt(listener, "name")
+			if (protocol != "HTTP" && protocol != "HTTPS") || (stringAt(parent, "sectionName") != "" && stringAt(parent, "sectionName") != name) || (intAt(parent, "port") != 0 && intAt(parent, "port") != intAt(listener, "port")) || (flags.Text("gateway-listener") != "" && flags.Text("gateway-listener") != name) {
 				continue
 			}
-			for _, listener := range objects(get(gateway, "spec", "listeners")) {
-				protocol, name := stringAt(listener, "protocol"), stringAt(listener, "name")
-				if (protocol != "HTTP" && protocol != "HTTPS") || (stringAt(parent, "sectionName") != "" && stringAt(parent, "sectionName") != name) || (intAt(parent, "port") != 0 && intAt(parent, "port") != intAt(listener, "port")) || (flags.Text("gateway-listener") != "" && flags.Text("gateway-listener") != name) {
-					continue
+			for _, rule := range objects(get(route, "spec", "rules")) {
+				matches := objects(rule["matches"])
+				if len(matches) == 0 {
+					matches = []Object{{}}
 				}
-				for _, rule := range objects(get(route, "spec", "rules")) {
-					matches := objects(rule["matches"])
-					if len(matches) == 0 {
-						matches = []Object{{}}
+				for _, match := range matches {
+					if (stringAt(match, "method") != "" && stringAt(match, "method") != "POST") || len(array(match["queryParams"])) > 0 || (stringAt(match, "path", "type") != "" && stringAt(match, "path", "type") != "PathPrefix") {
+						continue
 					}
-					for _, match := range matches {
-						if (stringAt(match, "method") != "" && stringAt(match, "method") != "POST") || len(array(match["queryParams"])) > 0 || (stringAt(match, "path", "type") != "" && stringAt(match, "path", "type") != "PathPrefix") {
-							continue
+					usable := true
+					for _, h := range objects(match["headers"]) {
+						if stringAt(h, "type") != "" && stringAt(h, "type") != "Exact" {
+							usable = false
 						}
-						usable := true
-						for _, h := range objects(match["headers"]) {
-							if stringAt(h, "type") != "" && stringAt(h, "type") != "Exact" {
-								usable = false
-							}
-						}
-						if usable {
-							candidates = append(candidates, candidate{route, listener, match})
-						}
+					}
+					if usable {
+						candidates = append(candidates, candidate{route, listener, match})
 					}
 				}
 			}
 		}
 	}
 	if len(candidates) == 0 {
-		return nil, accessUnsupported("No usable HTTPRoute and HTTP(S) listener were found for this model. Inspect its gateway route.")
+		return nil, accessUnsupported("No current, accepted HTTPRoute with resolved references and a matching HTTP(S) listener was found for this model. Inspect its gateway route.")
 	}
 	if len(candidates) != 1 {
 		return nil, accessUnsupported("The gateway has multiple matching routes or listeners. Select one with --gateway-listener or simplify the route.")
@@ -556,9 +605,20 @@ func runAccess(noun, action, name string, c *CommandContext) error {
 	if err := validateName(name, "name"); err != nil {
 		return err
 	}
-	ctx, cancel, err := accessDeadline(c.Context, c.Flags)
-	if err != nil {
-		return err
+	session := action == "connect" || (action == "logs" && c.Flags.Bool("follow")) ||
+		(action == "chat" && c.IO.Interactive && !c.Flags.Has("message") && !c.Flags.Has("message-file"))
+	var ctx context.Context
+	var cancel context.CancelFunc
+	var err error
+	if session && !c.Flags.Has("timeout") {
+		// Keep cancellation and any caller deadline, without imposing a finite
+		// operation's default timeout on an open-ended session.
+		ctx, cancel = context.WithCancel(c.Context)
+	} else {
+		ctx, cancel, err = accessDeadline(c.Context, c.Flags)
+		if err != nil {
+			return err
+		}
 	}
 	defer cancel()
 	client, err := accessCall(ctx, c.Client)
@@ -614,8 +674,25 @@ func runAccess(noun, action, name string, c *CommandContext) error {
 		}
 		defer tunnel.Close()
 		local := *e.URL
-		local.Host = net.JoinHostPort("127.0.0.1", strconv.Itoa(tunnel.Port))
+		loopback := net.JoinHostPort("127.0.0.1", strconv.Itoa(tunnel.Port))
 		v := accessEndpointView(e, resource)
+		if local.Scheme == "https" {
+			// A loopback URL would change certificate verification and SNI. Keep
+			// the TLS identity and advertise the separate network mapping instead.
+			host, port := accessTLSHost(e), local.Port()
+			if port == "" {
+				port = "443"
+				local.Host = host
+				if strings.Contains(host, ":") {
+					local.Host = "[" + host + "]"
+				}
+			} else {
+				local.Host = net.JoinHostPort(host, port)
+			}
+			v["connectTo"] = net.JoinHostPort(host, port) + ":" + loopback
+		} else {
+			local.Host = loopback
+		}
 		v["url"], v["upstream"], v["access"] = local.String(), e.URL.String(), "loopback"
 		if err := writeOutput(c.IO, c.Flags, v); err != nil {
 			return err
