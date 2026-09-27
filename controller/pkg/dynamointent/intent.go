@@ -22,6 +22,8 @@ type Spec struct {
 	SearchStrategy string    `json:"searchStrategy,omitempty"`
 	Workload       *Workload `json:"workload,omitempty"`
 	SLA            *SLA      `json:"sla,omitempty"`
+	// Overrides retain Dynamo-native job and generated-workload customization.
+	Overrides json.RawMessage `json:"overrides,omitempty"`
 }
 type Hardware struct {
 	TotalGPUs      int32    `json:"totalGpus"`
@@ -96,6 +98,9 @@ func Parse(md *api.ModelDeployment) (*Spec, error) {
 func Validate(md *api.ModelDeployment) error {
 	spec, err := Parse(md)
 	if err != nil || spec == nil {
+		return err
+	}
+	if err := validateOverrides(spec.Overrides); err != nil {
 		return err
 	}
 	if spec.Hardware.TotalGPUs < 1 || spec.Hardware.TotalGPUs > 64 {

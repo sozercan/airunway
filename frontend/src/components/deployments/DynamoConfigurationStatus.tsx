@@ -13,6 +13,7 @@ type Draft = { action: 'retry' | 'reconfigure'; intent: DynamoIntent; modelId: s
 export function DynamoConfigurationStatus({ deployment }: { deployment: DeploymentStatus }) {
   const client = useQueryClient()
   const [draft, setDraft] = useState<Draft | null>(null)
+  const [intentValid, setIntentValid] = useState(true)
   const mutation = useMutation({
     retry: false,
     throwOnError: false,
@@ -29,12 +30,13 @@ export function DynamoConfigurationStatus({ deployment }: { deployment: Deployme
   const start = (action: Draft['action']) => {
     if (!deployment.intent || !deployment.resourceVersion) return
     mutation.reset()
+    setIntentValid(true)
     setDraft({ action, intent: structuredClone(deployment.intent), resourceVersion: deployment.resourceVersion,
       modelId: deployment.modelId, engine: deployment.engine as Draft['engine'] })
   }
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!draft) return
+    if (!draft || (draft.action === 'reconfigure' && !intentValid)) return
     mutation.mutate({ resourceVersion: draft.resourceVersion,
       ...(draft.action === 'reconfigure' ? { intent: draft.intent, modelId: draft.modelId, engine: draft.engine } : {}) })
   }
@@ -65,11 +67,11 @@ export function DynamoConfigurationStatus({ deployment }: { deployment: Deployme
             <div className="space-y-2"><Label htmlFor="reconfigure-engine">Model server</Label><select id="reconfigure-engine" className="w-full rounded-md border bg-background p-2" value={draft.engine} onChange={e => setDraft({ ...draft, engine: e.target.value as Draft['engine'] })}>
               <option value="vllm">vLLM</option><option value="sglang">SGLang</option><option value="trtllm">TensorRT-LLM</option>
             </select></div>
-            <DynamoIntentFields prefix="reconfigure" value={draft.intent} onChange={intent => setDraft({ ...draft, intent })} />
+            <DynamoIntentFields prefix="reconfigure" value={draft.intent} onValidityChange={setIntentValid} onChange={intent => setDraft({ ...draft, intent })} />
           </fieldset>}
           {mutation.error && <p role="alert" className="text-sm text-destructive">{mutation.error.message}</p>}
           <DialogFooter><Button type="button" variant="outline" disabled={mutation.isPending} onClick={() => setDraft(null)}>Cancel</Button>
-            <Button type="submit" variant="destructive" disabled={mutation.isPending}>{mutation.isPending ? 'Submitting...' : draft.action === 'retry' ? 'Confirm retry' : 'Confirm reconfiguration'}</Button>
+            <Button type="submit" variant="destructive" disabled={mutation.isPending || !intentValid}>{mutation.isPending ? 'Submitting...' : draft.action === 'retry' ? 'Confirm retry' : 'Confirm reconfiguration'}</Button>
           </DialogFooter>
         </form>}
       </DialogContent>

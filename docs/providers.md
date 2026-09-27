@@ -98,6 +98,8 @@ latency targets. Do not specify manual resources or replica counts: Dynamo choos
 the topology and allocation within the profiling budget.
 
 ```yaml
+# Requires Dynamo 1.5 with native beta DGD overrides and args append support.
+# GPU discovery and the installation's profiler credentials must be available.
 apiVersion: airunway.ai/v1alpha1
 kind: ModelDeployment
 metadata:
@@ -117,6 +119,27 @@ spec:
         hardware:
           totalGpus: 1
         searchStrategy: rapid
+        overrides:
+          profilingJob:
+            activeDeadlineSeconds: 1800
+          dgd:
+            apiVersion: nvidia.com/v1beta1
+            kind: DynamoGraphDeployment
+            spec:
+              components:
+                - name: VllmDecodeWorker
+                  podTemplate:
+                    spec:
+                      containers:
+                        - name: main
+                          # Keep generated launch arguments and add the Qwen3 parsers.
+                          $patch:
+                            args: append
+                          args:
+                            - --dyn-tool-call-parser
+                            - hermes
+                            - --dyn-reasoning-parser
+                            - qwen3
         workload:
           isl: 1024
           osl: 256
@@ -150,12 +173,82 @@ Rapid profiling uses performance estimates and can fall back to a basic
 configuration. A generated configuration or healthy deployment is not proof that
 it meets the requested performance targets.
 
+#### Advanced automatic configuration
+
+The web UI's **Advanced configuration** JSON field is available in Automatic
+configuration and in Reconfigure. Enter the contents of
+`spec.provider.overrides.intent.overrides`, not a whole ModelDeployment or an
+extra `spec` block. Leave it blank to omit overrides, or clear it to remove saved
+overrides. Invalid JSON or malformed root/child objects block preview, creation,
+and reconfiguration until corrected. The server checks native fields, version
+compatibility, and policy.
+
+Only two optional children are accepted:
+
+- `profilingJob`, an object with native profiling-job settings. The example above
+  sets `activeDeadlineSeconds: 1800`.
+- `dgd`, a partial versioned `DynamoGraphDeployment` with `apiVersion`, `kind`, a
+  `spec` object, and optional `metadata`. Use the shape for your Dynamo version.
+
+| DGD API version | Override shape | Runtime |
+| --- | --- | --- |
+| `nvidia.com/v1alpha1` | `spec.services.<name>.extraPodSpec.mainContainer` | Legacy 1.1.1 contract |
+| `nvidia.com/v1beta1` | `spec.components[]` with named entries, then `podTemplate.spec.containers[]` | Dynamo 1.5 contract; not supported on 1.1.1 |
+
+For Dynamo 1.5, use the native beta shape shown in the complete Qwen3 example
+above. Names are case-sensitive and must match generated components and
+containers. `VllmDecodeWorker` and `main` select the generated vLLM worker and its
+container. Beta components, containers, and container environment variables merge
+by `name`. Container `args` normally replaces the generated argument list. To
+keep the generated launch arguments, put `$patch: {args: append}` on the named
+container alongside a non-empty `args` list. The target container must already
+have generated arguments. Runway preserves this directive for Dynamo to process.
+
+The alpha DGD API uses a service map and appends worker arguments:
+
+```yaml
+# Contents of spec.provider.overrides.intent.overrides for the alpha DGD API.
+dgd:
+  apiVersion: nvidia.com/v1alpha1
+  kind: DynamoGraphDeployment
+  spec:
+    services:
+      VllmDecodeWorker:
+        extraPodSpec:
+          mainContainer:
+            args:
+              - --dyn-tool-call-parser
+              - hermes
+              - --dyn-reasoning-parser
+              - qwen3
+```
+
+These are targeted modifications to a generated topology, not a way to add
+workers or set a manual GPU allocation. `resources` and `replicas` keys remain
+forbidden anywhere inside typed overrides, including nested objects and arrays.
+Privileged settings such as `securityContext`, host access, and service-account
+selection are also forbidden. Keep the total GPU budget in
+`intent.hardware.totalGpus`; do not add `spec.resources` or `spec.scaling`.
+The ordinary image and argument controls remain manual-only. No new top-level
+parser fields are needed for the Qwen3 example.
+
+See the [upstream override and append contract](https://github.com/ai-dynamo/dynamo/blob/b83b1d9304ebfc624709ac46db32b1b6f1ff1615/docs/fern/pages/kubernetes/auto-deployment/auto-deploy-with-dgdr.md#optional-customize-the-generated-dgd)
+for the native merge behavior. Runway's typed-mode sizing and security restrictions
+still apply.
+
 #### Request lifecycle and explicit reconfiguration
 
-Once profiling starts, normal edits to profiling inputs are rejected. Gateway
+Once profiling starts, normal edits to profiling inputs, including
+`intent.overrides`, are rejected. Gateway
 changes do not restart profiling. Failed requests do not automatically rerun.
 Use the web UI's Retry or Reconfigure action to explicitly create a new request.
 Reconfiguration can interrupt service; it is not a zero-downtime migration.
+
+When a reconfiguration request supplies `intent`, it replaces the whole intent,
+not just the fields in that object. Include all desired hardware, workload,
+latency, search, and override settings. Omitting `overrides` from a replacement
+intent removes them. The UI preserves saved overrides while editing other fields;
+a retry without replacement inputs keeps the existing intent.
 
 For YAML workflows, changing the `airunway.ai/dynamo-attempt` annotation to a new
 short token explicitly starts a fresh attempt. To change profiling inputs, update
@@ -180,18 +273,21 @@ Omit `deploymentMode`, or set it to `manual`, to render a DGD directly. Manual
 configuration retains ordinary resource updates and scaling; DGDR input
 immutability does not apply to manual deployments.
 
-Existing `deploymentMode: intent` resources using `overrides.spec` retain the
+Existing `deploymentMode: intent` resources using `spec.provider.overrides.spec` retain the
 legacy pass-through format. That format derives the GPU budget from normal
 resource/replica fields and lets upstream validate additional fields. It must not
-be combined with the typed `intent` block. Legacy profiler-only requests using
+be combined with the typed `intent` block, even when that block contains its own
+nested `overrides`. Legacy profiler-only requests using
 `autoApply: false` are not equivalent to a serving deployment.
 
 Typed intent deliberately does not reuse `spec.engine.image` as a profiler image,
 or reinterpret manual engine arguments as topology-independent overrides.
-Custom engine images/arguments, served-model aliases, environment variables, pod
-metadata, placement settings, custom token-secret names, and storage volumes are
-not accepted by the initial typed workflow. Use manual mode for those settings,
-or the legacy intent format for an explicit upstream model-cache snapshot path.
+Manual engine images/arguments, served-model aliases, environment variables, pod
+metadata, placement settings, custom token-secret names, and storage volumes
+cannot be supplied through the ordinary ModelDeployment fields in typed mode.
+Use manual mode for those controls. For supported native customizations, use the
+nested `intent.overrides` object described above. The legacy intent format is
+still available for an explicit upstream model-cache snapshot path.
 The existing API-defaulted `engine.enablePrefixCaching` value is not an optimizer
 constraint; cache tuning belongs in manual mode. Unsupported customization fails
 validation rather than being silently dropped.

@@ -165,6 +165,29 @@ func (t *Transformer) applyTypedIntent(spec map[string]any, md *api.ModelDeploym
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return err
 	}
+	if overrides, ok := fields["overrides"].(map[string]any); ok {
+		// The schemas require JobSpec.template; Dynamo's typed round-trip also
+		// emits PodSpec.containers. Keep that list empty rather than null so a
+		// partial override survives admission and later operator updates.
+		if job, ok := overrides["profilingJob"].(map[string]any); ok {
+			if _, present := job["template"]; !present {
+				job["template"] = map[string]any{}
+			}
+			if template, ok := job["template"].(map[string]any); ok {
+				if _, present := template["spec"]; !present {
+					template["spec"] = map[string]any{}
+				}
+				if pod, ok := template["spec"].(map[string]any); ok {
+					if _, present := pod["containers"]; !present {
+						pod["containers"] = []any{}
+					}
+				}
+			}
+		}
+		if dgd, ok := overrides["dgd"].(map[string]any); ok && dgd["apiVersion"] == "nvidia.com/v1beta1" && t.runtimeVersion != "" && !t.modernRuntime {
+			return fmt.Errorf("intent.overrides.dgd with nvidia.com/v1beta1 requires Dynamo 1.5.0 or newer; use nvidia.com/v1alpha1 for older runtimes")
+		}
+	}
 	for key, value := range fields {
 		spec[key] = value
 	}

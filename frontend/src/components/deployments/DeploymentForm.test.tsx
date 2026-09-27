@@ -59,7 +59,7 @@ vi.mock('./AIConfiguratorPanel', () => ({
 vi.mock('./ManifestViewer', () => ({
   ManifestViewer: (props: unknown) => {
     manifestViewerMock(props)
-    return null
+    return <div data-testid="manifest-preview" />
   },
 }))
 
@@ -123,6 +123,72 @@ describe('DeploymentForm', () => {
     toast.mockReset()
     manifestViewerMock.mockReset()
     gatewayMock.data = { available: false }
+  })
+
+  it.each([
+    ['{"profilingJob":', 'Enter valid JSON'],
+    ['{"profilingJob":{"activeDeadlineSeconds":1e400}}', 'finite'],
+  ])('blocks preview and creation for invalid advanced configuration, then submits the corrected value: %s', async (invalidText, error) => {
+    const model = createModel({ id: 'Qwen/Qwen3-0.6B', name: 'Qwen3', size: '0.6B', parameterCount: 600_000_000, estimatedGpuMemoryGb: 2 })
+    const runtime = createRuntime({ id: 'dynamo', name: 'Dynamo' })
+    render(<MemoryRouter><DeploymentForm model={model} detailedCapacity={createCapacity()} runtimes={[runtime]} /></MemoryRouter>)
+    fireEvent.click(screen.getByRole('radio', { name: /Automatic configuration/ }))
+    const editor = screen.getByRole('textbox', { name: /Advanced configuration/ })
+    const submit = screen.getByRole('button', { name: /Deploy Model/ })
+    const form = submit.closest('form')!
+    fireEvent.change(editor, { target: { value: '{"profilingJob":{"activeDeadlineSeconds":1800}}' } })
+    expect(screen.getByTestId('manifest-preview')).toBeInTheDocument()
+    manifestViewerMock.mockClear()
+    fireEvent.change(editor, { target: { value: invalidText } })
+    fireEvent.change(screen.getByRole('spinbutton', { name: /GPU budget/ }), { target: { value: '2' } })
+    expect(editor).toHaveValue(invalidText)
+    expect(screen.getByRole('alert')).toHaveTextContent(error)
+    expect(submit).toBeDisabled()
+    expect(form.checkValidity()).toBe(false)
+    expect(screen.queryByTestId('manifest-preview')).not.toBeInTheDocument()
+    expect(manifestViewerMock).not.toHaveBeenCalled()
+    // Dispatch directly as well, so a native-validation bypass cannot submit stale data.
+    fireEvent.submit(form)
+    expect(mutateAsync).not.toHaveBeenCalled()
+    const overrides = {
+      profilingJob: { activeDeadlineSeconds: 900 },
+      dgd: { apiVersion: 'nvidia.com/v1beta1', kind: 'DynamoGraphDeployment',
+        spec: { components: [{ name: 'VllmDecodeWorker', podTemplate: { spec: { containers: [{
+          name: 'main', $patch: { args: 'append' }, args: ['--dyn-tool-call-parser', 'hermes', '--dyn-reasoning-parser', 'qwen3'],
+        }] } } }] },
+      },
+    }
+    fireEvent.change(editor, { target: { value: JSON.stringify(overrides) } })
+    expect(submit).toBeEnabled()
+    expect(manifestViewerMock.mock.lastCall?.[0].config.providerOverrides).toMatchObject({ intent: { overrides } })
+    fireEvent.submit(form)
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1))
+    expect(mutateAsync.mock.calls[0][0].providerOverrides).toEqual(expect.objectContaining({
+      deploymentMode: 'intent', intent: expect.objectContaining({ hardware: { totalGpus: 2 }, overrides }),
+    }))
+    expect(mutateAsync.mock.calls[0][0].providerOverrides).not.toHaveProperty('spec')
+  })
+
+  it('clears invalid advanced configuration and leaves manual configuration unblocked', () => {
+    const model = createModel({ id: 'Qwen/Qwen3-0.6B', name: 'Qwen3', size: '0.6B', parameterCount: 600_000_000, estimatedGpuMemoryGb: 2 })
+    const runtime = createRuntime({ id: 'dynamo', name: 'Dynamo' })
+    render(<MemoryRouter><DeploymentForm model={model} detailedCapacity={createCapacity()} runtimes={[runtime]} /></MemoryRouter>)
+    fireEvent.click(screen.getByRole('radio', { name: /Automatic configuration/ }))
+    const editor = screen.getByRole('textbox', { name: /Advanced configuration/ })
+    fireEvent.change(editor, { target: { value: '{"profilingJob":{}}' } })
+    fireEvent.change(editor, { target: { value: '[]' } })
+    expect(screen.getByRole('button', { name: /Deploy Model/ })).toBeDisabled()
+    fireEvent.change(editor, { target: { value: '' } })
+    expect(screen.getByRole('button', { name: /Deploy Model/ })).toBeEnabled()
+    expect(manifestViewerMock.mock.lastCall?.[0].config.providerOverrides.intent).not.toHaveProperty('overrides')
+    fireEvent.change(editor, { target: { value: '{' } })
+    fireEvent.click(screen.getByRole('radio', { name: /Manual configuration/ }))
+    expect(screen.queryByRole('textbox', { name: /Advanced configuration/ })).not.toBeInTheDocument()
+    expect(screen.getByTestId('manifest-preview')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Deploy Model/ })).toBeEnabled()
+    fireEvent.click(screen.getByRole('radio', { name: /Automatic configuration/ }))
+    expect(screen.getByRole('textbox', { name: /Advanced configuration/ })).toHaveValue('')
+    expect(screen.getByRole('button', { name: /Deploy Model/ })).toBeEnabled()
   })
 
   it('keeps automatic intent through topology effects and restores manual settings', async () => {

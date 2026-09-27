@@ -102,6 +102,61 @@ Each entry is a `StorageVolume`. Maximum 8 volumes per deployment.
 | `storageClassName` | string | no | StorageClass for controller-created PVCs. Omit to use the cluster default. Set to `""` to disable dynamic provisioning. Only used when `size` is set. |
 | `accessMode` | string | no | PVC access mode for controller-created PVCs. One of `ReadWriteOnce`, `ReadWriteMany`, `ReadOnlyMany`, `ReadWriteOncePod`. Default: `ReadWriteMany`. Only used when `size` is set. |
 
+### spec.provider.overrides.intent.overrides
+
+For Dynamo Automatic configuration, set `spec.provider.name: dynamo` and
+`spec.provider.overrides.deploymentMode: intent`. The typed intent lives at
+`spec.provider.overrides.intent`; its optional native customization object is
+`spec.provider.overrides.intent.overrides`.
+
+| Field within `intent.overrides` | Type | Required | Description |
+| --- | --- | --- | --- |
+| `profilingJob` | object | no | Native profiling-job options, such as `activeDeadlineSeconds: 1800`. |
+| `dgd` | object | no | Partial generated DynamoGraphDeployment override. |
+| `dgd.apiVersion` | string | with `dgd` | `nvidia.com/v1alpha1` for the legacy contract or `nvidia.com/v1beta1` for the Dynamo 1.5 contract. Beta overrides are not supported on 1.1.1. |
+| `dgd.kind` | string | with `dgd` | Must be `DynamoGraphDeployment`. |
+| `dgd.metadata` | object | no | Native DGD metadata overrides, subject to upstream validation. |
+| `dgd.spec` | object | with `dgd` | Partial DGD fields in the declared API version's shape. |
+
+Only `profilingJob` and `dgd` are accepted as children of `intent.overrides`.
+Arrays, scalars, and null are not substitutes for these objects. A deadline-only
+`profilingJob` is valid input. When rendering, Runway supplies the empty
+`template.spec.containers: []` structure wherever those fields are absent. This
+satisfies released DGDR schemas and survives Dynamo's typed API round-trip without
+replacing generated profiling-job settings. Unknown native
+fields and incompatible versions fail validation. Runway does not translate the
+override from one DGD shape to another.
+
+- Alpha uses `dgd.spec.services.<serviceName>.extraPodSpec.mainContainer`.
+  Worker `args` append to the generated arguments.
+- For Dynamo 1.5, use beta's `dgd.spec.components[]` entries identified by `name`,
+  with `podTemplate.spec.containers[]` entries also identified by `name`.
+  Container `args` replaces the generated list unless the same container includes
+  `$patch: {args: append}`. Append requires a non-empty argument list and an
+  existing target container with generated arguments. Runway preserves `$patch`
+  for the upstream merge.
+
+The typed path rejects `resources` and `replicas` recursively, including inside
+arrays. GPU sizing remains controlled by `intent.hardware.totalGpus`. Privileged
+fields, including `securityContext`, service-account selection, and host access,
+remain forbidden. Nested overrides do not enable manual `spec.resources`,
+`spec.scaling`, or ordinary engine image/argument fields.
+
+Do not confuse this path with legacy `spec.provider.overrides.spec`. That sibling
+`spec` block is still incompatible with typed `intent`; it cannot be added beside
+`intent` to customize the request.
+
+Overrides participate in profiling-input immutability. After profiling starts,
+changes require an explicit new attempt through Reconfigure or a new
+`airunway.ai/dynamo-attempt` annotation submitted together with the changed inputs.
+A reconfiguration request's `intent` replaces the whole intent, not a deep merge.
+Include every desired setting; omitting `overrides` removes existing overrides.
+Retrying without replacement inputs retains them.
+
+See the [complete Qwen3 example and both override shapes](providers.md#advanced-automatic-configuration)
+and the sample at
+`controller/config/samples/airunway_v1alpha1_modeldeployment_dynamo_intent.yaml`.
+
 ### status.provider workload references
 
 Providers can report `requestRef`, `workloadRef`, and `inferencePoolRef`. Each

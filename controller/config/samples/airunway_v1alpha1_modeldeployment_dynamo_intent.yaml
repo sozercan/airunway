@@ -1,4 +1,5 @@
-# Requires Dynamo with DGDR support and GPU discovery, plus upstream profiler credentials.
+# Requires Dynamo 1.5 with native beta DGD overrides and args append support.
+# GPU discovery and the installation's profiler credentials must be available.
 apiVersion: airunway.ai/v1alpha1
 kind: ModelDeployment
 metadata:
@@ -18,6 +19,27 @@ spec:
         hardware:
           totalGpus: 1
         searchStrategy: rapid
+        overrides:
+          profilingJob:
+            activeDeadlineSeconds: 1800
+          dgd:
+            apiVersion: nvidia.com/v1beta1
+            kind: DynamoGraphDeployment
+            spec:
+              components:
+                - name: VllmDecodeWorker
+                  podTemplate:
+                    spec:
+                      containers:
+                        - name: main
+                          # Keep generated launch arguments and add the Qwen3 parsers.
+                          $patch:
+                            args: append
+                          args:
+                            - --dyn-tool-call-parser
+                            - hermes
+                            - --dyn-reasoning-parser
+                            - qwen3
         workload:
           isl: 1024
           osl: 256

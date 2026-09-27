@@ -51,6 +51,67 @@ describe('Dynamo configuration status', () => {
     expect(reconfigure.mock.calls[0][2].intent.sla).toEqual({ e2eLatency: 5000 })
   })
 
+  it('preserves saved advanced overrides through ordinary reconfiguration edits and refreshes', async () => {
+    reconfigure.mockResolvedValue({ attempt: 'new' })
+    const overrides = {
+      profilingJob: { activeDeadlineSeconds: 1800 },
+      dgd: { apiVersion: 'nvidia.com/v1beta1' as const, kind: 'DynamoGraphDeployment' as const,
+        spec: { components: [{ name: 'VllmDecodeWorker', podTemplate: { spec: { containers: [{
+          name: 'main', $patch: { args: 'append' }, args: ['--dyn-tool-call-parser', 'hermes', '--dyn-reasoning-parser', 'qwen3'],
+        }] } } }] },
+      },
+    }
+    const saved = { ...deployment, intent: { ...defaultDynamoIntent(), overrides } }
+    const view = render(<DynamoConfigurationStatus deployment={saved} />, { wrapper: createWrapper() })
+    fireEvent.click(screen.getByRole('button', { name: 'Reconfigure' }))
+    const editor = screen.getByRole('textbox', { name: /Advanced configuration/ })
+    expect(JSON.parse((editor as HTMLTextAreaElement).value)).toEqual(overrides)
+    fireEvent.change(screen.getByRole('spinbutton', { name: /GPU budget/ }), { target: { value: '2' } })
+    fireEvent.change(screen.getByLabelText('Model ID'), { target: { value: 'Qwen/Qwen3-8B' } })
+    view.rerender(<DynamoConfigurationStatus deployment={{ ...saved, resourceVersion: '43', intent: defaultDynamoIntent() }} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm reconfiguration' }))
+    await waitFor(() => expect(reconfigure).toHaveBeenCalledTimes(1))
+    expect(reconfigure.mock.calls[0][2]).toMatchObject({ resourceVersion: '42', modelId: 'Qwen/Qwen3-8B',
+      intent: { hardware: { totalGpus: 2 }, overrides },
+    })
+  })
+
+  it.each(['{', '{"profilingJob":{"activeDeadlineSeconds":1e400}}'])('blocks invalid reconfiguration without submitting old overrides, and clears them: %s', async invalidText => {
+    reconfigure.mockResolvedValue({ attempt: 'new' })
+    render(<DynamoConfigurationStatus deployment={{ ...deployment, intent: { ...defaultDynamoIntent(), overrides: { profilingJob: { activeDeadlineSeconds: 1800 } } } }} />, { wrapper: createWrapper() })
+    fireEvent.click(screen.getByRole('button', { name: 'Reconfigure' }))
+    const editor = screen.getByRole('textbox', { name: /Advanced configuration/ })
+    const submit = screen.getByRole('button', { name: 'Confirm reconfiguration' })
+    fireEvent.change(editor, { target: { value: invalidText } })
+    fireEvent.change(screen.getByRole('spinbutton', { name: /GPU budget/ }), { target: { value: '2' } })
+    expect(editor).toHaveValue(invalidText)
+    expect(submit).toBeDisabled()
+    expect(submit.closest('form')!.checkValidity()).toBe(false)
+    fireEvent.submit(submit.closest('form')!)
+    expect(reconfigure).not.toHaveBeenCalled()
+    fireEvent.change(editor, { target: { value: '' } })
+    expect(submit).toBeEnabled()
+    fireEvent.click(submit)
+    await waitFor(() => expect(reconfigure).toHaveBeenCalledTimes(1))
+    expect(reconfigure.mock.calls[0][2].intent).not.toHaveProperty('overrides')
+    expect(reconfigure.mock.calls[0][2].intent.hardware.totalGpus).toBe(2)
+  })
+
+  it('discards invalid draft text on cancel without blocking retry or the next reconfiguration', async () => {
+    reconfigure.mockResolvedValue({ attempt: 'new' })
+    render(<DynamoConfigurationStatus deployment={deployment} />, { wrapper: createWrapper() })
+    fireEvent.click(screen.getByRole('button', { name: 'Reconfigure' }))
+    fireEvent.change(screen.getByRole('textbox', { name: /Advanced configuration/ }), { target: { value: '{' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Reconfigure' }))
+    expect(screen.getByRole('textbox', { name: /Advanced configuration/ })).toHaveValue('')
+    expect(screen.getByRole('button', { name: 'Confirm reconfiguration' })).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm retry' }))
+    await waitFor(() => expect(reconfigure).toHaveBeenCalledWith('auto', 'models', { resourceVersion: '42' }))
+  })
+
   it('keeps the opened revision when live status refreshes and reports a conflict without auto-retry', async () => {
     reconfigure.mockRejectedValue(new Error('Deployment changed. Refresh before reconfiguring.'))
     const view = render(<DynamoConfigurationStatus deployment={deployment} />, { wrapper: createWrapper() })

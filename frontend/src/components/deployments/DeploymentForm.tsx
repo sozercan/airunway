@@ -593,6 +593,7 @@ export function DeploymentForm({ model, onAutomaticConfigurationChange, detailed
 
   const intent = getDynamoIntent(config.provider, config.providerOverrides)
   const automatic = !!intent
+  const [intentValid, setIntentValid] = useState(true)
   useEffect(() => { onAutomaticConfigurationChange?.(automatic) }, [automatic, onAutomaticConfigurationChange])
   const manualConfig = useRef<DeploymentConfig | null>(null)
   const changeConfigurationMode = (mode: string) => {
@@ -1048,6 +1049,7 @@ export function DeploymentForm({ model, onAutomaticConfigurationChange, detailed
 
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault()
+    if (automatic && !intentValid) return
 
     try {
       // Build the deployment config, adding KAITO-specific fields if needed
@@ -1173,7 +1175,7 @@ export function DeploymentForm({ model, onAutomaticConfigurationChange, detailed
         variant: 'destructive',
       })
     }
-  }, [config, createDeployment, navigate, toast, triggerConfetti, selectedRuntime, directVllmCustomImageRequired, directVllmImageRef, kaitoComputeType, kaitoResourceType, selectedPremadeModel, isHuggingFaceGgufModel, isVllmModel, model.id, model.gated, ggufFile, ggufRunMode, maxModelLen, gatewayInfo?.available])
+  }, [automatic, intentValid, config, createDeployment, navigate, toast, triggerConfetti, selectedRuntime, directVllmCustomImageRequired, directVllmImageRef, kaitoComputeType, kaitoResourceType, selectedPremadeModel, isHuggingFaceGgufModel, isVllmModel, model.id, model.gated, ggufFile, ggufRunMode, maxModelLen, gatewayInfo?.available])
 
   const updateConfig = <K extends keyof DeploymentConfig>(
     key: K,
@@ -1564,7 +1566,7 @@ export function DeploymentForm({ model, onAutomaticConfigurationChange, detailed
             <span>Automatic configuration<span className="block text-xs text-muted-foreground mt-1">Give Dynamo a GPU budget and performance targets. It chooses the serving layout.</span></span>
           </Label>
         </RadioGroup>
-        {intent && <DynamoIntentFields value={intent} onChange={next => setConfig(prev => ({ ...prev, providerOverrides: { deploymentMode: 'intent', intent: next } }))} />}
+        {intent && <DynamoIntentFields value={intent} onValidityChange={setIntentValid} onChange={next => setConfig(prev => ({ ...prev, providerOverrides: { deploymentMode: 'intent', intent: next } }))} />}
       </section>}
 
       {/* AI Configurator Panel - only show for Dynamo runtime */}
@@ -2655,6 +2657,7 @@ export function DeploymentForm({ model, onAutomaticConfigurationChange, detailed
 
         {/* Manifest Preview - build config with runtime-specific fields */}
         {(() => {
+          if (automatic && !intentValid) return <p className="text-sm text-destructive">Fix advanced configuration to preview or deploy.</p>
           // Build preview config with all necessary fields
           let previewConfig = normalizeGatewayAvailability(config, gatewayInfo?.available);
 
@@ -2740,7 +2743,7 @@ export function DeploymentForm({ model, onAutomaticConfigurationChange, detailed
         </Button>
         <Button
           type="submit"
-          disabled={createDeployment.isProcessing || needsHfAuth || !isRuntimeReady || !isKaitoConfigValid || (fp8Blocked && !automatic)}
+          disabled={createDeployment.isProcessing || needsHfAuth || !isRuntimeReady || !isKaitoConfigValid || (fp8Blocked && !automatic) || (automatic && !intentValid)}
           loading={createDeployment.isProcessing}
           className={cn(
             "flex-1 h-14 rounded-2xl bg-primary text-primary-foreground font-bold shadow-glow-button gap-2",

@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { defaultDynamoIntent, DYNAMO_ATTEMPT_ANNOTATION, type ModelDeployment } from '@airunway/shared';
-import { dynamoIntentSchema, dynamoOverridesSchema, reconfigureDynamoDeployment } from './dynamo-intent';
+import {
+  defaultDynamoIntent, deploymentRequest, getDynamoIntent, toDeploymentStatus, toModelDeploymentManifest,
+  DYNAMO_ATTEMPT_ANNOTATION, type DeploymentConfig, type DynamoIntentOverrides, type ModelDeployment,
+} from '@airunway/shared';
+import { dynamoIntentSchema, dynamoOverridesSchema, dynamoReconfigureSchema, reconfigureDynamoDeployment } from './dynamo-intent';
 
 export function automaticDeployment(): ModelDeployment {
   return {
@@ -15,6 +18,23 @@ export function automaticDeployment(): ModelDeployment {
   };
 }
 
+function nativeOverrides(): DynamoIntentOverrides {
+  return {
+    profilingJob: {
+      activeDeadlineSeconds: 1800,
+      template: { spec: { containers: [{ name: 'profiler', args: ['--verbose'] }], restartPolicy: 'Never' } },
+      futureField: { nested: [null, true, 1.5, { text: '  preserve whitespace  ' }] },
+    },
+    dgd: {
+      apiVersion: 'nvidia.com/v1beta1', kind: 'DynamoGraphDeployment',
+      metadata: { annotations: { 'example.com/note': 'keep me' } },
+      spec: { components: [{ name: 'VllmDecodeWorker', podTemplate: { spec: { containers: [{
+        name: 'main', $patch: { args: 'append' }, args: ['--dyn-tool-call-parser', 'hermes'],
+      }] } } }] },
+    },
+  };
+}
+
 describe('Dynamo intent contract', () => {
   test('validates bounded rapid intents and exclusive alternatives', () => {
     expect(dynamoIntentSchema.safeParse(defaultDynamoIntent()).success).toBe(true);
@@ -25,6 +45,8 @@ describe('Dynamo intent contract', () => {
       { ...defaultDynamoIntent(), hardware: { totalGpus: 1, unknown: 1 } },
       { ...defaultDynamoIntent(), searchStrategy: 'thorough' },
       { ...defaultDynamoIntent(), autoApply: false },
+      { ...defaultDynamoIntent(), model: 'other-model' },
+      { ...defaultDynamoIntent(), backend: 'vllm' },
       { ...defaultDynamoIntent(), workload: { requestRate: 2, concurrency: 4 } },
       { ...defaultDynamoIntent(), workload: { isl: -1 } },
       { ...defaultDynamoIntent(), workload: { requestRate: Infinity } },
@@ -32,6 +54,152 @@ describe('Dynamo intent contract', () => {
     ]) expect(dynamoIntentSchema.safeParse(invalid).success).toBe(false);
     expect(dynamoOverridesSchema.safeParse({ deploymentMode: 'intent', intent: defaultDynamoIntent(), spec: {} }).success).toBe(false);
     expect(dynamoIntentSchema.safeParse({ hardware: { totalGpus: 64, gpuSku: 'H100' }, workload: { concurrency: 2 }, sla: { e2eLatency: 5000 } }).success).toBe(true);
+  });
+
+  test('preserves native JSON, unknown inner fields and beta args append directives', () => {
+    const overrides = nativeOverrides();
+    const intent = { ...defaultDynamoIntent(), overrides };
+    expect(dynamoIntentSchema.parse(intent)).toEqual(intent);
+    expect(dynamoOverridesSchema.parse({ deploymentMode: 'intent', intent })).toEqual({ deploymentMode: 'intent', intent });
+    expect(dynamoReconfigureSchema.parse({ resourceVersion: '42', intent }).intent).toEqual(intent);
+    expect(dynamoOverridesSchema.safeParse({ deploymentMode: 'intent', intent, spec: {} }).success).toBe(false);
+
+    const alpha: DynamoIntentOverrides = {
+      dgd: { apiVersion: 'nvidia.com/v1alpha1', kind: 'DynamoGraphDeployment', spec: {
+        services: { VllmWorker: { extraPodSpec: { mainContainer: { args: ['--verbose'] } } } },
+      } },
+    };
+    for (const allowed of [{}, { profilingJob: {} }, { profilingJob: overrides.profilingJob }, alpha]) {
+      expect(dynamoIntentSchema.parse({ ...defaultDynamoIntent(), overrides: allowed }).overrides).toEqual(allowed);
+    }
+  });
+
+  test('requires object overrides, children, DGD spec and optional metadata', () => {
+    const dgd = nativeOverrides().dgd!;
+    for (const value of [null, [], 'raw', 1, false]) {
+      for (const overrides of [value, { profilingJob: value }, { dgd: value },
+        { dgd: { ...dgd, spec: value } }, { dgd: { ...dgd, metadata: value } }]) {
+        expect(dynamoIntentSchema.safeParse({ ...defaultDynamoIntent(), overrides }).success).toBe(false);
+      }
+    }
+    for (const overrides of [
+      { unknown: {} }, { profilingJob: {}, spec: {} },
+      { dgd: {} }, { dgd: { apiVersion: dgd.apiVersion, kind: dgd.kind } },
+      { dgd: { ...dgd, apiVersion: undefined } }, { dgd: { ...dgd, kind: undefined } },
+      { dgd: { ...dgd, apiVersion: 'nvidia.com/v1' } }, { dgd: { ...dgd, kind: 'Job' } },
+      { dgd: { ...dgd, status: {} } }, { dgd: { ...dgd, unknown: {} } },
+    ]) expect(dynamoIntentSchema.safeParse({ ...defaultDynamoIntent(), overrides }).success).toBe(false);
+  });
+
+  test('rejects non-JSON and non-finite values inside native objects and arrays', () => {
+    for (const invalid of [Infinity, -Infinity, NaN, undefined, 1n, Symbol('invalid'), () => {}, new Date(), new Map(), new Set()]) {
+      const nested = { nested: [[{ value: invalid }]] };
+      for (const overrides of [
+        { profilingJob: nested },
+        { dgd: { ...nativeOverrides().dgd, spec: nested } },
+        { dgd: { ...nativeOverrides().dgd, metadata: nested } },
+      ]) expect(dynamoIntentSchema.safeParse({ ...defaultDynamoIntent(), overrides }).success).toBe(false);
+    }
+  });
+
+  test('validates every native field before parsing and preserves unknown JSON keys', () => {
+    const profilingJob = JSON.parse('{"__proto__":{"futureField":[1,null,"unchanged"]}}');
+    const intent = { ...defaultDynamoIntent(), overrides: { profilingJob } };
+    const parsed = dynamoIntentSchema.parse(intent);
+    expect(parsed).toEqual(intent);
+    expect(parsed.overrides?.profilingJob).not.toBe(profilingJob);
+    const original = automaticDeployment();
+    original.spec.provider!.overrides!.intent = intent;
+    expect(reconfigureDynamoDeployment(original, { resourceVersion: '42' }).spec.provider?.overrides?.intent).toEqual(intent);
+    for (const value of [
+      JSON.parse('{"__proto__":{"nested":[{"HOSTNETWORK":true}]}}'),
+      JSON.parse('{"__proto__":{"value":1e400}}'),
+    ]) {
+      expect(dynamoIntentSchema.safeParse({ ...intent, overrides: { profilingJob: value } }).success).toBe(false);
+    }
+  });
+
+  test('rejects circular and sparse JSON values without rejecting shared object references', () => {
+    const object: Record<string, unknown> = {};
+    object.self = object;
+    const array: unknown[] = [];
+    array.push(array);
+    for (const value of [object, array, new Array(1)]) {
+      expect(dynamoIntentSchema.safeParse({ ...defaultDynamoIntent(), overrides: { profilingJob: { value } } }).success).toBe(false);
+    }
+    const child = { value: true };
+    const intent = { ...defaultDynamoIntent(), overrides: { profilingJob: { first: child, second: child } } };
+    expect(dynamoIntentSchema.parse(intent)).toEqual(intent);
+  });
+
+  test.each([
+    'securityContext', 'serviceAccountName', 'serviceAccount', 'hostNetwork', 'hostPID', 'hostIPC',
+    'automountServiceAccountToken', 'nodeName', 'priorityClassName', 'runtimeClassName', 'resources', 'replicas',
+  ])('rejects %s recursively and case-insensitively in both native overrides', key => {
+    for (const variant of [key, key.toLowerCase(), key.toUpperCase()]) {
+      const forbidden = { [variant]: null };
+      for (const value of [forbidden, { nested: [[forbidden]] }]) {
+        for (const overrides of [
+          { profilingJob: value },
+          { dgd: { ...nativeOverrides().dgd, spec: value } },
+          { dgd: { ...nativeOverrides().dgd, metadata: value } },
+        ]) {
+          const result = dynamoIntentSchema.safeParse({ ...defaultDynamoIntent(), overrides });
+          expect(result.success).toBe(false);
+          if (!result.success) expect(result.error.issues[0].path.at(-1)).toBe(variant);
+        }
+      }
+    }
+  });
+
+  test('shared request, manifest and status helpers retain nested overrides', () => {
+    const intent = { ...defaultDynamoIntent(), overrides: nativeOverrides() };
+    const providerOverrides = { deploymentMode: 'intent', intent };
+    const config: DeploymentConfig = {
+      name: 'test-auto', namespace: 'models', modelId: 'Qwen/Qwen3-0.6B', engine: 'vllm', provider: 'dynamo',
+      mode: 'aggregated', routerMode: 'default', replicas: 1, resources: { gpu: 1 },
+      enforceEager: false, enablePrefixCaching: true, trustRemoteCode: false, providerOverrides,
+    };
+    const request = deploymentRequest(config);
+    expect(request.providerOverrides).toEqual(providerOverrides);
+    expect(request.resources).toBeUndefined();
+    const manifest = toModelDeploymentManifest(config);
+    expect(manifest.spec.provider?.overrides).toEqual(providerOverrides);
+    expect(manifest.spec.resources).toBeUndefined();
+    expect(getDynamoIntent('dynamo', manifest.spec.provider?.overrides)).toEqual(intent);
+    expect(toDeploymentStatus(manifest).intent).toEqual(intent);
+  });
+
+  test('reconfigure retains omitted intent and replaces supplied intent without merging overrides', () => {
+    const original = automaticDeployment();
+    const intent = { ...defaultDynamoIntent(), overrides: nativeOverrides() };
+    original.spec.provider!.overrides!.intent = intent;
+    const retry = reconfigureDynamoDeployment(original, { resourceVersion: '42', engine: 'sglang' });
+    expect(retry.spec.provider?.overrides?.intent).toEqual(intent);
+    const supplied = { ...intent, hardware: { totalGpus: 2 } };
+    const next = reconfigureDynamoDeployment(original, { resourceVersion: '42', intent: supplied });
+    expect(next.spec.provider?.overrides?.intent).toEqual(supplied);
+    expect(original.spec.provider?.overrides?.intent).toEqual(intent);
+    const replaced = { ...defaultDynamoIntent(), overrides: { profilingJob: { backoffLimit: 0 } } };
+    expect(reconfigureDynamoDeployment(original, { resourceVersion: '42', intent: replaced }).spec.provider?.overrides?.intent).toEqual(replaced);
+    expect(reconfigureDynamoDeployment(original, { resourceVersion: '42', intent: defaultDynamoIntent() }).spec.provider?.overrides?.intent).toEqual(defaultDynamoIntent());
+  });
+
+  test('rejects invalid stored overrides and preserves top-level engine restrictions', () => {
+    for (const overrides of [{ profilingJob: [] }, { dgd: { ...nativeOverrides().dgd, spec: { ReSoUrCeS: {} } } }]) {
+      const original = automaticDeployment();
+      original.spec.provider!.overrides!.intent = { ...defaultDynamoIntent(), overrides };
+      expect(() => reconfigureDynamoDeployment(original, { resourceVersion: '42' })).toThrow('valid typed intent');
+    }
+    for (const settings of [
+      { args: { 'max-model-len': '4096' } }, { extraArgs: ['--verbose'] }, { image: 'custom/image' },
+      { contextLength: 4096 }, { trustRemoteCode: true }, { enforceEager: true },
+    ]) {
+      const original = automaticDeployment();
+      original.spec.provider!.overrides!.intent = { ...defaultDynamoIntent(), overrides: nativeOverrides() };
+      original.spec.engine = { ...original.spec.engine, ...settings };
+      expect(() => reconfigureDynamoDeployment(original, { resourceVersion: '42' })).toThrow('require manual configuration');
+    }
   });
 
   test('atomically changes intent, model, engine, and attempt without losing unrelated values', () => {

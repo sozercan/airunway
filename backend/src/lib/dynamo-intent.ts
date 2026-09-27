@@ -5,6 +5,61 @@ import { HTTPException } from 'hono/http-exception';
 const positive = () => z.number().finite().positive();
 const tokens = () => positive().int().max(2_147_483_647);
 
+const forbiddenOverrideKeys = new Set([
+  'securityContext', 'serviceAccountName', 'serviceAccount', 'hostNetwork', 'hostPID', 'hostIPC',
+  'automountServiceAccountToken', 'nodeName', 'priorityClassName', 'runtimeClassName', 'resources', 'replicas',
+].map(key => key.toLowerCase()));
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object'
+    && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+}
+
+// Validate raw JSON before any object parser can strip fields such as __proto__.
+// Dynamo owns the native schema, including unknown fields and merge directives.
+const nativeOverrideObjectSchema = z.custom<Record<string, unknown>>(isJsonObject, {
+  message: 'Native overrides must be JSON objects',
+}).superRefine((object, ctx) => {
+  const ancestors = new Set<object>();
+  const check = (value: unknown, path: Array<string | number>) => {
+    if (value === null || typeof value === 'string' || typeof value === 'boolean'
+      || (typeof value === 'number' && Number.isFinite(value))) return;
+    if (!Array.isArray(value) && !isJsonObject(value)) {
+      ctx.addIssue({ code: 'custom', message: 'Native overrides must contain only finite JSON values', path });
+      return;
+    }
+    if (ancestors.has(value)) {
+      ctx.addIssue({ code: 'custom', message: 'Native overrides must not contain circular references', path });
+      return;
+    }
+    ancestors.add(value);
+    if (Array.isArray(value)) {
+      for (const [index, item] of value.entries()) check(item, [...path, index]);
+    } else {
+      for (const [key, child] of Object.entries(value)) {
+        const childPath = [...path, key];
+        if (forbiddenOverrideKeys.has(key.toLowerCase())) {
+          ctx.addIssue({ code: 'custom', message: `${key} is not allowed in automatic configuration overrides`, path: childPath });
+        } else {
+          check(child, childPath);
+        }
+      }
+    }
+    ancestors.delete(value);
+  };
+  check(object, []);
+}).transform(object => structuredClone(object));
+
+const dynamoIntentOverridesSchema = z.object({
+  profilingJob: nativeOverrideObjectSchema.optional(),
+  dgd: z.object({
+    apiVersion: z.enum(['nvidia.com/v1alpha1', 'nvidia.com/v1beta1']),
+    kind: z.literal('DynamoGraphDeployment'),
+    metadata: nativeOverrideObjectSchema.optional(),
+    spec: nativeOverrideObjectSchema,
+  }).strict().optional(),
+}).strict();
+
 export const dynamoIntentSchema = z.object({
   hardware: z.object({
     totalGpus: z.number().int().min(1).max(64),
@@ -13,6 +68,7 @@ export const dynamoIntentSchema = z.object({
     numGpusPerNode: z.number().int().min(1).max(64).optional(),
   }).strict(),
   searchStrategy: z.literal('rapid').optional().default('rapid'),
+  overrides: dynamoIntentOverridesSchema.optional(),
   workload: z.object({
     isl: tokens().optional(),
     osl: tokens().optional(),

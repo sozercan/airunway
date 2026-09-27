@@ -1,11 +1,62 @@
+import { useEffect, useRef, useState } from 'react'
 import { type DynamoIntent } from '@airunway/shared'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { InfoHint } from '@/components/ui/InfoHint'
 
-export function DynamoIntentFields({ value, onChange, disabled = false, prefix = 'intent' }: {
-  value: DynamoIntent; onChange: (intent: DynamoIntent) => void; disabled?: boolean; prefix?: string
+function parseOverrides(text: string): { overrides?: DynamoIntent['overrides']; error?: string } {
+  if (!text.trim()) return {}
+  let parsed: unknown
+  let hasNonFiniteNumber = false
+  try {
+    parsed = JSON.parse(text, (_key, value: unknown) => {
+      // Reject overflow before JSON.stringify can silently turn it into null.
+      if (typeof value === 'number' && !Number.isFinite(value)) hasNonFiniteNumber = true
+      return value
+    })
+  } catch {
+    return { error: 'Enter valid JSON or clear advanced configuration to use the defaults.' }
+  }
+  if (hasNonFiniteNumber) return { error: 'Numbers in advanced configuration must be finite.' }
+  const isObject = (value: unknown): value is Record<string, unknown> =>
+    value !== null && typeof value === 'object' && !Array.isArray(value)
+  if (!isObject(parsed)) return { error: 'Advanced configuration must be a JSON object.' }
+  if (Object.keys(parsed).some(key => key !== 'profilingJob' && key !== 'dgd')) {
+    return { error: 'Only "profilingJob" and "dgd" are supported in advanced configuration.' }
+  }
+  if ('profilingJob' in parsed && !isObject(parsed.profilingJob)) {
+    return { error: 'The "profilingJob" setting must be a JSON object.' }
+  }
+  if ('dgd' in parsed) {
+    const dgd = parsed.dgd
+    if (!isObject(dgd)) return { error: 'The "dgd" setting must be a JSON object.' }
+    if ((dgd.apiVersion !== 'nvidia.com/v1alpha1' && dgd.apiVersion !== 'nvidia.com/v1beta1') ||
+      dgd.kind !== 'DynamoGraphDeployment' || !isObject(dgd.spec)) {
+      return { error: 'The "dgd" setting needs a supported "apiVersion", "kind": "DynamoGraphDeployment", and a "spec" JSON object.' }
+    }
+    if ('metadata' in dgd && !isObject(dgd.metadata)) {
+      return { error: 'The "metadata" setting must be a JSON object.' }
+    }
+  }
+  // Detailed field and policy validation belongs to the server. Preserve nested
+  // data verbatim, including the beta container $patch.args append directive.
+  return { overrides: parsed as DynamoIntent['overrides'] }
+}
+
+export function DynamoIntentFields({ value, onChange, onValidityChange, disabled = false, prefix = 'intent' }: {
+  value: DynamoIntent; onChange: (intent: DynamoIntent) => void; onValidityChange?: (valid: boolean) => void; disabled?: boolean; prefix?: string
 }) {
+  const savedText = JSON.stringify(value.overrides, null, 2) ?? ''
+  const [draft, setDraft] = useState({ savedText, text: savedText })
+  // Ordinary intent edits must not discard invalid JSON or change its formatting.
+  // Replace the draft only when the supplied overrides themselves change.
+  if (draft.savedText !== savedText) setDraft({ savedText, text: savedText })
+  const { error } = parseOverrides(draft.text)
+  const editorRef = useRef<HTMLTextAreaElement>(null)
+  useEffect(() => {
+    editorRef.current?.setCustomValidity(error ?? '')
+    onValidityChange?.(!error)
+  }, [error, onValidityChange])
   const workload = value.workload || {}
   const sla = value.sla || {}
   const concurrency = Object.prototype.hasOwnProperty.call(workload, 'concurrency')
@@ -55,7 +106,30 @@ export function DynamoIntentFields({ value, onChange, disabled = false, prefix =
           n => onChange({ ...value, sla: { ...sla, itl: n } }), { max: 86400000 })}
       </>}
     </div>
-    <p className="text-sm text-muted-foreground">Custom runtime options, placement rules, and storage are available in manual configuration. Automatic configuration uses the installation's default Hugging Face access.</p>
+    <div className="space-y-2">
+      <Label htmlFor={`${prefix}-overrides`} className="flex items-center gap-2">Advanced configuration (optional)<InfoHint text="Add JSON settings for the configuration search or generated model server. Leave blank to use the defaults. The server checks which settings your installation supports." /></Label>
+      <textarea ref={editorRef} id={`${prefix}-overrides`} rows={6} spellCheck={false}
+        className="w-full rounded-md border bg-background p-2 font-mono text-sm"
+        value={draft.text} aria-invalid={!!error}
+        aria-describedby={`${prefix}-overrides-help${error ? ` ${prefix}-overrides-error` : ''}`}
+        placeholder={'{ "profilingJob": { "activeDeadlineSeconds": 1800 } }'}
+        onChange={e => {
+          const text = e.target.value
+          const result = parseOverrides(text)
+          e.target.setCustomValidity(result.error ?? '')
+          onValidityChange?.(!result.error)
+          if (result.error) {
+            setDraft({ savedText, text })
+          } else {
+            setDraft({ savedText: JSON.stringify(result.overrides, null, 2) ?? '', text })
+            const { overrides: _overrides, ...rest } = value
+            onChange(result.overrides === undefined ? rest : { ...rest, overrides: result.overrides })
+          }
+        }} />
+      <p id={`${prefix}-overrides-help`} className="text-sm text-muted-foreground">Enter only the advanced settings here, not the whole deployment. Clear this field to remove them. GPU allocation and copy counts remain managed automatically.</p>
+      {error && <p id={`${prefix}-overrides-error`} role="alert" className="text-sm text-destructive">{error}</p>}
+    </div>
+    <p className="text-sm text-muted-foreground">The standard runtime options, placement rules, and storage controls are available in manual configuration. Automatic configuration uses the installation's default Hugging Face access.</p>
     <p className="text-sm text-muted-foreground">Dynamo uses a rapid configuration search and starts the selected configuration automatically. These performance targets are not guarantees.</p>
   </fieldset>
 }

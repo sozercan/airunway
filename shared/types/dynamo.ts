@@ -2,6 +2,17 @@ import type { DeploymentConfig } from './deployment';
 
 export const DYNAMO_ATTEMPT_ANNOTATION = 'airunway.ai/dynamo-attempt';
 
+/** Native Dynamo overrides. Inner fields are validated by the upstream schema. */
+export interface DynamoIntentOverrides {
+  profilingJob?: Record<string, unknown>;
+  dgd?: {
+    apiVersion: 'nvidia.com/v1alpha1' | 'nvidia.com/v1beta1';
+    kind: 'DynamoGraphDeployment';
+    metadata?: Record<string, unknown>;
+    spec: Record<string, unknown>;
+  };
+}
+
 /** Bounded automatic-configuration contract shared with the Dynamo provider. */
 export interface DynamoIntent {
   hardware: {
@@ -11,6 +22,7 @@ export interface DynamoIntent {
     numGpusPerNode?: number;
   };
   searchStrategy?: 'rapid';
+  overrides?: DynamoIntentOverrides;
   workload?: { isl?: number; osl?: number; requestRate?: number; concurrency?: number };
   sla?: { ttft?: number; itl?: number; e2eLatency?: number };
 }
