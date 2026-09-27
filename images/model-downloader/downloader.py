@@ -395,7 +395,13 @@ def oci_reference(uri):
         repo, ref = repo.rsplit(":", 1)
         require(TAG.fullmatch(ref), "Invalid OCI tag")
     require(REPOSITORY.fullmatch(repo), "Invalid OCI repository")
-    return "https://" + u.netloc, repo, ref
+    registry = u.netloc
+    # Docker Hub aliases name the registry, not its V2 HTTP endpoint. Resolve
+    # only the standard HTTPS aliases here, without following a redirect or
+    # changing the original URI used by stage() to identify completed caches.
+    if u.hostname in ("docker.io", "index.docker.io") and u.port in (None, 443):
+        registry = "registry-1.docker.io"
+    return "https://" + registry, repo, ref
 
 
 class Registry:

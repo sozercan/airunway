@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 import urllib.error
+import urllib.parse
 
 import downloader as d
 
@@ -257,6 +258,88 @@ sys.exit(d.main())
             d.download_oci("oci://registry.example/org/model@" + digest(manifest), "model/weights.bin", {}, self.output)
         self.assertEqual((self.root / "model/config.json").read_bytes(), b"{}")
         self.assertEqual((self.root / "model/weights.bin").read_bytes(), raw)
+
+    def test_oci_docker_hub_reference_aliases(self):
+        for host in ("docker.io", "index.docker.io", "DOCKER.IO", "docker.io:443", "index.docker.io:443"):
+            with self.subTest(host=host):
+                self.assertEqual(d.oci_reference(f"oci://{host}/org/model:v1"),
+                                 ("https://registry-1.docker.io", "org/model", "v1"))
+        for host in ("registry-1.docker.io", "registry.example", "docker.io:8443", "index.docker.io:8443", "docker.io.example", "index.docker.io.example"):
+            with self.subTest(host=host):
+                self.assertEqual(d.oci_reference(f"oci://{host}/org/model:v1"),
+                                 ("https://" + host, "org/model", "v1"))
+
+    def test_oci_docker_hub_alias_requests_and_cache_identity(self):
+        blob = b'{"fixture":true}'
+        manifest = json.dumps({"schemaVersion": 2, "layers": [{"digest": digest(blob), "size": len(blob), "mediaType": "application/json", "annotations": {"org.opencontainers.image.title": "config.json"}}]}).encode()
+        origin = "https://registry-1.docker.io/v2/org/model/"
+        manifest_url = origin + "manifests/" + digest(manifest)
+        challenge = 'Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:other:push"'
+        for host in ("docker.io", "index.docker.io", "registry-1.docker.io"):
+            with self.subTest(host=host):
+                uri = f"oci://{host}/org/model@" + digest(manifest)
+                root = self.root / host
+                root.mkdir()
+                responses = [Response(status=401, headers={"WWW-Authenticate": challenge}, url=manifest_url), Response(b'{"token":"test-bearer"}'), Response(manifest, headers={"Docker-Content-Digest": digest(manifest)}), Response(blob)]
+                with patch.object(d, "request", side_effect=responses) as req:
+                    d.stage(uri, "", "config.json", {}, str(root / "artifacts"))
+                self.assertEqual([req.call_args_list[i].args[0] for i in (0, 2, 3)],
+                                 [manifest_url, manifest_url, origin + "blobs/" + digest(blob)])
+                token_url, token_headers = req.call_args_list[1].args
+                parsed = urllib.parse.urlsplit(token_url)
+                self.assertEqual((parsed.scheme, parsed.netloc, parsed.path), ("https", "auth.docker.io", "/token"))
+                self.assertEqual(urllib.parse.parse_qs(parsed.query), {"scope": ["repository:org/model:pull"], "service": ["registry.docker.io"]})
+                self.assertEqual(token_headers, {})
+                self.assertEqual(req.call_args_list[3].args[1]["Authorization"], "Bearer test-bearer")
+                self.assertEqual((root / "artifacts/config.json").read_bytes(), blob)
+                self.assertEqual((root / "artifacts" / d.MARKER).read_text(),
+                                 hashlib.sha256(json.dumps([uri, "", "config.json"]).encode()).hexdigest())
+
+    def test_oci_docker_hub_alias_digest_checks(self):
+        blob = b"ok"
+        manifest = json.dumps({"schemaVersion": 2, "layers": [{"digest": digest(blob), "size": len(blob), "mediaType": "application/json", "annotations": {"org.opencontainers.image.title": "config.json"}}]}).encode()
+        for host in ("docker.io", "index.docker.io"):
+            for corruption in ("manifest", "advertised-digest", "blob"):
+                with self.subTest(host=host, corruption=corruption):
+                    root = self.root / (host + "-" + corruption)
+                    root.mkdir()
+                    responses = [Response(b"{}" if corruption == "manifest" else manifest,
+                                          headers={"Docker-Content-Digest": digest(b"wrong") if corruption == "advertised-digest" else digest(manifest)}),
+                                 Response(b"NO" if corruption == "blob" else blob)]
+                    uri = f"oci://{host}/org/model@" + digest(manifest)
+                    with patch.object(d, "request", side_effect=responses) as req, self.assertRaises(d.DownloadError):
+                        d.stage(uri, "", "config.json", {}, str(root / "artifacts"))
+                    self.assertTrue(req.call_args_list[0].args[0].startswith("https://registry-1.docker.io/v2/org/model/"))
+                    self.assertEqual(list(root.iterdir()), [])
+
+    def test_oci_docker_hub_token_service_credential_boundary(self):
+        trusted_realm = "https://auth.docker.io/token"
+        for host in ("docker.io", "index.docker.io"):
+            for realm, trust in ((trusted_realm, False), (trusted_realm, True), ("https://untrusted.example/token", True)):
+                with self.subTest(host=host, realm=realm, trust=trust):
+                    origin, repo, ref = d.oci_reference(f"oci://{host}/org/model:v1")
+                    creds = {"username": "test-user", "password": "test-password"}
+                    if trust:
+                        creds["token_service"] = trusted_realm
+                    responses = [Response(status=401, headers={"WWW-Authenticate": f'Bearer realm="{realm}",service="registry.docker.io",scope="repository:other:push"'}, url=origin + "/v2/org/model/manifests/v1"), Response(b'{"token":"test-bearer"}'), Response(b"manifest")]
+                    with patch.object(d, "request", side_effect=responses) as req:
+                        d.Registry(origin, repo, creds).get("manifests", ref).close()
+                    token_url, headers = req.call_args_list[1].args
+                    self.assertEqual("Authorization" in headers, trust and realm == trusted_realm)
+                    self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(token_url).query), {"scope": ["repository:org/model:pull"], "service": ["registry.docker.io"]})
+
+    def test_oci_docker_hub_redirected_challenge_cannot_replay_credentials(self):
+        origin, repo, ref = d.oci_reference("oci://docker.io/org/model:v1")
+        url = origin + "/v2/org/model/manifests/v1"
+        redirected = "https://untrusted.example/manifest"
+        responses = [urllib.error.HTTPError(url, 302, "", {"Location": redirected}, None),
+                     Response(status=401, headers={"WWW-Authenticate": 'Bearer realm="https://auth.docker.io/token",service="registry.docker.io"'}, url=redirected)]
+        creds = {"username": "test-user", "password": "test-password", "token_service": "https://auth.docker.io/token"}
+        with patch.object(d.HTTP, "open", side_effect=responses) as req, self.assertRaisesRegex(d.DownloadError, "Redirected authentication challenge rejected"):
+            d.Registry(origin, repo, creds).get("manifests", ref)
+        self.assertEqual(req.call_count, 2)
+        self.assertIn("Authorization", req.call_args_list[0].args[0].headers)
+        self.assertNotIn("Authorization", req.call_args_list[1].args[0].headers)
 
     def test_oci_corruption_and_unsupported(self):
         for media, checksum in (("application/octet-stream", digest(b"wrong")), ("unsupported/zstd", digest(b"ok"))):
