@@ -11,6 +11,7 @@ import (
 	"unicode"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/util/validation"
 )
 
@@ -96,6 +97,14 @@ func validArtifactRepository(name string) bool {
 		i := strings.IndexByte(name, '/')
 		u, err := url.Parse("https://" + name[:i])
 		if err != nil || u.User != nil || u.Hostname() == "" || len(validation.IsDNS1123Subdomain(u.Hostname())) != 0 {
+			return false
+		}
+		if port := u.Port(); port != "" {
+			number, err := strconv.Atoi(port)
+			if err != nil || number < 1 || number > 65535 {
+				return false
+			}
+		} else if strings.HasSuffix(u.Host, ":") {
 			return false
 		}
 		name = name[i+1:]
@@ -269,7 +278,7 @@ func (s *ModelDeploymentSpec) validateArtifactDestination(u *url.URL) error {
 		if mount == "" && v.Purpose == VolumePurposeCompilationCache {
 			mount = "/compilation-cache"
 		}
-		if v.Purpose != VolumePurposeModelCache && mount != "" && (mount == root || strings.HasPrefix(mount, root+"/") || strings.HasPrefix(root, mount+"/")) {
+		if v.Purpose != VolumePurposeModelCache && mount != "" && (mount == "/" || mount == root || strings.HasPrefix(mount, root+"/") || strings.HasPrefix(root, mount+"/")) {
 			return fmt.Errorf("artifact path must not overlap another storage mount")
 		}
 	}
@@ -283,7 +292,7 @@ func (s *ModelDeploymentSpec) ValidateArtifactUpdate(old *ModelDeploymentSpec) e
 	if !reflect.DeepEqual(s.Model.Artifact, old.Model.Artifact) {
 		return fmt.Errorf("model.artifact is immutable; delete and recreate the deployment")
 	}
-	if s.Model.Artifact != nil && (!reflect.DeepEqual(s.ArtifactCacheVolume(), old.ArtifactCacheVolume()) || s.Model.ID != old.Model.ID || !reflect.DeepEqual(s.Secrets, old.Secrets)) {
+	if s.Model.Artifact != nil && (!apiequality.Semantic.DeepEqual(s.ArtifactCacheVolume(), old.ArtifactCacheVolume()) || s.Model.ID != old.Model.ID || !reflect.DeepEqual(s.Secrets, old.Secrets)) {
 		return fmt.Errorf("artifact destination and token reference are immutable; delete and recreate the deployment")
 	}
 	return nil

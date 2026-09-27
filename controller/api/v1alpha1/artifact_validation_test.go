@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 func artifactSpec() ModelDeploymentSpec {
@@ -187,6 +188,63 @@ func TestArtifactURIPortRange(t *testing.T) {
 			if _, err := artifact.parseURI(); err != nil {
 				t.Fatalf("valid port rejected in %s: %v", uri, err)
 			}
+		}
+	}
+}
+
+func TestArtifactDownloaderImagePortRange(t *testing.T) {
+	for _, suffix := range []string{":v1", "@sha256:" + strings.Repeat("a", 64)} {
+		for _, port := range []string{"0", "65536", "70000", "999999999999999999999999999", "", "-1", "abc"} {
+			s := artifactSpec()
+			s.Model.Artifact.Image = "registry.example:" + port + "/downloader" + suffix
+			if err := s.ValidateArtifact(); err == nil {
+				t.Errorf("accepted downloader image with invalid port %q", port)
+			}
+		}
+		for _, port := range []string{"1", "443", "65535"} {
+			s := artifactSpec()
+			s.Model.Artifact.Image = "registry.example:" + port + "/downloader" + suffix
+			if err := s.ValidateArtifact(); err != nil {
+				t.Errorf("rejected downloader image with valid port %q: %v", port, err)
+			}
+		}
+	}
+}
+
+func TestArtifactCacheQuantityUpdate(t *testing.T) {
+	old := artifactSpec()
+	size := resource.MustParse("1Gi")
+	old.Model.Storage.Volumes[0].Size = &size
+	for _, quantity := range []string{"1Gi", "1024Mi", "1073741824"} {
+		s := old.DeepCopy()
+		size := resource.MustParse(quantity)
+		s.Model.Storage.Volumes[0].Size = &size
+		if err := s.ValidateArtifactUpdate(&old); err != nil {
+			t.Errorf("equivalent quantity %s rejected: %v", quantity, err)
+		}
+	}
+	for _, quantity := range []string{"2Gi", "1G", "0"} {
+		s := old.DeepCopy()
+		size := resource.MustParse(quantity)
+		s.Model.Storage.Volumes[0].Size = &size
+		if err := s.ValidateArtifactUpdate(&old); err == nil {
+			t.Errorf("changed quantity %s accepted", quantity)
+		}
+	}
+	s := old.DeepCopy()
+	s.Model.Storage.Volumes[0].Size = nil
+	if err := s.ValidateArtifactUpdate(&old); err == nil {
+		t.Error("removed cache quantity accepted")
+	}
+}
+
+func TestArtifactDestinationMountOverlap(t *testing.T) {
+	for _, mount := range []string{"/", "/model-cache", "/model-cache/artifacts", "/model-cache/artifacts/config.json", "/model-cache-other", "/other"} {
+		s := artifactSpec()
+		s.Model.Storage.Volumes = append(s.Model.Storage.Volumes, StorageVolume{Name: "other", ClaimName: "other", MountPath: mount, Purpose: VolumePurposeCompilationCache})
+		valid := mount == "/model-cache-other" || mount == "/other"
+		if err := s.ValidateArtifact(); (err == nil) != valid {
+			t.Errorf("mount %q: error = %v, want valid = %t", mount, err, valid)
 		}
 	}
 }

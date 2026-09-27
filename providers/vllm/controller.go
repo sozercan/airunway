@@ -25,6 +25,8 @@ import (
 	"syscall"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -35,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -1088,23 +1091,29 @@ func (r *VLLMProviderReconciler) setCondition(md *airunwayv1alpha1.ModelDeployme
 // SetupWithManager sets up the controller with the Manager.
 func (r *VLLMProviderReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&airunwayv1alpha1.ModelDeployment{}).
-		WithEventFilter(predicate.NewPredicateFuncs(func(obj client.Object) bool {
-			md, ok := obj.(*airunwayv1alpha1.ModelDeployment)
-			if !ok {
-				return false
-			}
-			// Process if provider is vllm OR if being deleted (to handle finalizer)
-			if md.Status.Provider != nil && md.Status.Provider.Name == ProviderName {
-				return true
-			}
-			// Also process if spec explicitly requests vllm
-			if md.Spec.Provider != nil && md.Spec.Provider.Name == ProviderName {
-				return true
-			}
-			// Process if we have our finalizer (for deletion handling)
-			return controllerutil.ContainsFinalizer(md, FinalizerName)
-		})).
+		// Keep provider filtering on the primary watch so it does not reject storage events.
+		For(
+			&airunwayv1alpha1.ModelDeployment{},
+			ctrlbuilder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+				md, ok := obj.(*airunwayv1alpha1.ModelDeployment)
+				if !ok {
+					return false
+				}
+				// Process if provider is vllm OR if being deleted (to handle finalizer)
+				if md.Status.Provider != nil && md.Status.Provider.Name == ProviderName {
+					return true
+				}
+				// Also process if spec explicitly requests vllm
+				if md.Spec.Provider != nil && md.Spec.Provider.Name == ProviderName {
+					return true
+				}
+				// Process if we have our finalizer (for deletion handling)
+				return controllerutil.ContainsFinalizer(md, FinalizerName)
+			})),
+		).
+		// Status updates do not change generation; ignore only unchanged informer resyncs.
+		Owns(&corev1.PersistentVolumeClaim{}, ctrlbuilder.WithPredicates(predicate.ResourceVersionChangedPredicate{})).
+		Owns(&batchv1.Job{}, ctrlbuilder.WithPredicates(predicate.ResourceVersionChangedPredicate{})).
 		Named("vllm-provider").
 		Complete(r)
 }
