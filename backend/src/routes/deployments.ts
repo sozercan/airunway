@@ -451,6 +451,14 @@ function getProviderOverrideRouterMode(providerOverrides: Record<string, unknown
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+async function requireDynamoIntentAvailability(): Promise<void> {
+  if (!await kubernetesService.checkCRDExists('dynamographdeploymentrequests.nvidia.com')) {
+    throw new HTTPException(422, {
+      message: 'Automatic configuration is unavailable for Dynamo because the DynamoGraphDeploymentRequest API could not be found or accessed. You can still use manual configuration.',
+    });
+  }
+}
+
 async function validateProviderCapabilities(config: DeploymentConfig): Promise<void> {
   if (!config.provider) {
     return;
@@ -1072,6 +1080,7 @@ const deployments = new Hono<AppEnv>()
       replicas: body.replicas ?? 1,
       namespace: body.namespace || (await configService.getDefaultNamespace()),
     });
+    if (isDynamoIntent(config.provider, config.providerOverrides)) await requireDynamoIntentAvailability();
     await validateProviderCapabilities(config);
 
     // GPU fit validation
@@ -1145,6 +1154,7 @@ const deployments = new Hono<AppEnv>()
       const current = await kubernetesService.getDeploymentManifest(name, namespace, userToken);
       if (!current) throw new HTTPException(404, { message: 'Deployment not found' });
       const next = reconfigureDynamoDeployment(current as unknown as ModelDeployment, c.req.valid('json'));
+      await requireDynamoIntentAvailability();
       try {
         await kubernetesService.replaceDeployment(next, userToken);
       } catch (error) {

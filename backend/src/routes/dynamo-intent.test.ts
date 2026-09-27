@@ -1,5 +1,5 @@
 import { ApiException } from '@kubernetes/client-node';
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import app from '../hono-app';
 import { kubernetesService } from '../services/kubernetes';
 import { mockServiceMethod } from '../test/helpers';
@@ -39,7 +39,14 @@ function nativeOverrides(apiVersion: 'nvidia.com/v1alpha1' | 'nvidia.com/v1beta1
 }
 
 describe('Dynamo automatic API', () => {
-  test('preview omits manual sizing and layout', async () => {
+  beforeEach(() => {
+    restores.push(mockServiceMethod(kubernetesService, 'checkCRDExists', async (name: string) =>
+      name === 'dynamographdeploymentrequests.nvidia.com'));
+  });
+
+  test('preview works offline without checking DGDR availability or adding manual sizing', async () => {
+    let checks = 0;
+    restores.push(mockServiceMethod(kubernetesService, 'checkCRDExists', async () => { checks++; return false; }));
     restores.push(mockServiceMethod(kubernetesService, 'getInferenceProviderConfig', async () => { throw new Error('offline'); }));
     const response = await request('/preview', body());
     expect(response.status).toBe(200);
@@ -49,6 +56,57 @@ describe('Dynamo automatic API', () => {
     expect(spec.resources).toBeUndefined();
     expect(spec.scaling).toBeUndefined();
     expect(spec.serving).toBeUndefined();
+    expect(checks).toBe(0);
+  });
+
+  test('rejects automatic create, retry and reconfigure when DGDR is unavailable before any write', async () => {
+    let writes = 0;
+    const checkedCrds: string[] = [];
+    restores.push(mockServiceMethod(kubernetesService, 'checkCRDExists', async (name: string) => {
+      checkedCrds.push(name);
+      return false;
+    }));
+    restores.push(mockServiceMethod(kubernetesService, 'getInferenceProviderConfig', async () => { throw new Error('offline'); }));
+    restores.push(mockServiceMethod(kubernetesService, 'getClusterGpuCapacity', async () => { throw new Error('offline'); }));
+    restores.push(mockServiceMethod(kubernetesService, 'getDeploymentManifest', async () => current() as unknown as Record<string, unknown>));
+    restores.push(mockServiceMethod(kubernetesService, 'createDeployment', async () => { writes++; }));
+    restores.push(mockServiceMethod(kubernetesService, 'replaceDeployment', async () => { writes++; }));
+    for (const [path, payload] of [
+      ['', body()],
+      ['/default/qwen-auto/reconfigure', { resourceVersion: '1' }],
+      ['/default/qwen-auto/reconfigure', { resourceVersion: '1', intent: { ...defaultDynamoIntent(), overrides: nativeOverrides() } }],
+    ] as const) {
+      const response = await request(path, payload);
+      expect(response.status).toBe(422);
+      const result = await response.json() as { error: { message: string } };
+      expect(result.error.message).toContain('Automatic configuration is unavailable');
+      expect(result.error.message).toContain('DynamoGraphDeploymentRequest');
+      expect(result.error.message).toContain('manual configuration');
+    }
+    expect(checkedCrds).toEqual(Array(3).fill('dynamographdeploymentrequests.nvidia.com'));
+    expect(writes).toBe(0);
+  });
+
+  test('manual Dynamo creation does not require DGDR on a DGD-only cluster', async () => {
+    let checks = 0;
+    const creates: DeploymentConfig[] = [];
+    restores.push(mockServiceMethod(kubernetesService, 'checkCRDExists', async (name: string) => {
+      checks++;
+      return name === 'dynamographdeployments.nvidia.com';
+    }));
+    restores.push(mockServiceMethod(kubernetesService, 'getInferenceProviderConfig', async () => ({
+      metadata: { name: 'dynamo' },
+      spec: { capabilities: { engines: [{ name: 'vllm', servingModes: ['aggregated'] }] } },
+    })));
+    restores.push(mockServiceMethod(kubernetesService, 'getClusterGpuCapacity', async () => { throw new Error('offline'); }));
+    restores.push(mockServiceMethod(kubernetesService, 'createDeployment', async (config: DeploymentConfig) => { creates.push(config); }));
+    for (const providerOverrides of [undefined, { deploymentMode: 'manual' }]) {
+      expect((await request('', { ...body(), providerOverrides })).status).toBe(201);
+    }
+    expect(creates).toHaveLength(2);
+    expect(creates[0].providerOverrides).toBeUndefined();
+    expect(creates[1].providerOverrides).toEqual({ deploymentMode: 'manual' });
+    expect(checks).toBe(0);
   });
 
   test.each(['nvidia.com/v1alpha1', 'nvidia.com/v1beta1'] as const)(

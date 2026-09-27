@@ -203,3 +203,20 @@ func TestReleasedDynamoRenderingContracts(t *testing.T) {
 		})
 	}
 }
+
+func TestManualProviderOverrideSurvivesBetaConversion(t *testing.T) {
+	md := newTestMD("provider-override", "models")
+	override := map[string]any{"apiVersion": "grove.io/v1alpha1", "value": map[string]any{"metadata": map[string]any{"labels": map[string]any{"example.com/workload": "custom"}}}}
+	setRenderingOverrides(t, md, map[string]any{"spec": map[string]any{"providerOverride": override}})
+	for _, apiVersion := range []string{"v1alpha1", "v1beta1"} {
+		objects, err := NewTransformer().TransformForVersion(context.Background(), md, apiVersion, "1.5.0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := objects[0].Object["spec"].(map[string]any)["providerOverride"]
+		if !sameJSON(t, got, override) {
+			t.Fatalf("%s lost native provider override", apiVersion)
+		}
+		assertContract(t, readReleasedContract(t, "v1.5.0", "dynamographdeployments", apiVersion), objects[0])
+	}
+}

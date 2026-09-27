@@ -1016,7 +1016,7 @@ func (r *DynamoProviderReconciler) handleDeletion(ctx context.Context, md *airun
 	p := ensureProviderStatus(md)
 	request, err := r.findRequest(ctx, md)
 	if err != nil {
-		return r.cleanupRetryResult(ctx, md)
+		return r.cleanupRetryResult(ctx, md, 10*time.Second)
 	}
 	if request != nil {
 		previous := p.WorkloadRef
@@ -1024,11 +1024,12 @@ func (r *DynamoProviderReconciler) handleDeletion(ctx context.Context, md *airun
 		if _, err := r.resolveGeneratedDGD(ctx, md, request); err != nil {
 			md.Status.Message = err.Error()
 			_ = r.Status().Update(ctx, md)
-			return r.cleanupRetryResult(ctx, md)
+			return r.cleanupRetryResult(ctx, md, 10*time.Second)
 		}
 		if previous == nil && p.WorkloadRef != nil {
 			if err := r.Status().Update(ctx, md); err != nil {
-				return ctrl.Result{}, err
+				logger.Error(err, "Failed to persist workload identity before cleanup")
+				return r.cleanupRetryResult(ctx, md, 10*time.Second)
 			}
 			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
@@ -1038,15 +1039,15 @@ func (r *DynamoProviderReconciler) handleDeletion(ctx context.Context, md *airun
 		if err != nil {
 			md.Status.Message = err.Error()
 			_ = r.Status().Update(ctx, md)
-			return r.cleanupRetryResult(ctx, md)
+			return r.cleanupRetryResult(ctx, md, 10*time.Second)
 		}
 		if pending {
-			return r.cleanupRetryResult(ctx, md)
+			return r.cleanupRetryResult(ctx, md, 10*time.Second)
 		}
 	} else if p.ResourceKind == DynamoGraphDeploymentRequestKind && p.WorkloadRef == nil {
 		md.Status.Message = "Dynamo request is missing and no workload UID was recorded; cleanup requires operator verification"
 		_ = r.Status().Update(ctx, md)
-		return r.cleanupRetryResult(ctx, md)
+		return r.cleanupRetryResult(ctx, md, 10*time.Second)
 	}
 	// Direct deployments retain their existing API representation on deletion.
 	directName := md.Name
@@ -1057,18 +1058,18 @@ func (r *DynamoProviderReconciler) handleDeletion(ctx context.Context, md *airun
 	}
 	dgd, err := r.findDGD(ctx, md.Namespace, directName, directRef)
 	if err != nil {
-		return r.cleanupRetryResult(ctx, md)
+		return r.cleanupRetryResult(ctx, md, 10*time.Second)
 	}
 	if dgd != nil && verifyDynamoOwnership(dgd, md.UID) == nil {
 		if p.RequestRef == nil && p.WorkloadRef != nil && p.WorkloadRef.UID != "" && p.WorkloadRef.UID != string(dgd.GetUID()) {
-			return r.cleanupRetryResult(ctx, md)
+			return r.cleanupRetryResult(ctx, md, 10*time.Second)
 		}
 		if dgd.GetDeletionTimestamp() == nil {
 			if err := r.deleteWithIdentityPreconditions(ctx, dgd); err != nil && !errors.IsNotFound(err) {
-				return r.cleanupRetryResult(ctx, md)
+				return r.cleanupRetryResult(ctx, md, 10*time.Second)
 			}
 		}
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		return r.cleanupRetryResult(ctx, md, 5*time.Second)
 	}
 
 	// The upstream resource is already gone or its CRD is no longer installed,
@@ -1083,14 +1084,7 @@ func (r *DynamoProviderReconciler) handleDeletion(ctx context.Context, md *airun
 		cleanupErrs = append(cleanupErrs, err)
 	}
 	if err := stderrors.Join(cleanupErrs...); err != nil {
-		// Check if we should force-remove the finalizer
-		deletionTime := md.DeletionTimestamp.Time
-		if time.Since(deletionTime) > FinalizerTimeout {
-			logger.Info("Finalizer timeout reached, removing finalizer without cleanup")
-			controllerutil.RemoveFinalizer(md, FinalizerName)
-			return ctrl.Result{}, r.Update(ctx, md)
-		}
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		return r.cleanupRetryResult(ctx, md, 10*time.Second)
 	}
 
 	// All resources cleaned up, remove finalizer
@@ -1102,8 +1096,14 @@ func (r *DynamoProviderReconciler) handleDeletion(ctx context.Context, md *airun
 func (r *DynamoProviderReconciler) cleanupRetryResult(
 	ctx context.Context,
 	md *airunwayv1alpha1.ModelDeployment,
+	delay time.Duration,
 ) (ctrl.Result, error) {
-	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	if md.DeletionTimestamp != nil && time.Since(md.DeletionTimestamp.Time) > FinalizerTimeout {
+		log.FromContext(ctx).Info("Finalizer timeout reached; removing provider finalizer, resources may require manual cleanup", "name", md.Name, "namespace", md.Namespace)
+		controllerutil.RemoveFinalizer(md, FinalizerName)
+		return ctrl.Result{}, r.Update(ctx, md)
+	}
+	return ctrl.Result{RequeueAfter: delay}, nil
 }
 
 func upstreamResourceUnavailable(err error) bool {

@@ -13,7 +13,7 @@ import (
 // representable legacy overrides. Unsupported alpha-only semantics are errors,
 // not annotations which merely preserve data without affecting beta workloads.
 func alphaSpecToBeta(src map[string]any) (map[string]any, error) {
-	if err := renderingKeys(src, "spec", "backendFramework", "annotations", "labels", "priorityClassName", "restart", "topologyConstraint", "experimental", "services", "envs", "pvcs"); err != nil {
+	if err := renderingKeys(src, "spec", "backendFramework", "annotations", "labels", "priorityClassName", "restart", "topologyConstraint", "experimental", "providerOverride", "services", "envs", "pvcs"); err != nil {
 		return nil, err
 	}
 	dst := map[string]any{}

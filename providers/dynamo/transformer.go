@@ -421,11 +421,20 @@ func (t *Transformer) parseOverrides(md *airunwayv1alpha1.ModelDeployment) (*Dyn
 		if len(wire.Spec) > 0 {
 			return nil, fmt.Errorf("intent and legacy overrides.spec cannot be combined")
 		}
-		// Parse/Validate share the admission contract. Auto-selected providers may
-		// have an empty spec.provider.name, so validate a private copy as Dynamo.
+	}
+	if _, present := overrideRoots["intent"]; present && wire.Intent == nil {
+		return nil, fmt.Errorf("intent must be an object")
+	}
+	if wire.DeploymentMode == DeploymentModeIntent {
+		// Both intent formats must validate attempt tokens even when the provider
+		// was auto-selected. Typed inputs also share the admission contract.
 		copy := md.DeepCopy()
 		copy.Spec.Provider.Name = "dynamo"
-		canonical, err := json.Marshal(map[string]any{"deploymentMode": wire.DeploymentMode, "intent": wire.Intent})
+		input := map[string]any{"deploymentMode": wire.DeploymentMode}
+		if wire.Intent != nil {
+			input["intent"] = wire.Intent
+		}
+		canonical, err := json.Marshal(input)
 		if err != nil {
 			return nil, err
 		}
@@ -433,9 +442,6 @@ func (t *Transformer) parseOverrides(md *airunwayv1alpha1.ModelDeployment) (*Dyn
 		if err := dynamointent.Validate(copy); err != nil {
 			return nil, err
 		}
-	}
-	if _, present := overrideRoots["intent"]; present && wire.Intent == nil {
-		return nil, fmt.Errorf("intent must be an object")
 	}
 	return &DynamoOverrides{
 		Intent:         wire.Intent,

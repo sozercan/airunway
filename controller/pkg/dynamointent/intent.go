@@ -97,8 +97,17 @@ func Parse(md *api.ModelDeployment) (*Spec, error) {
 // Validate is shared by admission and provider reconciliation.
 func Validate(md *api.ModelDeployment) error {
 	spec, err := Parse(md)
-	if err != nil || spec == nil {
+	if err != nil {
 		return err
+	}
+	// Legacy intent also uses attempt tokens, even though Parse returns nil.
+	if Enabled(md) {
+		if err := validateAttemptToken(md.Annotations[AttemptAnnotation]); err != nil {
+			return err
+		}
+	}
+	if spec == nil {
+		return nil
 	}
 	if err := validateOverrides(spec.Overrides); err != nil {
 		return err
@@ -109,8 +118,8 @@ func Validate(md *api.ModelDeployment) error {
 	if spec.SearchStrategy != "" && spec.SearchStrategy != "rapid" {
 		return fmt.Errorf("automatic configuration currently supports searchStrategy: rapid only")
 	}
-	if spec.Hardware.NumGPUsPerNode != nil && *spec.Hardware.NumGPUsPerNode <= 0 {
-		return fmt.Errorf("intent.hardware.numGpusPerNode must be positive")
+	if spec.Hardware.NumGPUsPerNode != nil && (*spec.Hardware.NumGPUsPerNode < 1 || *spec.Hardware.NumGPUsPerNode > 64) {
+		return fmt.Errorf("intent.hardware.numGpusPerNode must be between 1 and 64")
 	}
 	if spec.Hardware.VRAMMB != nil && !positive(*spec.Hardware.VRAMMB) {
 		return fmt.Errorf("intent.hardware.vramMb must be positive")
@@ -220,13 +229,7 @@ func Fingerprint(md *api.ModelDeployment) (string, error) {
 	return fmt.Sprintf("%x", sum), nil
 }
 
-// ValidateUpdate enforces the upstream request lifecycle at the Runway boundary.
-// Changing the attempt annotation is an explicit request for a fresh profiling run.
-func ValidateUpdate(old, next *api.ModelDeployment) error {
-	if !Enabled(old) && !Enabled(next) {
-		return nil
-	}
-	attempt := next.Annotations[AttemptAnnotation]
+func validateAttemptToken(attempt string) error {
 	if len(attempt) > 64 {
 		return fmt.Errorf("Dynamo attempt token must be at most 64 characters")
 	}
@@ -234,6 +237,19 @@ func ValidateUpdate(old, next *api.ModelDeployment) error {
 		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
 			return fmt.Errorf("Dynamo attempt token contains invalid characters")
 		}
+	}
+	return nil
+}
+
+// ValidateUpdate enforces the upstream request lifecycle at the Runway boundary.
+// Changing the attempt annotation is an explicit request for a fresh profiling run.
+func ValidateUpdate(old, next *api.ModelDeployment) error {
+	if !Enabled(old) && !Enabled(next) {
+		return nil
+	}
+	attempt := next.Annotations[AttemptAnnotation]
+	if err := validateAttemptToken(attempt); err != nil {
+		return err
 	}
 	if old.Annotations[AttemptAnnotation] != attempt {
 		return nil

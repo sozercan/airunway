@@ -244,3 +244,27 @@ func TestPartialProfilingJobSurvivesTypedRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestIntentAttemptTokensValidatedWithAutoSelectedProvider(t *testing.T) {
+	for _, provider := range []string{"dynamo", ""} {
+		for _, typed := range []bool{false, true} {
+			md := newTestMD("attempt", "models")
+			if typed {
+				md = typedRenderingMD(t)
+			} else {
+				setRenderingOverrides(t, md, map[string]any{"deploymentMode": "intent"})
+			}
+			md.Spec.Provider.Name = provider
+			for _, token := range []string{"invalid/token", strings.Repeat("x", 65)} {
+				md.Annotations = map[string]string{dynamointent.AttemptAnnotation: token}
+				if _, err := NewTransformer().Transform(context.Background(), md); err == nil || !strings.Contains(err.Error(), "attempt token") {
+					t.Fatalf("provider=%q typed=%v accepted invalid attempt token: %v", provider, typed, err)
+				}
+			}
+			md.Annotations = map[string]string{dynamointent.AttemptAnnotation: strings.Repeat("x", 64)}
+			if _, err := NewTransformer().Transform(context.Background(), md); err != nil {
+				t.Fatalf("valid attempt rejected: %v", err)
+			}
+		}
+	}
+}
