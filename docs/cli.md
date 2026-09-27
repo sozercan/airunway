@@ -316,6 +316,15 @@ claims. Endpoint checks do not submit chat requests or execute agent tools.
 Provider status must publish a usable access contract. Providers without one fail
 with an explanation rather than a fabricated URL.
 
+Model create/update requests with zero desired replicas skip the default readiness
+wait and return the submitted resource. They do not confirm that pods have finished
+terminating. Explicit `--wait=true` is rejected for these requests; omit it or use
+`--wait=false`.
+
+Plain agent creation can proceed when framework discovery is forbidden by RBAC;
+the controller resolves the framework. Preset/catalog reads and credential or
+model-reference authorization are still required where applicable.
+
 Model endpoint checks require a route that permits `GET /v1/models`. Chat can use
 a POST-only route when the served model name is already known; otherwise its
 model-discovery request also needs GET support.

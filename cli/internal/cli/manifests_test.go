@@ -437,9 +437,9 @@ func TestManifestAgentConstruction(t *testing.T) {
 			"spec":     Object{"framework": Object{"name": "langgraph"}, "lifecycle": "deployment", "model": Object{"deploymentRef": Object{"name": "demo"}}},
 		})
 	})
-	t.Run("cross namespace references", func(t *testing.T) {
-		manifestTestEqual(t, get(manifestTestAgent(t, Flags{"model-ref": {"models/demo"}}), "spec", "model"), Object{"deploymentRef": Object{"namespace": "models", "name": "demo"}})
-		manifestTestEqual(t, get(manifestTestAgent(t, manifestTestGateway(Flags{"model-gateway": {"edge/shared"}, "gateway-listener": {"https"}})), "spec", "model"), Object{"gatewayEndpoint": Object{"gatewayRef": Object{"name": "shared", "namespace": "edge", "listenerName": "https"}, "modelName": "served-model"}})
+	t.Run("qualified same namespace references", func(t *testing.T) {
+		manifestTestEqual(t, get(manifestTestAgent(t, Flags{"model-ref": {"team/demo"}}), "spec", "model"), Object{"deploymentRef": Object{"namespace": "team", "name": "demo"}})
+		manifestTestEqual(t, get(manifestTestAgent(t, manifestTestGateway(Flags{"model-gateway": {"team/shared"}, "gateway-listener": {"https"}})), "spec", "model"), Object{"gatewayEndpoint": Object{"gatewayRef": Object{"name": "shared", "namespace": "team", "listenerName": "https"}, "modelName": "served-model"}})
 	})
 	for _, pair := range [][2]string{{"openai", "openai"}, {"anthropic", "anthropic"}, {"azure-openai", "azureOpenAI"}, {"azureOpenAI", "azureOpenAI"}, {"custom", "custom"}} {
 		t.Run(pair[0], func(t *testing.T) {
@@ -700,18 +700,18 @@ func TestManifestSparseAgentUpdates(t *testing.T) {
 		manifestTestEqual(t, get(manifestTestMergePatch(existing, patch), "spec", "model", "gatewayEndpoint", "gatewayRef"), Object{"name": "edge", "listenerName": "https"})
 	})
 	t.Run("unqualified refs clear namespace and listener", func(t *testing.T) {
-		existing := manifestTestAgent(t, Flags{"model-ref": {"other/demo"}})
+		existing := manifestTestAgent(t, Flags{"model-ref": {"team/demo"}})
 		patch := manifestTestUpdate(t, "agent", existing, Flags{"model-ref": {"local"}}, "")
 		manifestTestEqual(t, get(patch, "spec", "model", "deploymentRef"), Object{"name": "local", "namespace": nil})
 		manifestTestEqual(t, get(manifestTestMergePatch(existing, patch), "spec", "model", "deploymentRef"), Object{"name": "local"})
-		existing = manifestTestAgent(t, manifestTestGateway(Flags{"model-gateway": {"other/edge"}, "gateway-listener": {"old"}}))
+		existing = manifestTestAgent(t, manifestTestGateway(Flags{"model-gateway": {"team/edge"}, "gateway-listener": {"old"}}))
 		before := cloneObject(existing)
 		patch = manifestTestUpdate(t, "agent", existing, Flags{"model-gateway": {"new-edge"}}, "")
 		manifestTestEqual(t, get(patch, "spec", "model", "gatewayEndpoint", "gatewayRef"), Object{"name": "new-edge", "namespace": nil, "listenerName": nil})
 		manifestTestEqual(t, get(manifestTestMergePatch(existing, patch), "spec", "model", "gatewayEndpoint", "gatewayRef"), Object{"name": "new-edge"})
 		manifestTestEqual(t, existing, before)
-		patch = manifestTestUpdate(t, "agent", existing, Flags{"model-gateway": {"next/new-edge"}, "gateway-listener": {"new"}}, "")
-		manifestTestEqual(t, get(manifestTestMergePatch(existing, patch), "spec", "model", "gatewayEndpoint", "gatewayRef"), Object{"name": "new-edge", "namespace": "next", "listenerName": "new"})
+		patch = manifestTestUpdate(t, "agent", existing, Flags{"model-gateway": {"team/new-edge"}, "gateway-listener": {"new"}}, "")
+		manifestTestEqual(t, get(manifestTestMergePatch(existing, patch), "spec", "model", "gatewayEndpoint", "gatewayRef"), Object{"name": "new-edge", "namespace": "team", "listenerName": "new"})
 	})
 	t.Run("repair invalid union", func(t *testing.T) {
 		existing := manifestTestAgent(t, manifestTestExternal(nil))

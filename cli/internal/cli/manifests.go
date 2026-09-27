@@ -683,6 +683,33 @@ func manifestObjectRef(value, label string) (Object, error) {
 	return ref, nil
 }
 
+const manifestGatewayEndpoint = "gatewayEndpoint"
+
+// Validate the effective references without changing sparse merge-patch semantics.
+func manifestCheckBindingNamespaces(model, existing Object, namespace string) error {
+	for _, mode := range []struct{ field, flag string }{
+		{"deploymentRef", "--model-ref"}, {manifestGatewayEndpoint, "--model-gateway"},
+	} {
+		ref := object(model[mode.field])
+		if len(ref) == 0 {
+			continue // Omitted or explicitly removed binding mode.
+		}
+		oldRef := object(existing[mode.field])
+		if mode.field == manifestGatewayEndpoint {
+			ref, oldRef = object(ref["gatewayRef"]), object(oldRef["gatewayRef"])
+		}
+		refNamespace := stringAt(ref, "namespace")
+		if _, supplied := ref["namespace"]; !supplied {
+			refNamespace = stringAt(oldRef, "namespace")
+		}
+		if refNamespace != "" && refNamespace != namespace {
+			return usage(mode.flag + " must reference the agent namespace " + namespace +
+				"; cross-namespace references are not supported.")
+		}
+	}
+	return nil
+}
+
 func manifestBinding(flags Flags, existing Object) (Object, error) {
 	selectors := []string{"model-ref", "model-url", "model-gateway"}
 	kinds := []string{"deploymentRef", "externalAPI", "gatewayEndpoint"}
@@ -906,6 +933,9 @@ func buildAgent(name string, flags Flags, namespace string, streams *IO) (Object
 	if err != nil {
 		return nil, err
 	}
+	if err := manifestCheckBindingNamespaces(model, nil, namespace); err != nil {
+		return nil, err
+	}
 	if err := manifestCheckStdin(flags); err != nil {
 		return nil, err
 	}
@@ -1069,8 +1099,13 @@ func updateResource(noun string, existing Object, flags Flags, streams *IO) (Obj
 			spec["config"] = Object{"systemPrompt": prompt}
 		}
 		if manifestAnyFlag(flags, manifestBindingFlags) {
-			model, err := manifestBinding(flags, object(get(existing, "spec", "model")))
+			existingBinding := object(get(existing, "spec", "model"))
+			model, err := manifestBinding(flags, existingBinding)
 			if err != nil {
+				return nil, err
+			}
+			if err := manifestCheckBindingNamespaces(
+				model, existingBinding, stringAt(existing, "metadata", "namespace")); err != nil {
 				return nil, err
 			}
 			spec["model"] = model

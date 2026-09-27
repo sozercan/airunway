@@ -22,7 +22,9 @@ const ArtifactDirectory = "artifacts"
 var artifactRepository = regexp.MustCompile(`^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$`)
 var artifactTag = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$`)
 var artifactDigest = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
-var artifactHFPart = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$`)
+
+// Keep segment bounds aligned with the dashboard; word boundaries match the pinned HF SDK.
+var artifactHFPart = regexp.MustCompile(`^[a-zA-Z0-9_](?:[a-zA-Z0-9_.-]{0,94}[a-zA-Z0-9_])?$`)
 var artifactGCSBucket = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$`)
 
 // ArtifactCacheVolume returns the cache volume, if configured. ValidateArtifact
@@ -221,9 +223,12 @@ func validateArtifactScheme(u *url.URL) error {
 			return fmt.Errorf("hf artifact must identify a repository; use artifact.file for a file")
 		}
 		for _, part := range parts {
-			if !artifactHFPart.MatchString(part) || strings.Contains(part, "..") {
+			if !artifactHFPart.MatchString(part) || strings.Contains(part, "..") || strings.Contains(part, "--") {
 				return fmt.Errorf("invalid HF repository")
 			}
+		}
+		if strings.HasSuffix(parts[len(parts)-1], ".git") {
+			return fmt.Errorf("invalid HF repository")
 		}
 	case "s3", "gs":
 		if !validArtifactBucket(u.Scheme, u.Host) {

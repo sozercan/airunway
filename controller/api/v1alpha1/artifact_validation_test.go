@@ -260,3 +260,35 @@ func TestArtifactDestinationMountOverlap(t *testing.T) {
 		}
 	}
 }
+
+func TestArtifactHFRepositorySegments(t *testing.T) {
+	maxSegment := strings.Repeat("a", 96)
+	for _, tc := range []struct {
+		name, uri string
+		valid     bool
+	}{
+		{"bare maximum", "hf://" + maxSegment, true},
+		{"maximum owner and name", "hf://" + maxSegment + "/" + maxSegment, true},
+		{"bare oversized", "hf://" + maxSegment + "a", false},
+		{"oversized owner", "hf://" + maxSegment + "a/model", false},
+		{"oversized name", "hf://org/" + maxSegment + "a", false},
+		{"trailing hyphen", "hf://org/model-", false},
+		{"trailing dot", "hf://org/model.", false},
+		{"leading hyphen", "hf://org/-model", false},
+		{"leading dot", "hf://org/.model", false},
+		{"double hyphen", "hf://org/model--name", false},
+		{"owner double hyphen", "hf://org--name/model", false},
+		{"git suffix", "hf://org/model.git", false},
+		{"owner git suffix", "hf://org.git/model", true},
+		{"single character", "hf://a", true},
+		{"valid punctuation", "hf://Org_Name/model-name.v1", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := artifactSpec()
+			s.Model.Artifact.URI = tc.uri
+			if err := s.ValidateArtifact(); (err == nil) != tc.valid {
+				t.Fatalf("valid=%t, error=%v", tc.valid, err)
+			}
+		})
+	}
+}

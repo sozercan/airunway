@@ -356,6 +356,10 @@ func runResource(words []string, c *CommandContext, config *CLIConfig, localPrev
 		if err != nil {
 			return err
 		}
+		wait, err := writeWaitEnabled(noun, nil, resource, f, dry)
+		if err != nil {
+			return err
+		}
 		if dry == "client" {
 			return writeOutput(c.IO, f, resource)
 		}
@@ -370,7 +374,7 @@ func runResource(words []string, c *CommandContext, config *CLIConfig, localPrev
 		if err != nil {
 			return err
 		}
-		if dry != "" || f.Has("wait") && !f.Bool("wait") {
+		if !wait {
 			return writeOutput(c.IO, f, created)
 		}
 		progress(c, fmt.Sprintf("Created %s %q in %s. Waiting; timeout or interruption will not delete it.", noun, name, c.Namespace))
@@ -406,11 +410,15 @@ func runResource(words []string, c *CommandContext, config *CLIConfig, localPrev
 		if err != nil {
 			return err
 		}
+		wait, err := writeWaitEnabled(noun, existing, patch, f, dry)
+		if err != nil {
+			return err
+		}
 		updated, err := client.Patch(c.Context, t, c.Namespace, name, patch, dry == "server")
 		if err != nil {
 			return err
 		}
-		if dry != "" || f.Has("wait") && !f.Bool("wait") {
+		if !wait {
 			return writeOutput(c.IO, f, updated)
 		}
 		ready, err := waitForResource(c.Context, client, noun, updated, f, c.IO)
@@ -480,6 +488,25 @@ func runResource(words []string, c *CommandContext, config *CLIConfig, localPrev
 	}
 	return runAccess(noun, action, name, c)
 }
+
+// A zero-replica write returns the submitted object, not proof of pod
+// termination. An explicit readiness wait is rejected before any mutation.
+func writeWaitEnabled(noun string, existing, desired Object, flags Flags, dry string) (bool, error) {
+	if dry != "" || flags.Has("wait") && !flags.Bool("wait") {
+		return false, nil
+	}
+	if get(desired, "spec", "scaling", "replicas") == nil {
+		desired = existing
+	}
+	zero := noun == "model" && get(desired, "spec", "scaling", "replicas") != nil &&
+		intAt(desired, "spec", "scaling", "replicas") == 0
+	if zero && flags.Has("wait") {
+		return false, usage("--wait=true cannot wait for readiness with zero desired replicas. " +
+			"Omit --wait or use --wait=false; submission does not confirm pod termination.")
+	}
+	return !zero, nil
+}
+
 func pause(ctx context.Context, d time.Duration) error {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
@@ -495,31 +522,36 @@ func preflight(resource Object, noun string, c *CommandContext, client ClusterCl
 	// permission is not required just to submit a resource.
 	if noun == "agent" {
 		framework, err := client.Get(c.Context, resourceTypes["framework"], "", stringAt(resource, "spec", "framework", "name"))
-		if err != nil {
+		// Framework discovery is advisory for namespaced creators. Credential
+		// and model-reference authorization below remains mandatory.
+		if err != nil && !accessHasCode(err, "HTTP_403") {
 			return err
 		}
-		if !boolAt(framework, "status", "ready") {
-			return cliError(1, "NOT_READY", "The selected agent framework is not ready. Run airunway framework get NAME.")
-		}
-		backend := stringAt(framework, "spec", "capabilities", "backend")
-		if stringAt(resource, "spec", "lifecycle") == "job" && backend != "container" {
-			return cliError(2, "UNSUPPORTED", "One-shot mode requires a container-backed framework.")
-		}
-		if (get(resource, "spec", "resources") != nil || get(resource, "spec", "config", "image") != nil) && backend != "container" {
-			return cliError(2, "UNSUPPORTED", "Image and resource overrides require a container-backed framework.")
-		}
 		binding := object(get(resource, "spec", "model"))
-		modes := array(get(framework, "spec", "capabilities", "modelBindingModes"))
-		if modes != nil {
-			for key := range binding {
-				found := false
-				for _, m := range modes {
-					if m == key {
-						found = true
+		if err == nil {
+			if !boolAt(framework, "status", "ready") {
+				return cliError(1, "NOT_READY", "The selected agent framework is not ready. Run airunway framework get NAME.")
+			}
+			backend := stringAt(framework, "spec", "capabilities", "backend")
+			if stringAt(resource, "spec", "lifecycle") == "job" && backend != "container" {
+				return cliError(2, "UNSUPPORTED", "One-shot mode requires a container-backed framework.")
+			}
+			if (get(resource, "spec", "resources") != nil || get(resource, "spec", "config", "image") != nil) &&
+				backend != "container" {
+				return cliError(2, "UNSUPPORTED", "Image and resource overrides require a container-backed framework.")
+			}
+			modes := array(get(framework, "spec", "capabilities", "modelBindingModes"))
+			if modes != nil {
+				for key := range binding {
+					found := false
+					for _, m := range modes {
+						if m == key {
+							found = true
+						}
 					}
-				}
-				if !found {
-					return cliError(2, "UNSUPPORTED", "The selected framework does not support this model binding.")
+					if !found {
+						return cliError(2, "UNSUPPORTED", "The selected framework does not support this model binding.")
+					}
 				}
 			}
 		}
