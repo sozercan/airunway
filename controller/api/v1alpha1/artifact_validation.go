@@ -243,12 +243,13 @@ func validateArtifactScheme(u *url.URL) error {
 	return nil
 }
 
-// validArtifactBucket preserves the existing S3 DNS rules. GCS allows underscores
+// validArtifactBucket checks S3 DNS names and length limits. GCS allows underscores
 // and dotted names up to 222 characters with at most 63 characters per component.
 // https://cloud.google.com/storage/docs/buckets#naming
 func validArtifactBucket(scheme, bucket string) bool {
 	if scheme == "s3" {
-		return len(validation.IsDNS1123Subdomain(bucket)) == 0
+		return len(bucket) >= 3 && len(bucket) <= 63 && net.ParseIP(bucket) == nil &&
+			len(validation.IsDNS1123Subdomain(bucket)) == 0
 	}
 	if !artifactGCSBucket.MatchString(bucket) || net.ParseIP(bucket) != nil {
 		return false

@@ -657,6 +657,9 @@ func runDashboard(ctx context.Context, words []string, flags Flags, streams *IO)
 		}
 	}
 	cmd := exec.CommandContext(ctx, path, args...)
+	if kubeconfig := flags.Text("kubeconfig"); kubeconfig != "" {
+		cmd.Env = append(os.Environ(), "KUBECONFIG="+kubeconfig)
+	}
 	cmd.Stdin = streams.In
 	cmd.Stdout = streams.Out
 	cmd.Stderr = streams.Err

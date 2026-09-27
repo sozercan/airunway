@@ -180,7 +180,14 @@ func manifestImageReference(value, label string, pinned bool) (string, error) {
 		if !manifestRegistryPattern.MatchString(registry) {
 			return "", usage(label + " has an invalid registry.")
 		}
-		if _, err := manifestDNSName(strings.Split(registry, ":")[0], label+" registry"); err != nil {
+		host, port, hasPort := strings.Cut(registry, ":")
+		if hasPort {
+			number, err := strconv.Atoi(port)
+			if err != nil || number < 1 || number > 65535 {
+				return "", usage(label + " registry port must be between 1 and 65535.")
+			}
+		}
+		if _, err := manifestDNSName(host, label+" registry"); err != nil {
 			return "", err
 		}
 	}
