@@ -422,3 +422,53 @@ func TestTypedIntentAcceptsAPIDefaultedPrefixCaching(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestLegacyMainContainerStrategicMerge(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		patch     map[string]any
+		wantError bool
+	}{
+		{"delete main", map[string]any{"$patch": "delete"}, true},
+		{"merge main", map[string]any{
+			"env": []any{map[string]any{"name": "CUSTOM", "value": "retained"}},
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			md := newTestMD("model", "models")
+			setRenderingOverrides(t, md, map[string]any{"spec": map[string]any{
+				"services": map[string]any{"VllmWorker": map[string]any{
+					"extraPodSpec": map[string]any{"mainContainer": tc.patch},
+				}},
+			}})
+			before := md.DeepCopy()
+			objects, err := NewTransformer().TransformForVersion(context.Background(), md, dynamoBetaVersion, "1.5.0")
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "main container") {
+					t.Fatalf("expected a main-container render error, got %v", err)
+				}
+				if len(objects) != 0 {
+					t.Fatal("invalid override returned a partially rendered workload")
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				main := betaContainer(t, betaComponent(t, objects[0], "VllmWorker"), "main")
+				if containerEnv(t, main, "CUSTOM") != "retained" {
+					t.Fatal("valid merge lost the environment override")
+				}
+				command, _, _ := unstructured.NestedStringSlice(main, "command")
+				args, _, _ := unstructured.NestedStringSlice(main, "args")
+				gpu, _, _ := unstructured.NestedString(main, "resources", "limits", "nvidia.com/gpu")
+				if !reflect.DeepEqual(command, []string{"python3", "-m", "dynamo.vllm"}) || len(args) == 0 || gpu != "1" {
+					t.Fatal("valid merge changed the generated launch contract")
+				}
+				assertContract(t, readReleasedContract(t, "v1.5.0", "dynamographdeployments", "v1beta1"), objects[0])
+			}
+			if !reflect.DeepEqual(before, md) {
+				t.Fatal("rendering mutated the ModelDeployment")
+			}
+		})
+	}
+}

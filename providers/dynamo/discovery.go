@@ -135,9 +135,6 @@ func (r *DynamoProviderReconciler) renderResources(ctx context.Context, md *api.
 			}
 			version = existing.GroupVersionKind().Version
 			runtimeVersion = existingRuntimeVersion(existing)
-			if existing.GetAnnotations()[manualInputHashAnnotation] == manualFingerprint(md) {
-				return []*unstructured.Unstructured{existing.DeepCopy()}, nil
-			}
 		}
 	}
 	if runtimeVersion == "" {

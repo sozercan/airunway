@@ -642,9 +642,6 @@ func (r *DynamoProviderReconciler) createOrUpdateResource(
 	if err := verifyDynamoOwnership(existing, md.UID); err != nil {
 		return err
 	}
-	if existing.GetAnnotations()[manualInputHashAnnotation] == annotations[manualInputHashAnnotation] {
-		return nil
-	}
 	// Retain operator/user metadata on spec updates.
 	for key, value := range existing.GetAnnotations() {
 		if _, ok := annotations[key]; !ok {
@@ -673,7 +670,6 @@ func (r *DynamoProviderReconciler) createOrUpdateResource(
 	// override appears to succeed.
 	if !equality.Semantic.DeepEqual(stripEmptyDefaults(existingSpec), stripEmptyDefaults(newSpec)) ||
 		overrideSpecDiffers(md, existingSpec, newSpec) {
-		logger.Info("Updating resource", "kind", resource.GetKind(), "name", resource.GetName())
 		// Keep upstream finalizers, defaults in metadata, and other owners. A
 		// rendered spec update must not remove the operator's cleanup machinery.
 		next := existing.DeepCopy()
@@ -691,7 +687,24 @@ func (r *DynamoProviderReconciler) createOrUpdateResource(
 			labels[key] = value
 		}
 		next.SetLabels(labels)
-		return wrapResourceWriteError(r.Update(ctx, next, strictFieldValidation), resourceWasOwnedActiveAndServing)
+		// Ask the installed CRD and admission webhooks to normalize the candidate.
+		// Defaults such as port protocols and Grove minAvailable are not empty
+		// values. Comparing raw rendering would repeatedly remove those defaults.
+		defaulted := next.DeepCopy()
+		if err := r.Update(ctx, defaulted, client.DryRunAll, strictFieldValidation); err != nil {
+			return wrapResourceWriteError(err, resourceWasOwnedActiveAndServing)
+		}
+		defaultedSpec, found, err := unstructured.NestedMap(defaulted.Object, "spec")
+		if err != nil || !found {
+			return wrapResourceWriteError(fmt.Errorf("Dynamo dry-run update returned a missing or invalid spec"), resourceWasOwnedActiveAndServing)
+		}
+		if !equality.Semantic.DeepEqual(stripEmptyDefaults(existingSpec), stripEmptyDefaults(defaultedSpec)) ||
+			overrideSpecDiffers(md, existingSpec, defaultedSpec) {
+			// Only take the normalized spec, not dry-run metadata, status, or RV.
+			next.Object["spec"] = defaultedSpec
+			logger.Info("Updating resource", "kind", resource.GetKind(), "name", resource.GetName())
+			return wrapResourceWriteError(r.Update(ctx, next, strictFieldValidation), resourceWasOwnedActiveAndServing)
+		}
 	}
 
 	if existing.GetAnnotations()[manualInputHashAnnotation] != annotations[manualInputHashAnnotation] {
@@ -756,10 +769,12 @@ func (r *DynamoProviderReconciler) ensureDeploymentModeTransition(ctx context.Co
 		return false, &intentLockedError{message: "Change airunway.ai/dynamo-attempt before replacing automatic configuration with a manual deployment"}
 	}
 	needsCheckpoint := p.Intent == nil || p.Intent.Phase != "Replacing"
-	if request != nil {
+	if request != nil || p.RequestRef != nil && p.WorkloadRef == nil {
 		previous := p.WorkloadRef
-		p.RequestRef = resourceReference(request)
-		if _, err := r.resolveGeneratedDGD(ctx, md, request); err != nil {
+		if request != nil {
+			p.RequestRef = resourceReference(request)
+		}
+		if _, err := r.resolveCleanupWorkload(ctx, md, request); err != nil {
 			return false, err
 		}
 		if previous == nil && p.WorkloadRef != nil {
@@ -818,8 +833,8 @@ func (r *DynamoProviderReconciler) deleteIntentResource(
 
 func (r *DynamoProviderReconciler) deleteGeneratedDGDs(ctx context.Context, md *airunwayv1alpha1.ModelDeployment, dgdr *unstructured.Unstructured) (bool, error) {
 	p := ensureProviderStatus(md)
-	if p.WorkloadRef == nil && dgdr != nil {
-		if _, err := r.resolveGeneratedDGD(ctx, md, dgdr); err != nil {
+	if p.WorkloadRef == nil {
+		if _, err := r.resolveCleanupWorkload(ctx, md, dgdr); err != nil {
 			return false, err
 		}
 		if p.WorkloadRef != nil {
@@ -1018,10 +1033,12 @@ func (r *DynamoProviderReconciler) handleDeletion(ctx context.Context, md *airun
 	if err != nil {
 		return r.cleanupRetryResult(ctx, md, 10*time.Second)
 	}
-	if request != nil {
+	if request != nil || p.RequestRef != nil && p.WorkloadRef == nil {
 		previous := p.WorkloadRef
-		p.RequestRef = resourceReference(request)
-		if _, err := r.resolveGeneratedDGD(ctx, md, request); err != nil {
+		if request != nil {
+			p.RequestRef = resourceReference(request)
+		}
+		if _, err := r.resolveCleanupWorkload(ctx, md, request); err != nil {
 			md.Status.Message = err.Error()
 			_ = r.Status().Update(ctx, md)
 			return r.cleanupRetryResult(ctx, md, 10*time.Second)
@@ -1035,6 +1052,7 @@ func (r *DynamoProviderReconciler) handleDeletion(ctx context.Context, md *airun
 		}
 	}
 	if p.RequestRef != nil || request != nil {
+		previous := p.WorkloadRef
 		pending, err := r.deleteIntentResource(ctx, md, request)
 		if err != nil {
 			md.Status.Message = err.Error()
@@ -1042,9 +1060,17 @@ func (r *DynamoProviderReconciler) handleDeletion(ctx context.Context, md *airun
 			return r.cleanupRetryResult(ctx, md, 10*time.Second)
 		}
 		if pending {
+			// A workload may appear between the first discovery and cleanup.
+			if previous == nil && p.WorkloadRef != nil {
+				if err := r.Status().Update(ctx, md); err != nil {
+					logger.Error(err, "Failed to persist workload identity before cleanup")
+					return r.cleanupRetryResult(ctx, md, 10*time.Second)
+				}
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
 			return r.cleanupRetryResult(ctx, md, 10*time.Second)
 		}
-	} else if p.ResourceKind == DynamoGraphDeploymentRequestKind && p.WorkloadRef == nil {
+	} else if (p.ResourceKind == DynamoGraphDeploymentRequestKind || dynamointent.Enabled(md)) && p.WorkloadRef == nil {
 		md.Status.Message = "Dynamo request is missing and no workload UID was recorded; cleanup requires operator verification"
 		_ = r.Status().Update(ctx, md)
 		return r.cleanupRetryResult(ctx, md, 10*time.Second)

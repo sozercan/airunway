@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -245,7 +246,7 @@ func (r *DynamoProviderReconciler) resolveGeneratedDGD(ctx context.Context, md *
 	name, _, _ := unstructured.NestedString(request.Object, "status", "dgdName")
 	if name == "" {
 		if p.WorkloadRef == nil {
-			return nil, nil
+			return r.discoverGeneratedDGD(ctx, md, request)
 		}
 		name = p.WorkloadRef.Name
 	}
@@ -261,6 +262,72 @@ func (r *DynamoProviderReconciler) resolveGeneratedDGD(ctx context.Context, md *
 	}
 	p.WorkloadRef = resourceReference(dgd)
 	return dgd, nil
+}
+
+// A generated DGD can exist before the DGDR's status is checkpointed. Search
+// only the request's namespace/relationship labels and retain a concrete UID.
+func (r *DynamoProviderReconciler) discoverGeneratedDGD(ctx context.Context, md *api.ModelDeployment, request *unstructured.Unstructured) (*unstructured.Unstructured, error) {
+	var found *unstructured.Unstructured
+	served := false
+	for _, version := range []string{DynamoAPIVersion, dynamoBetaVersion} {
+		list := &unstructured.UnstructuredList{}
+		list.SetAPIVersion(DynamoAPIGroup + "/" + version)
+		list.SetKind(DynamoGraphDeploymentKind + "List")
+		if err := r.List(ctx, list, client.InNamespace(md.Namespace), client.MatchingLabels{
+			dynamoDGDRNameLabel: request.GetName(), dynamoDGDRNamespaceLabel: md.Namespace,
+		}); err != nil {
+			if upstreamResourceUnavailable(err) {
+				continue
+			}
+			return nil, err
+		}
+		served = true
+		for i := range list.Items {
+			candidate := &list.Items[i]
+			if !generatedByRequest(candidate, request) {
+				continue
+			}
+			if candidate.GetUID() == "" {
+				return nil, fmt.Errorf("generated Dynamo workload has no UID")
+			}
+			if found != nil && (found.GetUID() != candidate.GetUID() || found.GetName() != candidate.GetName()) {
+				return nil, fmt.Errorf("multiple Dynamo workloads match request %s; cleanup requires verification", request.GetName())
+			}
+			if found == nil {
+				found = candidate.DeepCopy()
+				// List items may omit TypeMeta; the collection defines it.
+				found.SetAPIVersion(DynamoAPIGroup + "/" + version)
+				found.SetKind(DynamoGraphDeploymentKind)
+			}
+		}
+	}
+	if !served {
+		return nil, fmt.Errorf("no served Dynamo workload API for request discovery")
+	}
+	if found != nil {
+		ensureProviderStatus(md).WorkloadRef = resourceReference(found)
+	}
+	return found, nil
+}
+
+// A recorded request identity remains useful after garbage collection removes
+// the request. It is discovery evidence only, never a synthetic deletion target.
+func (r *DynamoProviderReconciler) resolveCleanupWorkload(ctx context.Context, md *api.ModelDeployment, request *unstructured.Unstructured) (*unstructured.Unstructured, error) {
+	p := ensureProviderStatus(md)
+	if request == nil {
+		if p.WorkloadRef != nil || p.RequestRef == nil {
+			return nil, nil
+		}
+		ref := p.RequestRef
+		if ref.Name == "" || ref.UID == "" || ref.Namespace != md.Namespace || ref.Kind != DynamoGraphDeploymentRequestKind || ref.APIVersion != DynamoAPIGroup+"/"+DynamoGraphDeploymentRequestAPIVersion {
+			return nil, fmt.Errorf("cannot discover a generated workload without a valid recorded request identity")
+		}
+		request = referenceResource(ref)
+		request.SetUID(types.UID(ref.UID))
+		// Requests cannot predate their owning ModelDeployment.
+		request.SetCreationTimestamp(md.CreationTimestamp)
+	}
+	return r.resolveGeneratedDGD(ctx, md, request)
 }
 
 func (r *DynamoProviderReconciler) deleteRecordedWorkload(ctx context.Context, md *api.ModelDeployment) (bool, error) {

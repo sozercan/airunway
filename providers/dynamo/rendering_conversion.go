@@ -169,7 +169,16 @@ func alphaComponentToBeta(name string, src map[string]any, pvcs map[string]bool)
 			if err != nil {
 				return nil, err
 			}
-			main = merged["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)
+			mergedSpec, _ := merged["spec"].(map[string]any)
+			mergedContainers, _ := mergedSpec["containers"].([]any)
+			if len(mergedContainers) != 1 {
+				return nil, fmt.Errorf("mainContainer override must retain the main container")
+			}
+			mergedMain, ok := mergedContainers[0].(map[string]any)
+			if !ok || mergedMain["name"] != "main" {
+				return nil, fmt.Errorf("mainContainer override produced an invalid main container")
+			}
+			main = mergedMain
 		}
 	}
 	containers := []any{main}
