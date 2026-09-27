@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -135,13 +136,14 @@ func waitForResource(parent context.Context, client ClusterClient, noun string, 
 }
 
 type accessEndpoint struct {
-	URL             *url.URL
-	Access          string
-	Headers         map[string]string
-	ServedModelName string
-	Service         Object
-	ServicePort     int
-	AuthSecretRef   Object
+	URL                *url.URL
+	Access             string
+	Headers            map[string]string
+	ServedModelName    string
+	Service            Object
+	ServicePort        int
+	AuthSecretRef      Object
+	RequiresKnownModel bool
 }
 
 func accessSafeURL(value string) (*url.URL, error) {
@@ -335,6 +337,28 @@ func accessRouteParentCurrent(route, parent Object, namespace string) bool {
 	return matched
 }
 
+// Discovery must use the same path and routing headers as chat. A separate
+// GET match with otherwise identical constraints also supports that request.
+func accessRouteSupportsGET(route, selected Object) bool {
+	if stringAt(selected, "method") == "" || stringAt(selected, "method") == "GET" {
+		return true
+	}
+	selected = cloneObject(selected)
+	delete(selected, "method")
+	for _, rule := range objects(get(route, "spec", "rules")) {
+		for _, match := range objects(rule["matches"]) {
+			if stringAt(match, "method") == "GET" {
+				match = cloneObject(match)
+				delete(match, "method")
+				if reflect.DeepEqual(match, selected) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func accessGatewayEndpoint(ctx context.Context, client ClusterClient, resource Object, flags Flags, fallback string, requireService bool) (*accessEndpoint, error) {
 	status := object(get(resource, "status", "gateway"))
 	ns := stringAt(status, "gatewayNamespace")
@@ -355,6 +379,10 @@ func accessGatewayEndpoint(ctx context.Context, client ClusterClient, resource O
 	route, err := accessGet(ctx, client, accessRouteType, accessNamespace(resource, fallback), routeName)
 	if err != nil {
 		return nil, err
+	}
+	method := "POST"
+	if flags.Bool("check") {
+		method = "GET"
 	}
 	type candidate struct{ route, listener, match Object }
 	candidates := []candidate{}
@@ -383,7 +411,9 @@ func accessGatewayEndpoint(ctx context.Context, client ClusterClient, resource O
 					matches = []Object{{}}
 				}
 				for _, match := range matches {
-					if (stringAt(match, "method") != "" && stringAt(match, "method") != "POST") || len(array(match["queryParams"])) > 0 || (stringAt(match, "path", "type") != "" && stringAt(match, "path", "type") != "PathPrefix") {
+					if (stringAt(match, "method") != "" && stringAt(match, "method") != method) ||
+						len(array(match["queryParams"])) > 0 ||
+						(stringAt(match, "path", "type") != "" && stringAt(match, "path", "type") != "PathPrefix") {
 						continue
 					}
 					usable := true
@@ -436,7 +466,10 @@ func accessGatewayEndpoint(ctx context.Context, client ClusterClient, resource O
 	}
 	scheme := strings.ToLower(stringAt(c.listener, "protocol"))
 	port := int(intAt(c.listener, "port"))
-	e := &accessEndpoint{Access: "gateway", Headers: headers, ServicePort: port}
+	e := &accessEndpoint{
+		Access: "gateway", Headers: headers, ServicePort: port,
+		RequiresKnownModel: !accessRouteSupportsGET(c.route, c.match),
+	}
 	e.ServedModelName, err = accessServedModelName(ctx, client, resource)
 	if err != nil {
 		return nil, err
@@ -644,6 +677,10 @@ func runAccess(noun, action, name string, c *CommandContext) error {
 	e, err := accessResolveEndpoint(ctx, client, noun, resource, c.Flags, c.Namespace, requireService)
 	if err != nil {
 		return err
+	}
+	if action == "chat" && e.RequiresKnownModel && e.ServedModelName == "" {
+		return accessUnsupported("This gateway route does not support GET model discovery. " +
+			"Publish a resolved served model name for POST-only chat, or use a route that also supports GET.")
 	}
 	switch action {
 	case "endpoint":

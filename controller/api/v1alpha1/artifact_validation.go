@@ -2,6 +2,7 @@ package v1alpha1
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"path"
 	"reflect"
@@ -249,11 +250,11 @@ func validArtifactBucket(scheme, bucket string) bool {
 	if scheme == "s3" {
 		return len(validation.IsDNS1123Subdomain(bucket)) == 0
 	}
-	if !artifactGCSBucket.MatchString(bucket) {
+	if !artifactGCSBucket.MatchString(bucket) || net.ParseIP(bucket) != nil {
 		return false
 	}
 	for part := range strings.SplitSeq(bucket, ".") {
-		if len(part) > 63 {
+		if part == "" || len(part) > 63 {
 			return false
 		}
 	}

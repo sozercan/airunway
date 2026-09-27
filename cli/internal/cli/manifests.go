@@ -359,6 +359,26 @@ func manifestRejectOptions(flags Flags, keys []string, description string) error
 	return nil
 }
 
+// Unresolved auto-selection is checked by the selected provider's transformer.
+func manifestCheckProviderOptions(flags Flags, providers ...string) error {
+	for _, provider := range providers {
+		if provider == "kaito" && flags.Has("replicas") {
+			replicas, err := integer(flags, "replicas", 1, 0, manifestInt32Max)
+			if err != nil {
+				return err
+			}
+			if replicas == 0 {
+				return usage("KAITO does not support zero replicas; use at least one replica.")
+			}
+		}
+		if flags.Has("engine-arg") && (provider == "kaito" || provider == "kuberay") {
+			return usage("--engine-arg is not supported by provider " + provider +
+				"; remove raw arguments or select another provider.")
+		}
+	}
+	return nil
+}
+
 func buildModel(name string, flags Flags, namespace string, streams *IO) (Object, error) {
 	allowed := slices.Concat(manifestModelMutableFlags, manifestSourceFlags, []string{"provider", "engine"})
 	if err := manifestCheckFlags(flags, allowed, "model creation"); err != nil {
@@ -390,6 +410,9 @@ func buildModel(name string, flags Flags, namespace string, streams *IO) (Object
 			return nil, err
 		}
 		spec["provider"] = Object{"name": value}
+	}
+	if err := manifestCheckProviderOptions(flags, stringAt(spec, "provider", "name")); err != nil {
+		return nil, err
 	}
 	if flags.Has("engine") {
 		value, err := manifestNonempty(flags, "engine")
@@ -1003,6 +1026,10 @@ func updateResource(noun string, existing Object, flags Flags, streams *IO) (Obj
 		var err error
 		spec, err = manifestModelOptions(flags)
 		if err != nil {
+			return nil, err
+		}
+		if err := manifestCheckProviderOptions(flags,
+			stringAt(existing, "spec", "provider", "name"), stringAt(existing, "status", "provider", "name")); err != nil {
 			return nil, err
 		}
 		custom := stringAt(existing, "spec", "model", "source") == "custom"

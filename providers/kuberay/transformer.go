@@ -61,6 +61,12 @@ func NewTransformer() *Transformer {
 
 // Transform converts a ModelDeployment to a RayService
 func (t *Transformer) Transform(ctx context.Context, md *airunwayv1alpha1.ModelDeployment) ([]*unstructured.Unstructured, error) {
+	// These raw CLI flags have no mapping to the provider's runtime configuration.
+	if len(md.Spec.Engine.ExtraArgs) > 0 {
+		return nil, fmt.Errorf("KubeRay does not support spec.engine.extraArgs (--engine-arg); " +
+			"remove raw arguments or select another provider")
+	}
+
 	rs := &unstructured.Unstructured{}
 	rs.SetAPIVersion(fmt.Sprintf("%s/%s", RayAPIGroup, RayAPIVersion))
 	rs.SetKind(RayServiceKind)

@@ -215,6 +215,7 @@ func (v *ModelDeploymentCustomValidator) ValidateCreate(ctx context.Context, obj
 	specWarnings, specErrs := v.validateSpec(ctx, obj)
 	warnings = append(warnings, specWarnings...)
 	allErrs = append(allErrs, specErrs...)
+	allErrs = append(allErrs, validateProviderScaling(obj, nil)...)
 	allErrs = append(allErrs, v.validateArtifactAccess(ctx, obj)...)
 
 	// Check for warnings
@@ -237,6 +238,7 @@ func (v *ModelDeploymentCustomValidator) ValidateUpdate(ctx context.Context, old
 	specWarnings, specErrs := v.validateSpec(ctx, newObj)
 	warnings = append(warnings, specWarnings...)
 	allErrs = append(allErrs, specErrs...)
+	allErrs = append(allErrs, validateProviderScaling(newObj, oldObj)...)
 	if !artifactBookkeepingOnly(oldObj, newObj) {
 		allErrs = append(allErrs, v.validateArtifactAccess(ctx, newObj)...)
 	}
@@ -259,6 +261,29 @@ func (v *ModelDeploymentCustomValidator) ValidateDelete(_ context.Context, obj *
 
 	// No validation on delete
 	return nil, nil
+}
+
+// validateProviderScaling rejects unsupported new zero-replica requests while
+// allowing bookkeeping and deletion of pre-existing unsupported resources.
+func validateProviderScaling(obj, old *airunwayv1alpha1.ModelDeployment) field.ErrorList {
+	kaitoZero := func(md *airunwayv1alpha1.ModelDeployment) bool {
+		if md == nil || md.Spec.Scaling == nil || md.Spec.Scaling.Replicas != 0 {
+			return false
+		}
+		provider := ""
+		if md.Spec.Provider != nil {
+			provider = md.Spec.Provider.Name
+		}
+		if provider == "" && md.Status.Provider != nil {
+			provider = md.Status.Provider.Name
+		}
+		return provider == "kaito"
+	}
+	if !kaitoZero(obj) || kaitoZero(old) {
+		return nil
+	}
+	return field.ErrorList{field.Invalid(field.NewPath("spec", "scaling", "replicas"), 0,
+		"KAITO does not support zero replicas; use at least one replica")}
 }
 
 // validateSpec validates the ModelDeployment spec

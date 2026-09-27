@@ -1107,6 +1107,12 @@ func TestTransformAggregatedReplicaIntent(t *testing.T) {
 			md := newTestMD("replica-intent", "default")
 			md.Spec.Scaling = tt.scaling
 			resources, err := NewTransformer().Transform(context.Background(), md)
+			if tt.name == "zero" {
+				if err == nil || !strings.Contains(err.Error(), "KAITO does not support zero replicas") || len(resources) != 0 {
+					t.Fatalf("unsupported zero replicas must not render a Workspace: resources=%d, err=%v", len(resources), err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatal(err)
 			}

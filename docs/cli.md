@@ -103,9 +103,12 @@ Provider and engine selection remain controller-owned when omitted. `--served-na
 sets an inference-facing model name; endpoint discovery reports the resolved name
 and routing headers rather than assuming the deployment name is callable.
 
-Use `--engine-arg=--flag=value` repeatedly for raw engine flags. Remote model code
-is not trusted unless `--trust-remote-code` is explicitly supplied. Use
-`--gateway=false` to disable gateway integration, not to create a public service.
+Use `--engine-arg=--flag=value` repeatedly for raw engine flags. KAITO and KubeRay
+do not support these raw arguments and reject them rather than ignoring them.
+KAITO also requires at least one replica; `--replicas 0` is not a supported stop
+operation for that provider. Remote model code is not trusted unless
+`--trust-remote-code` is explicitly supplied. Use `--gateway=false` to disable
+gateway integration, not to create a public service.
 
 ### Source references and artifacts
 
@@ -312,6 +315,10 @@ Deployment readiness, endpoint reachability, and successful inference are separa
 claims. Endpoint checks do not submit chat requests or execute agent tools.
 Provider status must publish a usable access contract. Providers without one fail
 with an explanation rather than a fabricated URL.
+
+Model endpoint checks require a route that permits `GET /v1/models`. Chat can use
+a POST-only route when the served model name is already known; otherwise its
+model-discovery request also needs GET support.
 
 `connect` binds loopback and stays in the foreground. Ctrl+C closes the connection,
 not the deployment. Authentication remains required by the upstream service.
