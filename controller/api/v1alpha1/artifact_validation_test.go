@@ -99,6 +99,47 @@ func TestValidateArtifact(t *testing.T) {
 	}
 }
 
+func TestValidateArtifactBuckets(t *testing.T) {
+	maxGCSBucket := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 30)
+	for _, tt := range []struct {
+		name  string
+		uri   string
+		valid bool
+	}{
+		{name: "GCS underscore prefix", uri: "gs://model_cache/weights", valid: true},
+		{name: "GCS underscore root", uri: "gs://model_cache", valid: true},
+		{name: "GCS underscore slash root", uri: "gs://model_cache/", valid: true},
+		{name: "GCS repeated underscores", uri: "gs://model__cache/weights", valid: true},
+		{name: "GCS minimum length", uri: "gs://0_1/weights", valid: true},
+		{name: "GCS dotted underscore", uri: "gs://model_cache.example.com/weights", valid: true},
+		{name: "GCS maximum component", uri: "gs://" + strings.Repeat("a", 31) + "_" + strings.Repeat("b", 31) + "/weights", valid: true},
+		{name: "GCS maximum dotted length", uri: "gs://" + maxGCSBucket + "/weights", valid: true},
+		{name: "GCS too short", uri: "gs://ab/weights"},
+		{name: "GCS too long without dots", uri: "gs://" + strings.Repeat("a", 64) + "/weights"},
+		{name: "GCS too long with dots", uri: "gs://" + maxGCSBucket + "d/weights"},
+		{name: "GCS component too long", uri: "gs://" + strings.Repeat("a", 64) + ".example.com/weights"},
+		{name: "GCS leading underscore", uri: "gs://_model_cache/weights"},
+		{name: "GCS trailing underscore", uri: "gs://model_cache_/weights"},
+		{name: "GCS leading dash", uri: "gs://-model_cache/weights"},
+		{name: "GCS trailing dot", uri: "gs://model_cache./weights"},
+		{name: "GCS uppercase", uri: "gs://Model_cache/weights"},
+		{name: "GCS invalid character", uri: "gs://model~cache/weights"},
+		{name: "GCS port", uri: "gs://model_cache:443/weights"},
+		{name: "S3 dash unchanged", uri: "s3://model-cache/weights", valid: true},
+		{name: "S3 dots unchanged", uri: "s3://model.cache/weights", valid: true},
+		{name: "S3 underscore rejected", uri: "s3://model_cache/weights"},
+		{name: "S3 uppercase rejected", uri: "s3://Model-cache/weights"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := artifactSpec()
+			s.Model.Artifact.URI = tt.uri
+			if err := s.ValidateArtifact(); (err == nil) != tt.valid {
+				t.Fatalf("ValidateArtifact() error = %v, want valid = %t", err, tt.valid)
+			}
+		})
+	}
+}
+
 func TestValidateArtifactUpdate(t *testing.T) {
 	old := artifactSpec()
 	for name, mutate := range map[string]func(*ModelDeploymentSpec){

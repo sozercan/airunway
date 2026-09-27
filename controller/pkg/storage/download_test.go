@@ -30,6 +30,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
+func assertDownloadJobTokenAutomount(t *testing.T, job *batchv1.Job, want bool) {
+	t.Helper()
+	token := job.Spec.Template.Spec.AutomountServiceAccountToken
+	if token == nil || *token != want {
+		t.Fatalf("download Job must explicitly set automountServiceAccountToken=%t", want)
+	}
+}
+
 func TestNeedsDownloadJob(t *testing.T) {
 	tests := []struct {
 		name string
@@ -138,6 +146,7 @@ func TestEnsureDownloadJobCreation(t *testing.T) {
 	}
 
 	// Verify Job spec
+	assertDownloadJobTokenAutomount(t, job, false)
 	if job.Spec.Template.Spec.Containers[0].Image != DefaultDownloadJobImage {
 		t.Errorf("expected image %s, got %s", DefaultDownloadJobImage, job.Spec.Template.Spec.Containers[0].Image)
 	}
@@ -269,6 +278,7 @@ func TestEnsureDownloadJobWithHFToken(t *testing.T) {
 		t.Fatalf("expected Job to be created: %v", err)
 	}
 
+	assertDownloadJobTokenAutomount(t, job, false)
 	container := job.Spec.Template.Spec.Containers[0]
 	if len(container.EnvFrom) != 1 {
 		t.Fatalf("expected 1 envFrom, got %d", len(container.EnvFrom))
@@ -838,6 +848,7 @@ func TestArtifactDownloadJob(t *testing.T) {
 	if pod.ServiceAccountName != "model-reader" || job.Spec.Template.Labels["azure.workload.identity/use"] != "true" || job.Spec.ActiveDeadlineSeconds == nil {
 		t.Fatal("missing identity/deadline")
 	}
+	assertDownloadJobTokenAutomount(t, job, true)
 	if len(container.EnvFrom) != 0 {
 		t.Fatal("must not inject entire Secret")
 	}
@@ -852,6 +863,22 @@ func TestArtifactDownloadJob(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("missing credentials")
+	}
+}
+
+func TestArtifactDownloadJobWithoutWorkloadIdentity(t *testing.T) {
+	md := artifactDownloadMD()
+	md.Spec.Model.Artifact.ServiceAccountName = ""
+	job := buildDownloadJob(md, findModelCacheVolume(md), DefaultDownloadJobImage)
+	pod := job.Spec.Template.Spec
+	assertDownloadJobTokenAutomount(t, job, false)
+	if pod.ServiceAccountName != "" || job.Spec.Template.Labels["azure.workload.identity/use"] != "" {
+		t.Fatal("workload identity must require an explicit service account")
+	}
+	for _, env := range pod.Containers[0].Env {
+		if env.Name == "ARTIFACT_WORKLOAD_IDENTITY" {
+			t.Fatal("workload identity must not be enabled by default")
+		}
 	}
 }
 

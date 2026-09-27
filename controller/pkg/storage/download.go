@@ -236,7 +236,8 @@ func buildDownloadJob(md *airunwayv1alpha1.ModelDeployment, vol *airunwayv1alpha
 			Parallelism:  &parallelism,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyNever,
+					AutomountServiceAccountToken: boolPtr(false),
+					RestartPolicy:                corev1.RestartPolicyNever,
 					Containers: []corev1.Container{
 						{
 							Name:  "model-download",
@@ -310,7 +311,6 @@ func buildDownloadJob(md *airunwayv1alpha1.ModelDeployment, vol *airunwayv1alpha
 			})
 		}
 		pod.ServiceAccountName = a.ServiceAccountName
-		pod.AutomountServiceAccountToken = boolPtr(false)
 		if a.ServiceAccountName != "" {
 			// Identity admission may inject a projected token for the selected account.
 			// AWS/GCP can also use the service account's existing identity binding.

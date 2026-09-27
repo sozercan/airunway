@@ -20,6 +20,7 @@ var artifactRepository = regexp.MustCompile(`^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]
 var artifactTag = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$`)
 var artifactDigest = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 var artifactHFPart = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$`)
+var artifactGCSBucket = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$`)
 
 // ArtifactCacheVolume returns the cache volume, if configured. ValidateArtifact
 // rejects multiple caches and unusable volumes before a download can start.
@@ -206,7 +207,7 @@ func validateArtifactScheme(u *url.URL) error {
 			}
 		}
 	case "s3", "gs":
-		if len(validation.IsDNS1123Subdomain(u.Host)) != 0 {
+		if !validArtifactBucket(u.Scheme, u.Host) {
 			return fmt.Errorf("invalid artifact bucket")
 		}
 	case "https":
@@ -221,6 +222,24 @@ func validateArtifactScheme(u *url.URL) error {
 		return fmt.Errorf("unsupported artifact URI scheme; use hf, s3, gs, https, or oci")
 	}
 	return nil
+}
+
+// validArtifactBucket preserves the existing S3 DNS rules. GCS allows underscores
+// and dotted names up to 222 characters with at most 63 characters per component.
+// https://cloud.google.com/storage/docs/buckets#naming
+func validArtifactBucket(scheme, bucket string) bool {
+	if scheme == "s3" {
+		return len(validation.IsDNS1123Subdomain(bucket)) == 0
+	}
+	if !artifactGCSBucket.MatchString(bucket) {
+		return false
+	}
+	for part := range strings.SplitSeq(bucket, ".") {
+		if len(part) > 63 {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *ModelDeploymentSpec) validateArtifactDestination(u *url.URL) error {
