@@ -3,6 +3,7 @@ package v1alpha1
 import (
 	"context"
 	"errors"
+	"maps"
 	"testing"
 
 	airunwayv1alpha1 "github.com/ai-runway/airunway/controller/api/v1alpha1"
@@ -124,5 +125,80 @@ func TestArtifactBookkeepingDoesNotDelegateNewAccess(t *testing.T) {
 	next.Spec.Model.ID = "/other"
 	if artifactBookkeepingOnly(old, next) {
 		t.Fatal("spec edit bypassed authorization")
+	}
+}
+
+func artifactGatewayBookkeepingPair(kind string, remove bool) (*airunwayv1alpha1.ModelDeployment, *airunwayv1alpha1.ModelDeployment) {
+	old := artifactWithAccess()
+	if kind == "image" {
+		old.Spec.Model.Artifact.Image = "downloader:v1"
+	} else {
+		old.Spec.Model.Artifact.ServiceAccountName = "downloader"
+	}
+	if remove {
+		old.Annotations = map[string]string{airunwayv1alpha1.HTTPRouteCreated: "true"}
+	}
+	next := old.DeepCopy()
+	if remove {
+		delete(next.Annotations, airunwayv1alpha1.HTTPRouteCreated)
+	} else {
+		next.Annotations = map[string]string{airunwayv1alpha1.HTTPRouteCreated: "true"}
+	}
+	return old, next
+}
+
+func TestArtifactGatewayBookkeepingDoesNotRequirePodAccess(t *testing.T) {
+	cases := []struct {
+		name, kind string
+		remove     bool
+	}{
+		{"image/add", "image", false}, {"image/remove", "image", true},
+		{"account/add", "account", false}, {"account/remove", "account", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			old, next := artifactGatewayBookkeepingPair(tc.kind, tc.remove)
+			oldAnnotations, newAnnotations := maps.Clone(old.Annotations), maps.Clone(next.Annotations)
+			if !artifactBookkeepingOnly(old, next) {
+				t.Fatal("gateway bookkeeping requires new artifact privileges")
+			}
+			if _, err := (&ModelDeploymentCustomValidator{}).ValidateUpdate(context.Background(), old, next); err != nil {
+				t.Fatal("gateway bookkeeping rejected", err)
+			}
+			if !maps.Equal(old.Annotations, oldAnnotations) || !maps.Equal(next.Annotations, newAnnotations) {
+				t.Fatal("annotations mutated during validation")
+			}
+		})
+	}
+}
+
+func TestArtifactGatewayMarkerCannotHideWorkloadChanges(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*airunwayv1alpha1.ModelDeployment)
+	}{
+		{"annotation", func(obj *airunwayv1alpha1.ModelDeployment) {
+			obj.Annotations["azure.workload.identity/client-id"] = "other-identity"
+		}},
+		{"labels", func(obj *airunwayv1alpha1.ModelDeployment) { obj.Labels = map[string]string{"workload": "other"} }},
+		{"image", func(obj *airunwayv1alpha1.ModelDeployment) { obj.Spec.Engine.Image = "other/image:v1" }},
+		{"ownership", func(obj *airunwayv1alpha1.ModelDeployment) {
+			obj.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "Secret", Name: "other", UID: "other"}}
+		}},
+		{"invalid marker", func(obj *airunwayv1alpha1.ModelDeployment) {
+			obj.Annotations[airunwayv1alpha1.HTTPRouteCreated] = "unexpected"
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			old, edited := artifactGatewayBookkeepingPair("account", false)
+			tc.mutate(edited)
+			if artifactBookkeepingOnly(old, edited) {
+				t.Fatal("non-bookkeeping change bypassed authorization")
+			}
+			if _, err := (&ModelDeploymentCustomValidator{}).ValidateUpdate(context.Background(), old, edited); err == nil {
+				t.Fatal("non-bookkeeping update admitted without authorization")
+			}
+		})
 	}
 }

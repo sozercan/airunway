@@ -3,6 +3,7 @@ package v1alpha1
 import (
 	"context"
 	"fmt"
+	"maps"
 	"reflect"
 
 	airunwayv1alpha1 "github.com/ai-runway/airunway/controller/api/v1alpha1"
@@ -111,12 +112,27 @@ func (v *ModelDeploymentCustomValidator) validateArtifactPodAccess(ctx context.C
 	return nil
 }
 
+const artifactGatewayCreatedValue = "true"
+
 // artifactBookkeepingOnly excludes only updates with no workload-affecting
 // changes. In particular, keeping credentialsRef unchanged does NOT bypass SAR
-// when the image, spec, labels, annotations, or ownership are edited.
+// when the image, spec, labels, workload annotations, or ownership are edited.
+// The gateway controller only adds or removes its HTTPRoute-created marker.
 func artifactBookkeepingOnly(oldObj, newObj *airunwayv1alpha1.ModelDeployment) bool {
+	oldAnnotations := maps.Clone(oldObj.Annotations)
+	newAnnotations := maps.Clone(newObj.Annotations)
+	key := airunwayv1alpha1.HTTPRouteCreated
+	if oldAnnotations[key] != newAnnotations[key] {
+		for _, value := range []string{oldAnnotations[key], newAnnotations[key]} {
+			if value != "" && value != artifactGatewayCreatedValue {
+				return false
+			}
+		}
+	}
+	delete(oldAnnotations, key)
+	delete(newAnnotations, key)
 	return reflect.DeepEqual(oldObj.Spec, newObj.Spec) &&
 		reflect.DeepEqual(oldObj.Labels, newObj.Labels) &&
-		reflect.DeepEqual(oldObj.Annotations, newObj.Annotations) &&
+		maps.Equal(oldAnnotations, newAnnotations) &&
 		reflect.DeepEqual(oldObj.OwnerReferences, newObj.OwnerReferences)
 }
