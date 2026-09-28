@@ -128,3 +128,20 @@ func TestDynamoIntentCreationValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestUnnamedDynamoIntentAvoidsManualDefaults(t *testing.T) {
+	md := &api.ModelDeployment{Spec: api.ModelDeploymentSpec{Model: api.ModelSpec{ID: "Qwen/Qwen3-0.6B"}, Engine: api.EngineSpec{Type: api.EngineTypeVLLM}, Provider: &api.ProviderSpec{Overrides: &runtime.RawExtension{Raw: []byte(`{"deploymentMode":"intent","intent":{"hardware":{"totalGpus":2}}}`)}}}}
+	if err := (&ModelDeploymentCustomDefaulter{}).Default(context.Background(), md); err != nil {
+		t.Fatal(err)
+	}
+	if md.Spec.Resources != nil || md.Spec.Scaling != nil || dynamointent.GPUCount(md) != 2 {
+		t.Fatal("unnamed automatic intent acquired manual defaults")
+	}
+	if _, err := (&ModelDeploymentCustomValidator{}).ValidateCreate(context.Background(), md); err != nil {
+		t.Fatal(err)
+	}
+	md.Spec.Provider.Name = "kaito"
+	if _, err := (&ModelDeploymentCustomValidator{}).ValidateCreate(context.Background(), md); err == nil {
+		t.Fatal("wrong explicit provider accepted")
+	}
+}

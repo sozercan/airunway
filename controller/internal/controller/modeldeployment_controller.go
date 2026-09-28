@@ -520,7 +520,11 @@ func (r *ModelDeploymentReconciler) selectEngine(ctx context.Context, md *airunw
 	availableEngines := make(map[airunwayv1alpha1.EngineType]string)    // engine -> provider name
 	advertisedEngines := make(map[string][]airunwayv1alpha1.EngineType) // provider name -> engines advertised
 
+	dynamoIntent := dynamointent.Enabled(md)
 	for _, pc := range providerConfigs {
+		if dynamoIntent && pc.Name != "dynamo" {
+			continue
+		}
 		if !pc.Status.Ready || pc.Spec.Capabilities == nil {
 			continue
 		}
@@ -636,10 +640,7 @@ func (r *ModelDeploymentReconciler) runSelectionAlgorithm(md *airunwayv1alpha1.M
 	spec := &md.Spec
 
 	// Determine GPU requirements
-	hasGPU := false
-	if spec.Resources != nil && spec.Resources.GPU != nil && spec.Resources.GPU.Count > 0 {
-		hasGPU = true
-	}
+	hasGPU := dynamointent.GPUCount(md) > 0
 	if spec.Serving != nil && spec.Serving.Mode == airunwayv1alpha1.ServingModeDisaggregated {
 		hasGPU = true
 	}
@@ -671,7 +672,11 @@ func (r *ModelDeploymentReconciler) runSelectionAlgorithm(md *airunwayv1alpha1.M
 	}
 	var candidates []candidate
 
+	dynamoIntent := dynamointent.Enabled(md)
 	for _, pc := range providers {
+		if dynamoIntent && pc.Name != "dynamo" {
+			continue
+		}
 		caps := pc.Spec.Capabilities
 		if caps == nil {
 			continue

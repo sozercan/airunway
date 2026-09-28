@@ -1151,17 +1151,18 @@ const deployments = new Hono<AppEnv>()
     async (c) => {
       const { namespace, name } = c.req.valid('param');
       const userToken = c.get('token') as string | undefined;
-      const current = await kubernetesService.getDeploymentManifest(name, namespace, userToken);
-      if (!current) throw new HTTPException(404, { message: 'Deployment not found' });
-      const next = reconfigureDynamoDeployment(current as unknown as ModelDeployment, c.req.valid('json'));
-      await requireDynamoIntentAvailability();
       try {
+        const current = await kubernetesService.getDeploymentManifest(name, namespace, userToken, { strict: true });
+        if (!current) throw new HTTPException(404, { message: 'Deployment not found' });
+        const next = reconfigureDynamoDeployment(current as unknown as ModelDeployment, c.req.valid('json'));
+        await requireDynamoIntentAvailability();
         await kubernetesService.replaceDeployment(next, userToken);
+        return c.json({ message: 'Automatic configuration requested', attempt: next.metadata.annotations?.['airunway.ai/dynamo-attempt'] });
       } catch (error) {
+        if (error instanceof HTTPException) throw error;
         const { message, statusCode } = handleK8sError(error, { operation: 'reconfigureDeployment', deploymentName: name, namespace });
         throw new HTTPException(statusCode as ContentfulStatusCode, { message });
       }
-      return c.json({ message: 'Automatic configuration requested', attempt: next.metadata.annotations?.['airunway.ai/dynamo-attempt'] });
     })
   .post('/preview', zValidator('json', createDeploymentSchema), async (c) => {
     const body = c.req.valid('json');

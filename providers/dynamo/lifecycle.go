@@ -1,8 +1,10 @@
 package dynamo
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -163,12 +165,38 @@ func (r *DynamoProviderReconciler) reconcileIntent(ctx context.Context, desired 
 			acceptedHash = p.Intent.InputHash
 		}
 		changed := acceptedHash != "" && acceptedHash != hash
-		if acceptedHash == "" {
-			// Compare only supplied fields. Upstream discovery/defaulting may populate
-			// other hardware, workload and metadata fields after submission.
+		legacyUnscopedHash := false
+		if changed && md.Spec.Provider != nil {
+			// Older controllers omitted legacy overrides from the hash when the
+			// provider name was unset. Verify the live inputs before migrating it.
+			if typed, err := dynamointent.Parse(md); err != nil {
+				return err
+			} else if typed == nil {
+				oldInput := md.DeepCopy()
+				oldInput.Spec.Provider.Overrides = nil
+				oldHash, err := dynamointent.Fingerprint(oldInput)
+				if err != nil {
+					return err
+				}
+				legacyUnscopedHash = acceptedHash == oldHash
+			}
+		}
+		if acceptedHash == "" || legacyUnscopedHash {
+			// Compare supplied fields only; retain upstream-discovered defaults.
+			// Normalize JSON number representations without losing integer precision.
 			have, _, _ := unstructured.NestedMap(existing.Object, "spec")
 			want, _, _ := unstructured.NestedMap(desired.Object, "spec")
-			changed = selectedOverrideValuesDiffer(have, want, want)
+			raw, err := json.Marshal([]any{have, want})
+			if err != nil {
+				return err
+			}
+			decoder := json.NewDecoder(bytes.NewReader(raw))
+			decoder.UseNumber()
+			var normalized []map[string]any
+			if err := decoder.Decode(&normalized); err != nil {
+				return err
+			}
+			changed = selectedOverrideValuesDiffer(normalized[0], normalized[1], normalized[1])
 		}
 		if changed && (phase == "Profiling" || phase == "Ready" || phase == "Deploying" || phase == "Deployed") {
 			p.RequestRef = resourceReference(existing)

@@ -212,3 +212,41 @@ func TestManualSpecUpdatePreservesOperatorMetadata(t *testing.T) {
 		t.Fatal("operator metadata was lost during spec update")
 	}
 }
+
+func TestAutoSelectedTypedIntentCreatesDGDR(t *testing.T) {
+	for _, target := range []struct{ api, release string }{{DynamoAPIVersion, "1.1.1"}, {dynamoBetaVersion, "1.5.0"}} {
+		t.Run(target.release, func(t *testing.T) {
+			md := typedRenderingMD(t)
+			md.Spec.Provider.Name = ""
+			md.Status.Provider = &api.ProviderStatus{Name: ProviderName}
+			mapper := meta.NewDefaultRESTMapper(nil)
+			mapper.Add(schema.GroupVersionKind{Group: DynamoAPIGroup, Version: target.api, Kind: DynamoGraphDeploymentKind}, meta.RESTScopeNamespace)
+			mapper.Add(schema.GroupVersionKind{Group: DynamoAPIGroup, Version: DynamoGraphDeploymentRequestAPIVersion, Kind: DynamoGraphDeploymentRequestKind}, meta.RESTScopeNamespace)
+			c := fake.NewClientBuilder().WithScheme(newScheme()).WithRESTMapper(mapper).WithObjects(operatorRuntimeFixtures(target.release, "")...).Build()
+			r := NewDynamoProviderReconciler(c, newScheme(), "")
+			if err := r.validateCompatibility(md); err != nil {
+				t.Fatal(err)
+			}
+			objects, err := r.renderResources(context.Background(), md)
+			if err != nil || len(objects) != 1 {
+				t.Fatalf("render: %v", err)
+			}
+			if objects[0].GetKind() != DynamoGraphDeploymentRequestKind {
+				t.Fatal("auto-selected intent rendered a manual DGD")
+			}
+			assertContract(t, readReleasedContract(t, "v"+target.release, "dynamographdeploymentrequests", "v1beta1"), objects[0])
+			if err := r.createOrUpdateResource(context.Background(), objects[0], md); err != nil {
+				t.Fatal(err)
+			}
+			requests := &unstructured.UnstructuredList{}
+			requests.SetAPIVersion(DynamoAPIGroup + "/" + DynamoGraphDeploymentRequestAPIVersion)
+			requests.SetKind(DynamoGraphDeploymentRequestKind + "List")
+			if err := c.List(context.Background(), requests, client.InNamespace(md.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			if len(requests.Items) != 1 || md.Spec.Resources != nil || md.Spec.Scaling != nil || md.Spec.Provider.Name != "" {
+				t.Fatal("DGDR not created or manual defaults injected")
+			}
+		})
+	}
+}

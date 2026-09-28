@@ -2,6 +2,7 @@ import { ApiException } from '@kubernetes/client-node';
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import app from '../hono-app';
 import { kubernetesService } from '../services/kubernetes';
+import { authService } from '../services/auth';
 import { mockServiceMethod } from '../test/helpers';
 import {
   defaultDynamoIntent, toDeploymentStatus, toModelDeploymentManifest,
@@ -242,6 +243,79 @@ describe('Dynamo automatic API', () => {
     }));
     expect((await request('/default/qwen-auto/reconfigure', { resourceVersion: '1' })).status).toBe(409);
     expect(writes).toBe(1);
+  });
+
+  test.each([401, 403, 503, 404])('maps actual manifest-read %s errors without mutation and forwards the user token', async status => {
+    const apiService = kubernetesService as unknown as { getCustomObjectsApi: (token?: string) => {
+      getNamespacedCustomObject: (args: unknown) => Promise<unknown>;
+    } };
+    const tokens: Array<string | undefined> = [];
+    let writes = 0;
+    let availabilityChecks = 0;
+    restores.push(mockServiceMethod(authService, 'isAuthEnabled', () => true));
+    restores.push(mockServiceMethod(authService, 'validateToken', async () => ({ valid: true, user: { username: 'test-user' } })));
+    restores.push(mockServiceMethod(apiService, 'getCustomObjectsApi', token => {
+      tokens.push(token);
+      return { getNamespacedCustomObject: async args => {
+        expect(args).toEqual({ group: 'airunway.ai', version: 'v1alpha1', namespace: 'default', plural: 'modeldeployments', name: 'qwen-auto' });
+        throw new ApiException(status, 'Unknown API Status Code!', JSON.stringify({ code: status, message: 'Manifest read failed' }), {});
+      } };
+    }));
+    restores.push(mockServiceMethod(kubernetesService, 'replaceDeployment', async () => { writes++; }));
+    restores.push(mockServiceMethod(kubernetesService, 'checkCRDExists', async () => { availabilityChecks++; return true; }));
+    const response = await app.request('/api/deployments/default/qwen-auto/reconfigure', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer user-token' },
+      body: JSON.stringify({ resourceVersion: '1' }),
+    });
+    expect(response.status).toBe(status);
+    const result = await response.json() as { error: { message: string; statusCode: number } };
+    expect(result.error.statusCode).toBe(status);
+    expect(result.error.message).toBe(status === 404 ? 'Deployment not found' : status >= 500 ? 'Internal Server Error' : 'Manifest read failed');
+    expect(tokens).toEqual(['user-token']);
+    expect(availabilityChecks).toBe(0);
+    expect(writes).toBe(0);
+  });
+
+  test.each([401, 403, 503, 404])('maps actual replacement %s failures without retry and forwards the user token to read and write', async status => {
+    const apiService = kubernetesService as unknown as { getCustomObjectsApi: (token?: string) => {
+      getNamespacedCustomObject: () => Promise<unknown>;
+      replaceNamespacedCustomObject: (args: { body: ModelDeployment }) => Promise<unknown>;
+    } };
+    const tokens: Array<string | undefined> = [];
+    let writes = 0;
+    restores.push(mockServiceMethod(authService, 'isAuthEnabled', () => true));
+    restores.push(mockServiceMethod(authService, 'validateToken', async () => ({ valid: true, user: { username: 'test-user' } })));
+    restores.push(mockServiceMethod(apiService, 'getCustomObjectsApi', token => {
+      tokens.push(token);
+      return {
+        getNamespacedCustomObject: async () => current(),
+        replaceNamespacedCustomObject: async args => {
+          writes++;
+          expect(args.body.metadata.resourceVersion).toBe('1');
+          throw new ApiException(status, 'Unknown API Status Code!', JSON.stringify({ code: status, message: 'Replacement failed' }), {});
+        },
+      };
+    }));
+    const response = await app.request('/api/deployments/default/qwen-auto/reconfigure', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer user-token' },
+      body: JSON.stringify({ resourceVersion: '1' }),
+    });
+    expect(response.status).toBe(status);
+    expect(tokens).toEqual(['user-token', 'user-token']);
+    expect(writes).toBe(1);
+  });
+
+  test('keeps the manifest-view endpoint best-effort for API read failures', async () => {
+    const apiService = kubernetesService as unknown as { getCustomObjectsApi: () => {
+      getNamespacedCustomObject: () => Promise<unknown>;
+    } };
+    restores.push(mockServiceMethod(apiService, 'getCustomObjectsApi', () => ({
+      getNamespacedCustomObject: async () => {
+        throw new ApiException(403, 'Unknown API Status Code!', JSON.stringify({ code: 403, message: 'Read denied' }), {});
+      },
+    })));
+    const response = await app.request('/api/deployments/qwen-auto/manifest?namespace=default');
+    expect(response.status).toBe(404);
   });
 
   test('rejects manual reconfiguration and arbitrary spec replacement', async () => {

@@ -102,7 +102,8 @@ export const dynamoReconfigureSchema = z.object({
 export function reconfigureDynamoDeployment(
   current: ModelDeployment, request: DynamoReconfigureRequest, attempt = crypto.randomUUID(),
 ): ModelDeployment {
-  if (current.spec.provider?.name !== 'dynamo' || current.spec.provider.overrides?.deploymentMode !== 'intent') {
+  const providerName = current.spec.provider?.name || current.status?.provider?.name;
+  if (providerName !== 'dynamo' || current.spec.provider?.overrides?.deploymentMode !== 'intent') {
     throw new HTTPException(422, { message: 'Only automatic Dynamo deployments can be reconfigured' });
   }
   if (current.metadata.resourceVersion !== request.resourceVersion) {

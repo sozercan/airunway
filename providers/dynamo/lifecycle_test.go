@@ -515,3 +515,55 @@ func TestPreviousLongAttemptIsRecoveredWithoutCreatingAnotherRequest(t *testing.
 		})
 	}
 }
+
+func TestUnnamedLegacyRequestHashMigratesWithoutReprofiling(t *testing.T) {
+	md := newMDForController("legacy-auto", "models")
+	setRenderingOverrides(t, md, map[string]any{"deploymentMode": "intent", "spec": map[string]any{"searchStrategy": "rapid", "workload": map[string]any{"requestRate": 1.5}}})
+	md.Spec.Provider.Name = ""
+	oldInput := md.DeepCopy()
+	oldInput.Spec.Provider.Overrides = nil
+	oldHash, err := dynamointent.Fingerprint(oldInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newHash, err := dynamointent.Fingerprint(md)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldHash == newHash {
+		t.Fatal("test must cover the historical unnamed-provider hash")
+	}
+	request := requestFixture(t, md, "Deployed")
+	annotations := request.GetAnnotations()
+	annotations[dynamointent.HashAnnotation] = oldHash
+	request.SetAnnotations(annotations)
+	_ = unstructured.SetNestedField(request.Object, "discovered-gpu", "spec", "hardware", "gpuSku")
+	c := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(request).Build()
+	r := NewDynamoProviderReconciler(c, newScheme(), "")
+	desired, err := r.Transformer.Transform(context.Background(), md)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.createOrUpdateResource(context.Background(), desired[0], md); err != nil {
+		t.Fatalf("unchanged request locked during hash migration: %v", err)
+	}
+	got := request.DeepCopy()
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(request), got); err != nil {
+		t.Fatal(err)
+	}
+	if got.GetUID() != request.GetUID() || got.GetAnnotations()[dynamointent.HashAnnotation] != newHash || !sameJSON(t, got.Object["spec"], request.Object["spec"]) {
+		t.Fatal("hash migration replaced or modified the existing request")
+	}
+	// A genuine override change must remain locked after the metadata migration.
+	setRenderingOverrides(t, md, map[string]any{"deploymentMode": "intent", "spec": map[string]any{"searchStrategy": "rapid", "workload": map[string]any{"requestRate": 2.5}}})
+	md.Spec.Provider.Name = ""
+	desired, err = r.Transformer.Transform(context.Background(), md)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = r.createOrUpdateResource(context.Background(), desired[0], md)
+	var locked *intentLockedError
+	if !errors.As(err, &locked) {
+		t.Fatalf("real input edit bypassed lock: %v", err)
+	}
+}

@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"context"
+	"k8s.io/apimachinery/pkg/runtime"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -161,5 +163,35 @@ func TestValidateSpec_UsesProvidedEngineType(t *testing.T) {
 	}
 	if md.Spec.Engine.Type != "" {
 		t.Errorf("validateSpec mutated md.Spec.Engine.Type to %q", md.Spec.Engine.Type)
+	}
+}
+
+func TestDynamoIntentRestrictsAutomaticSelection(t *testing.T) {
+	md := &airunwayv1alpha1.ModelDeployment{Spec: airunwayv1alpha1.ModelDeploymentSpec{
+		Model:    airunwayv1alpha1.ModelSpec{ID: "Qwen/Qwen3-0.6B"},
+		Provider: &airunwayv1alpha1.ProviderSpec{Overrides: &runtime.RawExtension{Raw: []byte(`{"deploymentMode":"intent","intent":{"hardware":{"totalGpus":2}}}`)}},
+	}}
+	providers := []airunwayv1alpha1.InferenceProviderConfig{
+		providerWithEngineRule("kaito", airunwayv1alpha1.EngineTypeSGLang, 100),
+		providerWithEngineRule("dynamo", airunwayv1alpha1.EngineTypeVLLM, 1),
+	}
+	r := &ModelDeploymentReconciler{}
+	if err := r.selectEngine(context.Background(), md, providers, airunwayv1alpha1.ServingModeAggregated); err != nil {
+		t.Fatal(err)
+	}
+	if md.ResolvedEngineType() != airunwayv1alpha1.EngineTypeVLLM {
+		t.Fatal("intent selected another provider's engine")
+	}
+	// Even a higher-priority compatible provider must not receive Dynamo intent.
+	providers[0] = providerWithEngineRule("kaito", airunwayv1alpha1.EngineTypeVLLM, 100)
+	if err := r.selectProvider(context.Background(), md, providers, md.ResolvedEngineType(), airunwayv1alpha1.ServingModeAggregated); err != nil {
+		t.Fatal(err)
+	}
+	if md.Status.Provider == nil || md.Status.Provider.Name != "dynamo" || md.Spec.Provider.Name != "" || md.Spec.Resources != nil {
+		t.Fatal("incorrect selection or mutated desired spec")
+	}
+	selected, _, err := r.runSelectionAlgorithm(md, providers[:1], md.ResolvedEngineType(), airunwayv1alpha1.ServingModeAggregated)
+	if err != nil || selected != "" {
+		t.Fatalf("intent fell back to incompatible provider: %q %v", selected, err)
 	}
 }

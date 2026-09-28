@@ -650,10 +650,12 @@ class KubernetesService {
   }
 
   /**
-   * Get the raw Custom Resource manifest for a deployment
-   * Returns the full CR object as stored in Kubernetes
+   * Get the raw Custom Resource manifest for a deployment.
+   * Strict reads propagate non-404 failures; default reads remain best-effort.
    */
-  async getDeploymentManifest(name: string, namespace: string, userToken?: string): Promise<Record<string, unknown> | null> {
+  async getDeploymentManifest(
+    name: string, namespace: string, userToken?: string, options: { strict?: boolean } = {},
+  ): Promise<Record<string, unknown> | null> {
     try {
       const api = this.getCustomObjectsApi(userToken);
       const response = await withRetry(
@@ -675,6 +677,7 @@ class KubernetesService {
         return null;
       }
       logger.error({ error, name, namespace }, 'Error getting deployment manifest');
+      if (options.strict) throw error;
       return null;
     }
   }

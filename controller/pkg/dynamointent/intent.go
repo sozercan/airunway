@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strings"
+	"unicode/utf16"
 
 	api "github.com/ai-runway/airunway/controller/api/v1alpha1"
 )
@@ -44,12 +46,23 @@ type SLA struct {
 }
 
 func overrides(md *api.ModelDeployment) (map[string]json.RawMessage, error) {
-	if md.Spec.Provider == nil || md.Spec.Provider.Name != "dynamo" || md.Spec.Provider.Overrides == nil {
+	if md.Spec.Provider == nil || md.Spec.Provider.Overrides == nil {
 		return nil, nil
 	}
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(md.Spec.Provider.Overrides.Raw, &m); err != nil {
+		if md.Spec.Provider.Name != "" && md.Spec.Provider.Name != "dynamo" {
+			return nil, nil // The selected provider owns validation of its overrides.
+		}
 		return nil, fmt.Errorf("invalid Dynamo overrides: %w", err)
+	}
+	if md.Spec.Provider.Name != "" && md.Spec.Provider.Name != "dynamo" {
+		var mode string
+		_ = json.Unmarshal(m["deploymentMode"], &mode)
+		if _, typed := m["intent"]; typed || mode == "intent" {
+			return nil, fmt.Errorf("Dynamo intent requires the dynamo provider, not %q", md.Spec.Provider.Name)
+		}
+		return nil, nil
 	}
 	return m, nil
 }
@@ -102,6 +115,9 @@ func Validate(md *api.ModelDeployment) error {
 	}
 	// Legacy intent also uses attempt tokens, even though Parse returns nil.
 	if Enabled(md) {
+		if md.Status.Provider != nil && md.Status.Provider.Name != "" && md.Status.Provider.Name != "dynamo" {
+			return fmt.Errorf("Dynamo intent cannot use the already-selected provider %q; delete and recreate the deployment to change providers", md.Status.Provider.Name)
+		}
 		if err := validateAttemptToken(md.Annotations[AttemptAnnotation]); err != nil {
 			return err
 		}
@@ -121,8 +137,16 @@ func Validate(md *api.ModelDeployment) error {
 	if spec.Hardware.NumGPUsPerNode != nil && (*spec.Hardware.NumGPUsPerNode < 1 || *spec.Hardware.NumGPUsPerNode > 64) {
 		return fmt.Errorf("intent.hardware.numGpusPerNode must be between 1 and 64")
 	}
-	if spec.Hardware.VRAMMB != nil && !positive(*spec.Hardware.VRAMMB) {
-		return fmt.Errorf("intent.hardware.vramMb must be positive")
+	// Match REST validation without rewriting accepted inputs or their hash.
+	sku := strings.TrimSpace(spec.Hardware.GPUSKU)
+	if spec.Hardware.GPUSKU != "" && sku == "" {
+		return fmt.Errorf("intent.hardware.gpuSku must not be blank")
+	}
+	if len(utf16.Encode([]rune(sku))) > 128 {
+		return fmt.Errorf("intent.hardware.gpuSku must be at most 128 characters")
+	}
+	if spec.Hardware.VRAMMB != nil && (!positive(*spec.Hardware.VRAMMB) || *spec.Hardware.VRAMMB > 10_000_000) {
+		return fmt.Errorf("intent.hardware.vramMb must be positive and at most 10000000")
 	}
 	if w := spec.Workload; w != nil {
 		if w.ISL != nil && *w.ISL <= 0 || w.OSL != nil && *w.OSL <= 0 {
@@ -131,8 +155,10 @@ func Validate(md *api.ModelDeployment) error {
 		if w.Concurrency != nil && w.RequestRate != nil {
 			return fmt.Errorf("specify requestRate or concurrency, not both")
 		}
-		if w.Concurrency != nil && !positive(*w.Concurrency) || w.RequestRate != nil && !positive(*w.RequestRate) {
-			return fmt.Errorf("intent workload traffic must be positive")
+		for _, value := range []*float64{w.Concurrency, w.RequestRate} {
+			if value != nil && (!positive(*value) || *value > 1_000_000) {
+				return fmt.Errorf("intent workload traffic must be positive and at most 1000000")
+			}
 		}
 	}
 	if s := spec.SLA; s != nil {
@@ -140,8 +166,8 @@ func Validate(md *api.ModelDeployment) error {
 			return fmt.Errorf("specify e2eLatency or ttft/itl, not both")
 		}
 		for _, v := range []*float64{s.TTFT, s.ITL, s.E2E} {
-			if v != nil && !positive(*v) {
-				return fmt.Errorf("intent latency targets must be positive")
+			if v != nil && (!positive(*v) || *v > 86_400_000) {
+				return fmt.Errorf("intent latency targets must be positive and at most 86400000")
 			}
 		}
 	}

@@ -219,6 +219,52 @@ describe('Dynamo intent contract', () => {
     expect(original.metadata.annotations).toEqual({ keep: 'me' });
   });
 
+  test('reconfigures auto-selected Dynamo intent without adding a spec provider name or losing overrides', () => {
+    const original = automaticDeployment();
+    delete original.spec.provider!.name;
+    original.status!.provider!.name = 'dynamo';
+    const intent = { ...defaultDynamoIntent(), overrides: nativeOverrides() };
+    original.spec.provider!.overrides!.intent = intent;
+    const before = structuredClone(original);
+
+    const retry = reconfigureDynamoDeployment(original, { resourceVersion: '42' }, 'retry-attempt');
+    expect(retry.spec).toEqual(original.spec);
+    expect(retry.status).toEqual(original.status);
+    expect(retry.spec.provider).not.toHaveProperty('name');
+    expect(retry.metadata.annotations).toEqual({ keep: 'me', [DYNAMO_ATTEMPT_ANNOTATION]: 'retry-attempt' });
+
+    const replacement = { ...intent, hardware: { totalGpus: 2 } };
+    const next = reconfigureDynamoDeployment(original, { resourceVersion: '42', intent: replacement }, 'new-attempt');
+    expect(next.spec.provider).toEqual({ overrides: { deploymentMode: 'intent', intent: replacement } });
+    expect(next.status).toEqual(original.status);
+    expect(original).toEqual(before);
+  });
+
+  test('an explicit provider takes precedence over the resolved status provider', () => {
+    for (const name of ['kaito', 'vllm']) {
+      const original = automaticDeployment();
+      original.spec.provider!.name = name;
+      original.status!.provider!.name = 'dynamo';
+      expect(() => reconfigureDynamoDeployment(original, { resourceVersion: '42' })).toThrow('Only automatic Dynamo');
+    }
+    const explicitDynamo = automaticDeployment();
+    explicitDynamo.status!.provider!.name = 'kaito';
+    expect(reconfigureDynamoDeployment(explicitDynamo, { resourceVersion: '42' }).spec).toEqual(explicitDynamo.spec);
+  });
+
+  test('requires resolved Dynamo and stored intent when the spec provider name is absent', () => {
+    for (const name of [undefined, 'kaito']) {
+      const original = automaticDeployment();
+      delete original.spec.provider!.name;
+      original.status!.provider!.name = name;
+      expect(() => reconfigureDynamoDeployment(original, { resourceVersion: '42' })).toThrow('Only automatic Dynamo');
+    }
+    const noIntent = automaticDeployment();
+    delete noIntent.spec.provider;
+    noIntent.status!.provider!.name = 'dynamo';
+    expect(() => reconfigureDynamoDeployment(noIntent, { resourceVersion: '42' })).toThrow('Only automatic Dynamo');
+  });
+
   test('retry preserves inputs and creates a unique attempt', () => {
     const current = automaticDeployment();
     const a = reconfigureDynamoDeployment(current, { resourceVersion: '42' });

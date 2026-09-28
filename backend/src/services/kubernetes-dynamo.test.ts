@@ -47,6 +47,42 @@ describe('Dynamo serving identity', () => {
     expect(reads).toBe(1);
   });
 
+  test.each([401, 403, 503])('strict manifest reads propagate generated-client %s failures while best-effort reads stay nullable', async status => {
+    const old = service.customObjectsApi;
+    restores.push(() => { service.customObjectsApi = old; });
+    const error = new ApiException(status, 'Unknown API Status Code!', JSON.stringify({ code: status, message: 'Read failed' }), {});
+    service.customObjectsApi = { getNamespacedCustomObject: async () => { throw error; } };
+    await expect(kubernetesService.getDeploymentManifest('auto', 'models', undefined, { strict: true })).rejects.toBe(error);
+    expect(await kubernetesService.getDeploymentManifest('auto', 'models')).toBeNull();
+  });
+
+  test('strict manifest reads return null only for NotFound and propagate unknown failures', async () => {
+    const old = service.customObjectsApi;
+    restores.push(() => { service.customObjectsApi = old; });
+    service.customObjectsApi = { getNamespacedCustomObject: async () => {
+      throw new ApiException(404, 'Unknown API Status Code!', JSON.stringify({ code: 404, reason: 'NotFound' }), {});
+    } };
+    expect(await kubernetesService.getDeploymentManifest('missing', 'models', undefined, { strict: true })).toBeNull();
+    const error = new Error('Unexpected read failure');
+    service.customObjectsApi = { getNamespacedCustomObject: async () => { throw error; } };
+    await expect(kubernetesService.getDeploymentManifest('auto', 'models', undefined, { strict: true })).rejects.toBe(error);
+    expect(await kubernetesService.getDeploymentManifest('auto', 'models')).toBeNull();
+  });
+
+  test('strict manifest reads retain transient-read retries and return the original manifest', async () => {
+    const old = service.customObjectsApi;
+    restores.push(() => { service.customObjectsApi = old; });
+    let reads = 0;
+    const manifest = { metadata: { name: 'auto', namespace: 'models', resourceVersion: '42' } };
+    service.customObjectsApi = { getNamespacedCustomObject: async args => {
+      expect(args).toEqual({ group: 'airunway.ai', version: 'v1alpha1', namespace: 'models', plural: 'modeldeployments', name: 'auto' });
+      if (++reads === 1) throw { statusCode: 503, message: 'Temporarily unavailable' };
+      return manifest;
+    } };
+    expect(await kubernetesService.getDeploymentManifest('auto', 'models', undefined, { strict: true })).toBe(manifest);
+    expect(reads).toBe(2);
+  });
+
   test('sends a single resourceVersion-guarded replacement, not a create or unguarded patch', async () => {
     const old = service.customObjectsApi;
     restores.push(() => { service.customObjectsApi = old; });
