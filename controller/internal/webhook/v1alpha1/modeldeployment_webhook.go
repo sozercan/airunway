@@ -1181,11 +1181,38 @@ func validateIntentDGDResourceList(resources map[string]any, fldPath *field.Path
 			allErrs = append(allErrs, validateResourceQuantity(valueString, MaxCPU, valuePath)...)
 		case resourceName == "memory":
 			allErrs = append(allErrs, validateResourceQuantity(valueString, MaxMemory, valuePath)...)
-		case resourceName == "gpu" || strings.HasSuffix(resourceName, "/gpu"):
-			allErrs = append(allErrs, validateResourceQuantity(valueString, fmt.Sprint(MaxGPUCount), valuePath)...)
+		case isIntentDGDGPUResource(resourceName):
+			allErrs = append(allErrs, validateIntentDGDGPUQuantity(valueString, valuePath)...)
+		case resourceName == "custom":
+			// Alpha ResourceList stores native extended resources under custom.
+			if custom, ok := value.(map[string]any); ok {
+				allErrs = append(allErrs, validateIntentDGDResourceList(custom, valuePath)...)
+			}
 		}
 	}
 	return allErrs
+}
+
+// GPU partitions and shared devices are still integer-count accelerators. Match
+// the supported vendor forms without imposing GPU policy on other resources.
+func isIntentDGDGPUResource(name string) bool {
+	return name == "gpu" || strings.HasSuffix(name, "/gpu") ||
+		name == "nvidia.com/gpu.shared" || strings.HasPrefix(name, "nvidia.com/mig-") ||
+		name == "gpu.intel.com/i915" || name == "gpu.intel.com/xe"
+}
+
+func validateIntentDGDGPUQuantity(value string, fldPath *field.Path) field.ErrorList {
+	quantity, err := resource.ParseQuantity(value)
+	if err != nil {
+		return field.ErrorList{field.Invalid(fldPath, value, "invalid resource quantity")}
+	}
+	if quantity.Cmp(*resource.NewQuantity(MaxGPUCount, resource.DecimalSI)) > 0 {
+		return field.ErrorList{field.Invalid(fldPath, value, fmt.Sprintf("exceeds maximum allowed (%d)", MaxGPUCount))}
+	}
+	if quantity.Sign() < 0 || quantity.Cmp(*resource.NewQuantity(quantity.Value(), resource.DecimalSI)) != 0 {
+		return field.ErrorList{field.Invalid(fldPath, value, "must be a nonnegative integer GPU count")}
+	}
+	return nil
 }
 
 // checkForbiddenOverrideKeys recursively walks an unmarshalled JSON object and

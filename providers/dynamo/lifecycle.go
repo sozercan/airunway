@@ -11,6 +11,7 @@ import (
 
 	api "github.com/ai-runway/airunway/controller/api/v1alpha1"
 	"github.com/ai-runway/airunway/controller/pkg/dynamointent"
+	batchv1 "k8s.io/api/batch/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -181,22 +182,17 @@ func (r *DynamoProviderReconciler) reconcileIntent(ctx context.Context, desired 
 				legacyUnscopedHash = acceptedHash == oldHash
 			}
 		}
+		// Hashes describe accepted parent inputs, not proof of current child state.
+		have, _, _ := unstructured.NestedMap(existing.Object, "spec")
+		want, _, _ := unstructured.NestedMap(desired.Object, "spec")
+		drifted, err := requestSpecDiffers(have, want)
+		if err != nil {
+			return err
+		}
 		if acceptedHash == "" || legacyUnscopedHash {
-			// Compare supplied fields only; retain upstream-discovered defaults.
-			// Normalize JSON number representations without losing integer precision.
-			have, _, _ := unstructured.NestedMap(existing.Object, "spec")
-			want, _, _ := unstructured.NestedMap(desired.Object, "spec")
-			raw, err := json.Marshal([]any{have, want})
-			if err != nil {
-				return err
-			}
-			decoder := json.NewDecoder(bytes.NewReader(raw))
-			decoder.UseNumber()
-			var normalized []map[string]any
-			if err := decoder.Decode(&normalized); err != nil {
-				return err
-			}
-			changed = selectedOverrideValuesDiffer(normalized[0], normalized[1], normalized[1])
+			changed = drifted
+		} else {
+			changed = changed || drifted
 		}
 		if changed && (phase == "Profiling" || phase == "Ready" || phase == "Deploying" || phase == "Deployed") {
 			p.RequestRef = resourceReference(existing)
@@ -211,7 +207,18 @@ func (r *DynamoProviderReconciler) reconcileIntent(ctx context.Context, desired 
 		annotations[dynamointent.AttemptAnnotation] = attempt
 		next.SetAnnotations(annotations)
 		if changed {
-			next.Object["spec"] = desired.Object["spec"]
+			if acceptedHash == hash {
+				// Correct child drift without discarding operator-discovered inputs.
+				corrected := deepMerge(have, want)
+				if overrides, supplied := want["overrides"]; supplied {
+					corrected["overrides"] = overrides
+				} else {
+					delete(corrected, "overrides")
+				}
+				next.Object["spec"] = corrected
+			} else {
+				next.Object["spec"] = desired.Object["spec"]
+			}
 		}
 		// Optimistic metadata patch preserves operator defaults and concurrent status.
 		if !reflect.DeepEqual(existing.Object, next.Object) {
@@ -247,6 +254,74 @@ func (r *DynamoProviderReconciler) reconcileIntent(ctx context.Context, desired 
 	p.RequestRef = resourceReference(desired)
 	p.Intent = &api.ProviderIntentStatus{Phase: "Pending", InputHash: hash, Attempt: attempt}
 	return nil
+}
+
+// Compare the declared request inputs, retaining upstream-derived fields such
+// as discovered hardware. An opaque DGD override and override membership are
+// owned by Runway; native JobSpec additions/defaults remain upstream-owned.
+func requestSpecDiffers(have, want map[string]any) (bool, error) {
+	raw, err := json.Marshal([]any{have, want})
+	if err != nil {
+		return false, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var specs []map[string]any
+	if err := decoder.Decode(&specs); err != nil {
+		return false, err
+	}
+	for _, spec := range specs {
+		for key, value := range spec {
+			if value == nil {
+				delete(spec, key)
+			}
+		}
+		if overrides, ok := spec["overrides"].(map[string]any); ok {
+			for key, value := range overrides {
+				if value == nil {
+					delete(overrides, key)
+				}
+			}
+			if job, present := overrides["profilingJob"]; present {
+				encoded, err := json.Marshal(job)
+				if err != nil {
+					return false, err
+				}
+				dec := json.NewDecoder(bytes.NewReader(encoded))
+				dec.DisallowUnknownFields()
+				var typed batchv1.JobSpec
+				// Normalize known native omitempty fields without discarding future
+				// fields unknown to this client's Kubernetes version.
+				if dec.Decode(&typed) == nil {
+					encoded, err = json.Marshal(typed)
+					if err != nil {
+						return false, err
+					}
+					dec = json.NewDecoder(bytes.NewReader(encoded))
+					dec.UseNumber()
+					var normalized map[string]any
+					if err := dec.Decode(&normalized); err != nil {
+						return false, err
+					}
+					overrides["profilingJob"] = normalized
+				}
+			}
+		}
+	}
+	if selectedOverrideValuesDiffer(specs[0], specs[1], specs[1]) {
+		return true, nil
+	}
+	actual, _ := specs[0]["overrides"].(map[string]any)
+	desired, _ := specs[1]["overrides"].(map[string]any)
+	for key := range actual {
+		if _, present := desired[key]; !present {
+			return true, nil
+		}
+	}
+	if dgd, present := desired["dgd"]; present && !reflect.DeepEqual(actual["dgd"], dgd) {
+		return true, nil
+	}
+	return false, nil
 }
 
 // Releases 1.1.1 and 1.5 bind by name and namespace. Newer releases may also

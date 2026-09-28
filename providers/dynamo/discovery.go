@@ -96,13 +96,6 @@ func (r *DynamoProviderReconciler) renderResources(ctx context.Context, md *api.
 			return nil, err
 		}
 		if request != nil {
-			hash, err := dynamointent.Fingerprint(md)
-			if err != nil {
-				return nil, err
-			}
-			if request.GetAnnotations()[dynamointent.HashAnnotation] == hash && request.GetAnnotations()[dynamointent.AttemptAnnotation] == md.Annotations[dynamointent.AttemptAnnotation] {
-				return []*unstructured.Unstructured{request.DeepCopy()}, nil
-			}
 			// Legacy requests inherit the operator's image rather than setting one.
 			// Comparing/updating their common DGDR fields needs no runtime guess.
 			if typed, err := dynamointent.Parse(md); err != nil {
@@ -110,8 +103,10 @@ func (r *DynamoProviderReconciler) renderResources(ctx context.Context, md *api.
 			} else if typed == nil {
 				return r.Transformer.Transform(ctx, md)
 			}
-			image, _, _ := unstructured.NestedString(request.Object, "spec", "image")
-			runtimeVersion = semanticImageTag(image)
+			if request.GetAnnotations()[dynamointent.AttemptAnnotation] == md.Annotations[dynamointent.AttemptAnnotation] {
+				image, _, _ := unstructured.NestedString(request.Object, "spec", "image")
+				runtimeVersion = semanticImageTag(image)
+			} // A new attempt uses the installed operator, not the previous attempt's image.
 		}
 	}
 	var existing *unstructured.Unstructured

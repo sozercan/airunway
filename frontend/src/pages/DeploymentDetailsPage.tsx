@@ -124,7 +124,7 @@ export function DeploymentDetailsPage() {
         }
       })()
     : undefined
-  const showChatPanel = deployment.phase === 'Running' && !!deployment.frontendService
+  const showChatPanel = deployment.phase === 'Running' && (!!deployment.frontendService || hasGateway)
 
   return (
     <div className="space-y-6 max-w-4xl mx-auto animate-slide-up">

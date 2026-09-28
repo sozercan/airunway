@@ -115,6 +115,9 @@ func Validate(md *api.ModelDeployment) error {
 	}
 	// Legacy intent also uses attempt tokens, even though Parse returns nil.
 	if Enabled(md) {
+		if strings.TrimSpace(md.Spec.Model.ID) == "" {
+			return fmt.Errorf("automatic Dynamo configuration requires a non-empty model ID")
+		}
 		if md.Status.Provider != nil && md.Status.Provider.Name != "" && md.Status.Provider.Name != "dynamo" {
 			return fmt.Errorf("Dynamo intent cannot use the already-selected provider %q; delete and recreate the deployment to change providers", md.Status.Provider.Name)
 		}
@@ -124,6 +127,9 @@ func Validate(md *api.ModelDeployment) error {
 	}
 	if spec == nil {
 		return nil
+	}
+	if md.Spec.Model.Source != "" && md.Spec.Model.Source != api.ModelSourceHuggingFace {
+		return fmt.Errorf("typed automatic configuration requires a huggingface model source; use manual configuration for custom models")
 	}
 	if err := validateOverrides(spec.Overrides); err != nil {
 		return err

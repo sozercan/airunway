@@ -104,3 +104,34 @@ func TestUnnamedIntentFingerprintTracksOverrides(t *testing.T) {
 		t.Fatalf("unnamed intent override absent from fingerprint: %v", err)
 	}
 }
+
+func TestTypedIntentRequiresHuggingFaceModel(t *testing.T) {
+	for _, tc := range []struct {
+		source api.ModelSource
+		id     string
+		valid  bool
+	}{
+		{"", "Qwen/Qwen3-0.6B", true},
+		{api.ModelSourceHuggingFace, "Qwen/Qwen3-0.6B", true},
+		{api.ModelSourceCustom, "Qwen/Qwen3-0.6B", false},
+		{api.ModelSourceCustom, "", false},
+		{api.ModelSourceHuggingFace, "", false},
+		{api.ModelSourceHuggingFace, "   ", false},
+	} {
+		md := fixture(valid)
+		md.Spec.Model.Source = tc.source
+		md.Spec.Model.ID = tc.id
+		if err := Validate(md); (err == nil) != tc.valid {
+			t.Fatalf("source=%q id=%q valid=%v error=%v", tc.source, tc.id, tc.valid, err)
+		}
+	}
+	legacy := fixture(`{"deploymentMode":"intent","spec":{"searchStrategy":"rapid"}}`)
+	legacy.Spec.Model.Source = api.ModelSourceCustom
+	if err := Validate(legacy); err != nil {
+		t.Fatalf("legacy custom model path rejected: %v", err)
+	}
+	legacy.Spec.Model.ID = ""
+	if err := Validate(legacy); err == nil {
+		t.Fatal("DGDR with empty model ID accepted")
+	}
+}

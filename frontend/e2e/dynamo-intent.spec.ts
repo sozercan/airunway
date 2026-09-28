@@ -146,3 +146,23 @@ test('failed automatic deployment confirms retry and validates advanced reconfig
   expect(writes[1]).toMatchObject({ resourceVersion: '42', modelId: 'Qwen/Qwen3-8B', intent: { hardware: { totalGpus: 4 }, overrides: correctedOverrides } })
   if (proofDir) await writeFile(`${proofDir}/reconfigure-requests.json`, JSON.stringify(writes, null, 2))
 })
+
+test('gateway-only Dynamo deployment exposes working chat without a frontend service', async ({ mockedPage: page }) => {
+  const deployment = { name: 'qwen-epp', namespace: 'models', resourceVersion: '7', modelId: 'Qwen/Qwen3-0.6B',
+    engine: 'vllm', mode: 'aggregated', phase: 'Running', provider: 'dynamo', configurationMode: 'manual',
+    replicas: { desired: 1, ready: 1, available: 1 }, pods: [], createdAt: '2026-09-25T10:00:00Z',
+    gateway: { endpoint: 'http://gateway.invalid', modelName: 'Qwen/Qwen3-0.6B' } }
+  let submitted: unknown
+  await page.route(/\/api\/deployments\/qwen-epp(?:\?.*)?$/, route => route.fulfill({ json: deployment }))
+  await page.route(/\/api\/deployments\/models\/qwen-epp\/chat$/, route => {
+    submitted = route.request().postDataJSON()
+    return route.fulfill({ contentType: 'text/event-stream', body: 'data: {"choices":[{"index":0,"delta":{"content":"Gateway-only reply"},"finish_reason":null}]}\n\ndata: [DONE]\n\n' })
+  })
+  await page.goto('/deployments/qwen-epp?namespace=models')
+  await expect(page.getByRole('heading', { name: 'Chat with model' })).toBeVisible()
+  await page.getByLabel('Message').fill('Hello through the gateway')
+  await page.getByRole('button', { name: /send/i }).click()
+  await expect(page.getByTestId('chat-transcript')).toContainText('Gateway-only reply')
+  expect(submitted).toMatchObject({ messages: [{ role: 'user', content: 'Hello through the gateway' }] })
+  if (proofDir) await page.screenshot({ path: `${proofDir}/gateway-only-chat.png`, fullPage: true })
+})

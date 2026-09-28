@@ -835,7 +835,7 @@ async function resolveDirectChatModel(
 
 async function resolveGatewayChatModel(
   deployment: DeploymentStatus,
-  serviceName: string,
+  serviceName: string | undefined,
   namespace: string,
   servicePort: number,
   requestSignal: AbortSignal,
@@ -844,6 +844,10 @@ async function resolveGatewayChatModel(
   // Gateway path: the HTTPRoute alias is exactly what the gateway routes by.
   if (deployment.gateway?.modelName) {
     return deployment.gateway.modelName;
+  }
+
+  if (!serviceName) {
+    return getServedChatModelName(deployment) || deployment.modelId;
   }
 
   return resolveServedChatModel(
@@ -878,14 +882,70 @@ async function handleDeploymentChat(
   }
 
   const frontendService = parseFrontendService(deployment.frontendService);
+  const frontendServicePort = frontendService?.servicePort || DEFAULT_FRONTEND_SERVICE_PORT;
+  const frontendNamespace = deployment.frontendNamespace || resolvedNamespace;
+  const gatewayEndpoint = deployment.gateway?.endpoint;
+  const proxyGateway = async (endpoint: string) => {
+    const gatewayModel = await resolveGatewayChatModel(
+      deployment,
+      frontendService?.serviceName,
+      frontendNamespace,
+      frontendServicePort,
+      signal,
+      userToken
+    );
+    const gatewayResponse = await proxyGatewayChatPostStream(
+      endpoint,
+      {
+        ...body,
+        model: gatewayModel,
+        stream: true,
+      },
+      gatewayModel,
+      signal
+    );
+
+    if (gatewayResponse.ok) {
+      if (!gatewayResponse.body) {
+        return c.json(
+          {
+            error: {
+              message: 'Gateway chat response did not include a stream body',
+              statusCode: 502,
+            },
+          },
+          502
+        );
+      }
+
+      return new Response(gatewayResponse.body, {
+        status: 200,
+        headers: CHAT_STREAM_HEADERS,
+      });
+    }
+
+    const gatewayDetails = await readUpstreamErrorDetails(gatewayResponse);
+    const statusCode = toUpstreamChatErrorStatusCode(gatewayResponse.status);
+    const sanitizedDetails = sanitizeUpstreamErrorDetails(gatewayDetails);
+
+    return c.json(
+      {
+        error: {
+          message: getUpstreamChatErrorMessage(gatewayResponse.status, gatewayDetails, name),
+          statusCode,
+          ...(sanitizedDetails ? { details: sanitizedDetails } : {}),
+        },
+      },
+      statusCode
+    );
+  };
+
   if (!frontendService?.serviceName) {
+    if (gatewayEndpoint) return proxyGateway(gatewayEndpoint);
     throw new HTTPException(409, {
-      message: `Deployment '${name}' does not expose a frontend service for chat`,
+      message: `Deployment '${name}' does not expose a frontend service or gateway endpoint for chat`,
     });
   }
-
-  const frontendServicePort = frontendService.servicePort || DEFAULT_FRONTEND_SERVICE_PORT;
-  const frontendNamespace = deployment.frontendNamespace || resolvedNamespace;
 
   const directModel = await resolveDirectChatModel(
     deployment,
@@ -914,59 +974,8 @@ async function handleDeploymentChat(
   if (!upstreamResponse.ok) {
     const details = await readUpstreamErrorDetails(upstreamResponse);
 
-    if (deployment.gateway?.endpoint && isMissingServiceProxyResponse(upstreamResponse.status, details)) {
-      const gatewayModel = await resolveGatewayChatModel(
-        deployment,
-        frontendService.serviceName,
-        frontendNamespace,
-        frontendServicePort,
-        signal,
-        userToken
-      );
-      const gatewayResponse = await proxyGatewayChatPostStream(
-        deployment.gateway.endpoint,
-        {
-          ...body,
-          model: gatewayModel,
-          stream: true,
-        },
-        gatewayModel,
-        signal
-      );
-
-      if (gatewayResponse.ok) {
-        if (!gatewayResponse.body) {
-          return c.json(
-            {
-              error: {
-                message: 'Gateway chat response did not include a stream body',
-                statusCode: 502,
-              },
-            },
-            502
-          );
-        }
-
-        return new Response(gatewayResponse.body, {
-          status: 200,
-          headers: CHAT_STREAM_HEADERS,
-        });
-      }
-
-      const gatewayDetails = await readUpstreamErrorDetails(gatewayResponse);
-      const statusCode = toUpstreamChatErrorStatusCode(gatewayResponse.status);
-      const sanitizedDetails = sanitizeUpstreamErrorDetails(gatewayDetails);
-
-      return c.json(
-        {
-          error: {
-            message: getUpstreamChatErrorMessage(gatewayResponse.status, gatewayDetails, name),
-            statusCode,
-            ...(sanitizedDetails ? { details: sanitizedDetails } : {}),
-          },
-        },
-        statusCode
-      );
+    if (gatewayEndpoint && isMissingServiceProxyResponse(upstreamResponse.status, details)) {
+      return proxyGateway(gatewayEndpoint);
     }
 
     const statusCode = toUpstreamChatErrorStatusCode(upstreamResponse.status);

@@ -145,3 +145,12 @@ func TestUnnamedDynamoIntentAvoidsManualDefaults(t *testing.T) {
 		t.Fatal("wrong explicit provider accepted")
 	}
 }
+
+func TestCustomModelSourceCannotEnterTypedIntent(t *testing.T) {
+	for _, id := range []string{"", "custom/model"} {
+		md := &api.ModelDeployment{Spec: api.ModelDeploymentSpec{Model: api.ModelSpec{ID: id, Source: api.ModelSourceCustom}, Engine: api.EngineSpec{Type: api.EngineTypeVLLM}, Provider: &api.ProviderSpec{Name: "dynamo", Overrides: &runtime.RawExtension{Raw: []byte(`{"deploymentMode":"intent","intent":{"hardware":{"totalGpus":1}}}`)}}}}
+		if _, err := (&ModelDeploymentCustomValidator{}).ValidateCreate(context.Background(), md); err == nil {
+			t.Fatal("custom model admitted into typed intent")
+		}
+	}
+}
