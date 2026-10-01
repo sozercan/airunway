@@ -521,7 +521,7 @@ func managementApply(words []string, ctx *CommandContext) error {
 	results := []Object{}
 	partial := func(err error) error {
 		if len(results) > 0 {
-			if outputErr := writeOutput(ctx.IO, ctx.Flags, results); outputErr != nil {
+			if outputErr := writeApplyOutput(ctx.IO, ctx.Flags, results); outputErr != nil {
 				return outputErr
 			}
 			if dry == "server" {
@@ -557,5 +557,5 @@ func managementApply(words []string, ctx *CommandContext) error {
 		receipt["metadata"] = managementPick(result["metadata"], "name", "namespace")
 		results = append(results, receipt)
 	}
-	return writeOutput(ctx.IO, ctx.Flags, results)
+	return writeApplyOutput(ctx.IO, ctx.Flags, results)
 }

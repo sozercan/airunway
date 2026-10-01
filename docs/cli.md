@@ -78,6 +78,32 @@ airunway config unset agent.model-ref
 An explicitly selected model binding replaces the entire saved binding. Defaults
 are for new requests, never for rewriting existing deployments.
 
+## Output
+
+Text is the default. Lists show headers and resource-specific columns. `get`
+shows a compact summary, while create, update, delete, and wait commands print
+short receipts. Ready counts describe reported replicas, not measured pod or GPU
+counts. Summaries mark a status as updating when it predates the current request.
+
+Use `-o json` or `-o yaml` for structured details. Model and agent reads retain
+full resource objects in these formats; credential commands remain metadata-only.
+Dry-run previews retain their manifest output. Progress stays on stderr.
+
+```bash
+airunway model get demo
+airunway model get demo -o yaml
+airunway agent list
+airunway doctor
+airunway doctor -o json
+```
+
+`doctor` prints an access-check count with the selected context and namespace.
+Failures include readable details and a nonzero exit code. These checks verify
+API access and creation permissions, not model readiness or successful inference.
+`apply` prints an `applied` receipt for each accepted resource, or `validated
+(dry run)` for server-side validation. It does not claim to detect unchanged
+resources.
+
 ## Models
 
 ```bash
@@ -278,17 +304,37 @@ framework configuration; it cannot silently create a model or install a provider
 `--config-file` contains framework-specific JSON, not a whole deployment. Conflicts
 between explicit flags and file configuration are rejected.
 
+For container frameworks, omitting `--image` leaves image selection to the
+controller, which uses the framework's unambiguous registered catalog image.
+This keeps the catalog as the source of truth and does not require extra catalog
+read permissions for ordinary creation. If no usable default exists, configure
+the catalog or supply `--image`; use `--preset` when choosing a specific recipe.
+The CLI does not install a framework automatically.
+
 ### One-shot tasks
 
 ```bash
-airunway agent create report --framework crewai --model-ref demo --mode once \
+airunway agent run report --framework crewai --model-ref demo \
   --prompt "Summarize the supplied information accurately." \
-  --task-file ./report-task.txt --wait=false
+  --task-file ./report-task.txt --timeout 10m
 
-airunway agent wait report --for completed --timeout 10m
-airunway agent logs report
-airunway agent delete report
+# Or submit without waiting, then inspect it separately:
+airunway agent create background-report --framework crewai --model-ref demo \
+  --mode once --task-file ./report-task.txt --wait=false
+airunway agent wait background-report --for completed --timeout 10m
+airunway agent logs background-report
+airunway agent delete background-report
 ```
+
+`agent run` implies one-shot mode, waits for completion, and prints the task
+result rather than the resource object or runtime diagnostics. It retains the
+agent and workload for inspection. Use a new name for each invocation.
+This command requires a runtime image supporting the
+[versioned task-result record](agent-container-runtime.md#machine-readable-task-results).
+It requests that format through the existing opaque runtime configuration.
+Older images may complete the task without emitting this record; the CLI reports
+that the result is unavailable and does not resubmit. JSON/YAML output represents
+the answer string, not an AgentDeployment.
 
 One-shot mode requires a compatible container framework. It has no endpoint or
 interactive chat. Creation submits work. Jobs may retry, so execution is not
@@ -303,6 +349,8 @@ airunway model endpoint demo
 airunway model endpoint demo --check --output json
 airunway model connect demo --port 8000
 airunway model chat demo --message "Reply with OK."
+airunway model chat demo --system-file ./instructions.txt \
+  --message-file ./question.txt --temperature 0.2 --max-tokens 256
 
 airunway agent wait assistant --for ready
 airunway agent endpoint assistant
@@ -310,6 +358,15 @@ airunway agent connect assistant --port 8080
 airunway agent chat assistant
 airunway agent chat assistant --message-file ./question.txt
 ```
+
+`model chat` accepts `--system TEXT` or `--system-file FILE|-`, but not both.
+The system instruction remains first in interactive conversation history.
+System prompt files use the same 4 MiB input limit as message files. Only one
+input can consume stdin; use a regular system-prompt file for interactive chat.
+Agent instructions remain part of their deployment configuration, set with
+`--prompt` or `--prompt-file`, rather than a per-chat system override.
+`--temperature` accepts values from 0 to 2, and `--max-tokens` accepts positive
+integers. Both are forwarded to the chat endpoint.
 
 Deployment readiness, endpoint reachability, and successful inference are separate
 claims. Endpoint checks do not submit chat requests or execute agent tools.

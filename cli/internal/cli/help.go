@@ -17,6 +17,7 @@ Models:
   model endpoint NAME [--check [--credential NAME]]
   model connect NAME [--port 8000]
   model chat NAME [--message TEXT | --message-file FILE|-]
+                  [--system TEXT | --system-file FILE|-] [--temperature N] [--max-tokens N]
   model logs NAME [--follow] [--tail N] [--pod NAME] [--container NAME]
   model events NAME
 
@@ -26,6 +27,7 @@ Agents:
   agent create NAME --framework FRAMEWORK --model-gateway NAME --model-id ID
   agent create NAME --preset FRAMEWORK/PRESET --model-ref MODEL
   agent create NAME --framework FRAMEWORK --model-ref MODEL --mode once --task-file FILE
+  agent run NAME --framework FRAMEWORK --model-ref MODEL --task-file FILE
   agent list | get NAME | delete NAME | events NAME
   agent update NAME [--prompt-file FILE|-] [--model-ref MODEL]
   agent wait NAME --for ready|completed [--timeout 10m]
@@ -63,8 +65,13 @@ Agent creation options:
   --model-credential NAME/KEY            External API credential reference
   --model-api openai|anthropic|azure-openai|custom
   --gateway-listener NAME               Select an existing gateway listener
-  --image IMAGE           Container-backed agent runtime image
+  --image IMAGE           Override the framework catalog runtime image
   --cpu QUANTITY --memory SIZE           Container-backed agent resource requests
+
+Chat options:
+  --system TEXT | --system-file FILE|-   Model chat system instructions
+  --temperature N          Sampling temperature, between 0 and 2
+  --max-tokens N           Positive maximum completion token count
 
 Environment and discovery:
   context list | current | use NAME
@@ -87,11 +94,17 @@ Declarative files:
 Global options:
   --kubeconfig FILE --context NAME --namespace NAME, -n NAME
   --output text|json|yaml, -o FORMAT
+                          Text summaries by default; JSON/YAML for structured details
   --timeout DURATION      Waits and finite access default to 10m (maximum 24h)
                           Foreground sessions have no default timeout; supports ms, s, m, h
   --wait=false            Return after submission; timeouts do not delete resources
   --dry-run client|server Preview create/apply without persisting anything
   --help, -h              Show help without connecting to a cluster
+
+agent run executes once, waits for completion, and prints the task result.
+It retains the agent for inspection; timeout does not cancel or resubmit work.
+Without --image, container frameworks use their unambiguous registered catalog
+image. Use an explicit --image or --preset if the catalog has multiple images.
 
 Settings: namespace, agent.framework, agent.model-ref. Agent defaults are per
 context and namespace. Explicit model bindings replace the entire saved binding.

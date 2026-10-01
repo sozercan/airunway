@@ -75,6 +75,29 @@ func accessNamespace(resource Object, fallback string) string {
 	return "default"
 }
 
+const (
+	conditionFalse  = "False"
+	conditionTrue   = "True"
+	conditionFailed = "Failed"
+)
+
+func waitFailure(resource Object) error {
+	message := "The resource failed."
+	generation := intAt(resource, "metadata", "generation")
+	for _, condition := range objects(get(resource, "status", "conditions")) {
+		if intAt(condition, "observedGeneration") < generation {
+			continue
+		}
+		failed := stringAt(condition, "status") == conditionFalse ||
+			(stringAt(condition, "type") == conditionFailed && stringAt(condition, "status") == conditionTrue)
+		if reason := stringAt(condition, "reason"); failed && reason != "" {
+			message = "The resource failed: " + textCell(reason) + "."
+			break
+		}
+	}
+	return cliError(1, "FAILED", message+" Inspect its logs and events for details.")
+}
+
 func waitForResource(parent context.Context, client ClusterClient, noun string, resource Object, flags Flags, _ *IO) (Object, error) {
 	target := strings.ToLower(flags.Text("for"))
 	if target == "" {
@@ -101,7 +124,7 @@ func waitForResource(parent context.Context, client ClusterClient, noun string, 
 		fresh := generation > 0 && intAt(current, "status", "observedGeneration") >= generation
 		phase := stringAt(current, "status", "phase")
 		if fresh && (phase == "Failed" || phase == "Error") {
-			return nil, cliError(1, "FAILED", "The resource failed. Inspect its logs and events for details.")
+			return nil, waitFailure(current)
 		}
 		ready, completed := false, false
 		for _, condition := range objects(get(current, "status", "conditions")) {
@@ -114,7 +137,7 @@ func waitForResource(parent context.Context, client ClusterClient, noun string, 
 				phaseOwner = slices.Contains([]string{"Ready", "Validated", "ProviderCompatible", "ResourceCreated"}, kind)
 			}
 			if (kind == "Failed" && status == "True") || (status == "False" && (reason == "JobFailed" || ((phase == "Failed" || phase == "Error") && phaseOwner))) {
-				return nil, cliError(1, "FAILED", "The resource failed. Inspect its logs and events for details.")
+				return nil, waitFailure(current)
 			}
 			ready = ready || (kind == "Ready" && status == "True")
 			completed = completed || (noun == "agent" && phase == "Completed" && status == "True" && (kind == "Ready" || kind == "Completed" || (kind == "ProviderReady" && reason == "JobCompleted")))
@@ -631,6 +654,9 @@ func runAccess(noun, action, name string, c *CommandContext) error {
 	options, ok := allowed[action]
 	if !ok {
 		return usage("Unknown access action.")
+	}
+	if noun == "model" && action == actionChat {
+		options = append(options, "system", "system-file")
 	}
 	if err := assertFlags(c.Flags, options); err != nil {
 		return err

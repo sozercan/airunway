@@ -469,6 +469,10 @@ func accessChat(client ClusterClient, noun string, resource Object, e *accessEnd
 			return accessUnsupported("This model provider does not advertise the OpenAI chat API. Use a provider with openai-chat support.")
 		}
 	}
+	messages, err := accessCall(ctx, func() ([]any, error) { return accessSystemMessages(noun, c) })
+	if err != nil {
+		return err
+	}
 	type messageInput struct {
 		text    string
 		present bool
@@ -542,7 +546,6 @@ func accessChat(client ClusterClient, noun string, resource Object, e *accessEnd
 			return accessUnsupported("The endpoint did not identify a unique served model. Publish a resolved model name or configure a single served ID.")
 		}
 	}
-	messages := []any{}
 	turn := func(content string) error {
 		messages = append(messages, Object{"role": "user", "content": content})
 		body := cloneObject(options)

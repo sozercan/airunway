@@ -127,13 +127,13 @@ func managementDiscovery(words []string, ctx *CommandContext) error {
 		for _, item := range items {
 			result = append(result, managementDiscoveryMetadata(item))
 		}
-		return writeOutput(ctx.IO, ctx.Flags, result)
+		return writeResourceOutput(ctx.IO, ctx.Flags, words[0], "list", result)
 	}
 	item, err := client.Get(ctx.Context, t, "", name)
 	if err != nil {
 		return err
 	}
-	return writeOutput(ctx.IO, ctx.Flags, managementDiscoveryMetadata(item))
+	return writeResourceOutput(ctx.IO, ctx.Flags, words[0], "get", managementDiscoveryMetadata(item))
 }
 
 func runManagement(words []string, ctx *CommandContext) (bool, error) {

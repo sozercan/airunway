@@ -567,11 +567,18 @@ def main() -> None:
     )
 
     if os.environ.get("AIRUNWAY_AGENT_MODE", "server") == "job":
+        structured = "resultFormat" in config
+        if structured and config["resultFormat"] != "airunway-json-v1":
+            raise ValueError("spec.config.resultFormat must be airunway-json-v1 when set")
         task = config.get("task") or config.get("prompt")
         if not isinstance(task, str) or not task.strip():
             raise ValueError("job lifecycle requires spec.config.task or spec.config.prompt")
         try:
             answer = run_one_shot(task)
+            if structured:
+                if not isinstance(answer, str) or not answer.strip():
+                    raise ValueError("Hermes returned no text answer.")
+                answer = "AIRUNWAY_RESULT_V1 " + json.dumps({"output": answer}, separators=(",", ":"))
         except Exception:
             print("Hermes task failed.", file=sys.stderr, flush=True)
             raise SystemExit(1) from None

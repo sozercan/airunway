@@ -206,6 +206,17 @@ func (c *KubernetesClient) List(ctx context.Context, t ResourceType, namespace s
 			if !ok {
 				return nil, cliError(1, "RESPONSE", "The cluster returned an invalid resource list.")
 			}
+			// Kubernetes typed lists omit TypeMeta on individual items.
+			// Preserve explicit values so callers can still reject mismatches.
+			if _, exists := obj["kind"]; !exists {
+				obj["kind"] = t.Kind
+			}
+			if _, exists := obj["apiVersion"]; !exists {
+				obj["apiVersion"] = t.Version
+				if t.Group != "" {
+					obj["apiVersion"] = t.Group + "/" + t.Version
+				}
+			}
 			items = append(items, obj)
 		}
 		next := stringAt(page, "metadata", "continue")

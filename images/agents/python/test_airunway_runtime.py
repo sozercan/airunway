@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import socket
@@ -9,8 +10,9 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import redirect_stdout
 from http import HTTPStatus
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import airunway_runtime
 
@@ -68,6 +70,64 @@ class RuntimeContractTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "requires spec.config.task"):
             airunway_runtime.job_messages({"systemPrompt": "not a task"})
+
+    def test_job_emits_one_compact_result_record(self) -> None:
+        answer = 'First line.\nAIRUNWAY_RESULT_V1 {"output":"not a second record"}\r\n雪 " \\ end'
+        adapter = Mock()
+        adapter.invoke.return_value = answer
+        config = {"task": "Answer", "resultFormat": "airunway-json-v1"}
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            airunway_runtime.run_job(adapter, config)
+        output = stdout.getvalue()
+        self.assertEqual(output, 'AIRUNWAY_RESULT_V1 ' + json.dumps({"output": answer}, separators=(",", ":")) + "\n")
+        self.assertEqual(len(output.splitlines()), 1)
+        self.assertEqual(json.loads(output.removeprefix("AIRUNWAY_RESULT_V1 ")), {"output": answer})
+        adapter.invoke.assert_called_once_with([{"role": "user", "content": "Answer"}], config)
+
+    def test_job_legacy_stdout_is_unchanged(self) -> None:
+        for answer in ("5", "First\nSecond\n", "", None, 42):
+            with self.subTest(answer=answer):
+                adapter = Mock()
+                adapter.invoke.return_value = answer
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    airunway_runtime.run_job(adapter, {"task": "Answer"})
+                self.assertEqual(stdout.getvalue(), str(answer) + "\n")
+
+    def test_job_rejects_unknown_result_format_before_invocation(self) -> None:
+        for result_format in ("private-config-value", "", None, True, 1, [], {}):
+            with self.subTest(result_format=result_format):
+                adapter = Mock()
+                stdout = io.StringIO()
+                with redirect_stdout(stdout), self.assertRaises(ValueError) as raised:
+                    airunway_runtime.run_job(adapter, {"task": "Answer", "resultFormat": result_format})
+                self.assertEqual(str(raised.exception), "spec.config.resultFormat must be airunway-json-v1 when set")
+                self.assertEqual(stdout.getvalue(), "")
+                adapter.invoke.assert_not_called()
+
+    def test_job_rejects_empty_or_non_string_structured_output(self) -> None:
+        for answer in ("", " \n\t", None, True, 42, {"private-output": "value"}, []):
+            with self.subTest(answer=answer):
+                adapter = Mock()
+                adapter.invoke.return_value = answer
+                stdout = io.StringIO()
+                with redirect_stdout(stdout), self.assertRaises(ValueError) as raised:
+                    airunway_runtime.run_job(adapter, {"task": "Answer", "resultFormat": "airunway-json-v1"})
+                self.assertEqual(str(raised.exception), "agent returned an empty or non-string task result")
+                self.assertEqual(stdout.getvalue(), "")
+                adapter.invoke.assert_called_once()
+
+    def test_failed_job_does_not_emit_result_record(self) -> None:
+        for config in ({"task": "Answer"}, {"task": "Answer", "resultFormat": "airunway-json-v1"}):
+            with self.subTest(config=config):
+                adapter = Mock()
+                adapter.invoke.side_effect = RuntimeError("native task failed")
+                stdout = io.StringIO()
+                with redirect_stdout(stdout), self.assertRaisesRegex(RuntimeError, "native task failed"):
+                    airunway_runtime.run_job(adapter, config)
+                self.assertEqual(stdout.getvalue(), "")
+                adapter.invoke.assert_called_once()
 
     def test_http_contract_routes_and_invokes_adapter(self) -> None:
         class EchoAdapter:

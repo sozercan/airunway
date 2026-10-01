@@ -88,6 +88,26 @@ function runOneShot(task, model) {
   });
 }
 
+export async function runJob(config, model, invoke = runOneShot) {
+  const structured = Object.hasOwn(config, "resultFormat");
+  if (structured && config.resultFormat !== "airunway-json-v1") {
+    throw new Error("spec.config.resultFormat must be airunway-json-v1 when set");
+  }
+  const task = config.task || config.prompt;
+  if (typeof task !== "string" || !task.trim()) {
+    throw new Error("job lifecycle requires spec.config.task or spec.config.prompt");
+  }
+  const answer = await invoke(task, model);
+  if (structured) {
+    if (typeof answer !== "string" || !answer.trim()) {
+      throw new Error("OpenClaw returned no text answer.");
+    }
+    process.stdout.write(`AIRUNWAY_RESULT_V1 ${JSON.stringify({ output: answer })}\n`);
+  } else {
+    process.stdout.write(`${answer}\n`);
+  }
+}
+
 async function main() {
   const mountedConfig = process.env.AIRUNWAY_AGENT_CONFIG || "/etc/airunway/agent.json";
   const runtimeConfig = JSON.parse(fs.readFileSync(mountedConfig, "utf8"));
@@ -160,12 +180,7 @@ async function main() {
 
   const mode = process.env.AIRUNWAY_AGENT_MODE || "server";
   if (mode === "job") {
-    const task = runtimeConfig.task || runtimeConfig.prompt;
-    if (typeof task !== "string" || !task.trim()) {
-      throw new Error("job lifecycle requires spec.config.task or spec.config.prompt");
-    }
-    const answer = await runOneShot(task, `${provider.id}/${provider.model}`);
-    process.stdout.write(`${answer}\n`);
+    await runJob(runtimeConfig, `${provider.id}/${provider.model}`);
   } else {
     const accessToken = required("AIRUNWAY_AGENT_API_KEY");
     const gateway = spawn("node", ["/app/openclaw.mjs", "gateway"], {

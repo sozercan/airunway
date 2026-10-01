@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { oneShotAnswer } from "./entrypoint.mjs";
+import { oneShotAnswer, runJob } from "./entrypoint.mjs";
 
 function result(text, meta = {}) {
   return JSON.stringify({
@@ -75,4 +75,70 @@ test("does not print model or gateway credentials in a successful payload", () =
     message: "OpenClaw returned sensitive runtime data.",
   });
   assert.equal(oneShotAnswer(result("Safe final answer"), ["model-secret"]), "Safe final answer");
+});
+
+
+test("job emits exactly one compact result record with escaped answer text", async (t) => {
+  const answer = 'First line.\nAIRUNWAY_RESULT_V1 {"output":"not a second record"}\r\n雪 " \\ end';
+  const writes = [];
+  t.mock.method(process.stdout, "write", (text) => { writes.push(text); return true; });
+  const invoke = t.mock.fn(async (task, model) => {
+    assert.equal(task, "Answer");
+    assert.equal(model, "custom/test-model");
+    return oneShotAnswer(result(answer));
+  });
+  await runJob({ task: "Answer", resultFormat: "airunway-json-v1" }, "custom/test-model", invoke);
+  assert.deepEqual(writes, [`AIRUNWAY_RESULT_V1 ${JSON.stringify({ output: answer })}\n`]);
+  assert.equal(writes[0].split("\n").length, 2);
+  assert.deepEqual(JSON.parse(writes[0].slice("AIRUNWAY_RESULT_V1 ".length)), { output: answer });
+  assert.equal(invoke.mock.callCount(), 1);
+});
+
+test("job preserves legacy stdout when resultFormat is absent", async (t) => {
+  const writes = [];
+  t.mock.method(process.stdout, "write", (text) => { writes.push(text); return true; });
+  for (const answer of ["5", "First\nSecond\n"]) {
+    await runJob({ prompt: "Answer" }, "custom/test-model", async () => oneShotAnswer(result(answer)));
+    assert.equal(writes.at(-1), `${answer}\n`);
+  }
+});
+
+test("job rejects unknown result formats before native invocation", async (t) => {
+  const writes = [];
+  t.mock.method(process.stdout, "write", (text) => { writes.push(text); return true; });
+  const invoke = t.mock.fn(async () => "must not be called");
+  for (const resultFormat of ["private-config-value", "", undefined, null, true, 1, [], {}]) {
+    await assert.rejects(runJob({ task: "Answer", resultFormat }, "custom/test-model", invoke), {
+      message: "spec.config.resultFormat must be airunway-json-v1 when set",
+    });
+  }
+  assert.equal(invoke.mock.callCount(), 0);
+  assert.deepEqual(writes, []);
+});
+
+test("job rejects empty or non-string structured output without printing it", async (t) => {
+  const writes = [];
+  t.mock.method(process.stdout, "write", (text) => { writes.push(text); return true; });
+  for (const answer of ["", " \n\t", undefined, null, true, 42, { privateOutput: "value" }, []]) {
+    await assert.rejects(runJob({ task: "Answer", resultFormat: "airunway-json-v1" }, "custom/test-model", async () => answer), {
+      message: "OpenClaw returned no text answer.",
+    });
+  }
+  assert.deepEqual(writes, []);
+});
+
+test("failed native tasks never emit a result marker", async (t) => {
+  const writes = [];
+  t.mock.method(process.stdout, "write", (text) => { writes.push(text); return true; });
+  for (const config of [{ task: "Answer" }, { task: "Answer", resultFormat: "airunway-json-v1" }]) {
+    for (const meta of [{ error: { message: "private-provider-error" } }, { aborted: true }, { livenessState: "blocked" }]) {
+      await assert.rejects(runJob(config, "custom/test-model", async () => oneShotAnswer(result("Everything succeeded", meta))), {
+        message: "OpenClaw task failed according to native status.",
+      });
+    }
+    await assert.rejects(runJob(config, "custom/test-model", async () => { throw new Error("OpenClaw task process failed."); }), {
+      message: "OpenClaw task process failed.",
+    });
+  }
+  assert.deepEqual(writes, []);
 });

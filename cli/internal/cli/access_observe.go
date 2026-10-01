@@ -83,27 +83,50 @@ func accessReferenceType(ctx context.Context, client ClusterClient, kind, apiVer
 func accessWorkload(ctx context.Context, client ClusterClient, noun string, resource Object, fallback string) (Object, error) {
 	ref := object(get(resource, "status", "runtime", "workloadRef"))
 	if noun == "model" {
-		ref = object(get(resource, "status", "workloadRef"))
-		if len(ref) == 0 {
-			provider := object(get(resource, "status", "provider"))
-			ref = Object{"name": provider["resourceName"], "kind": provider["resourceKind"], "apiVersion": provider["apiVersion"]}
+		provider := object(get(resource, "status", "provider"))
+		// A DGDR request and its generated serving workload have different identities.
+		// Prefer the published serving ref; legacy fields may identify the request.
+		if published := provider["workloadRef"]; published != nil {
+			ref = object(published)
+		} else {
+			ref = object(get(resource, "status", "workloadRef"))
+			if len(ref) == 0 {
+				ref = Object{
+					"name": provider["resourceName"], "kind": provider["resourceKind"], "apiVersion": provider["apiVersion"],
+				}
+			}
 		}
 	}
 	if stringAt(ref, "name") == "" || stringAt(ref, "kind") == "" {
 		return nil, accessUnsupported("The provider has not published a workload reference. Inspect the resource status and provider.")
 	}
-	t, err := accessReferenceType(ctx, client, stringAt(ref, "kind"), stringAt(ref, "apiVersion"))
-	if err != nil {
-		return nil, err
-	}
 	ns := stringAt(ref, "namespace")
 	if ns == "" {
 		ns = accessNamespace(resource, fallback)
 	}
+	if noun == "model" && ns != accessNamespace(resource, fallback) {
+		return nil, accessUnsupported("The published workload namespace does not match the ModelDeployment namespace.")
+	}
+	t, err := accessReferenceType(ctx, client, stringAt(ref, "kind"), stringAt(ref, "apiVersion"))
+	if err != nil {
+		return nil, err
+	}
 	if !t.Namespaced {
 		ns = ""
 	}
-	return accessGet(ctx, client, t, ns, stringAt(ref, "name"))
+	workload, err := accessGet(ctx, client, t, ns, stringAt(ref, "name"))
+	if err != nil {
+		return nil, err
+	}
+	if uid := stringAt(ref, "uid"); uid != "" && stringAt(workload, "metadata", "uid") != uid {
+		return nil, accessUnsupported(
+			"The workload UID no longer matches the published reference. Wait for refreshed status.",
+		)
+	}
+	if t.Namespaced && stringAt(workload, "metadata", "namespace") != ns {
+		return nil, accessUnsupported("The backing workload namespace does not match the published reference.")
+	}
+	return workload, nil
 }
 func accessDescendsFrom(ctx context.Context, client ClusterClient, child, root Object, cache map[string]Object, seen map[string]bool, fallback string) (bool, error) {
 	uid := stringAt(root, "metadata", "uid")

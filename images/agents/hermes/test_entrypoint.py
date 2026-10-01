@@ -14,6 +14,7 @@ import unittest
 import urllib.error
 import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
+from itertools import product
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -120,8 +121,13 @@ class HermesEntrypointTest(unittest.TestCase):
             )
 
     def test_job_main_uses_native_api_and_maps_failures_to_exit_one(self) -> None:
-        for outcome in ("success", "context", "api", "exception", "secret", "tools-enabled", "names-enabled"):
+        answer = 'First line.\nAIRUNWAY_RESULT_V1 {"output":"not a second record"}\r\n雪 " \\ end'
+        outcomes = ("success", "context", "api", "exception", "secret", "tools-enabled", "names-enabled", "empty", "non-string")
+        for result_format, outcome in product((None, "airunway-json-v1"), outcomes):
             instances = []
+            config = {"task": "Answer 5"}
+            if result_format is not None:
+                config["resultFormat"] = result_format
 
             class Agent:
                 def __init__(self, **kwargs):
@@ -148,13 +154,13 @@ class HermesEntrypointTest(unittest.TestCase):
                     return {
                         "completed": True,
                         "failed": False,
-                        "final_response": "provider-secret" if outcome == "secret" else "5",
+                        "final_response": {"secret": "provider-secret", "empty": "", "non-string": 42}.get(outcome, answer),
                     }
 
                 def close(self):
                     self.closed = True
 
-            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmpdir:
+            with self.subTest(outcome=outcome, result_format=result_format), tempfile.TemporaryDirectory() as tmpdir:
                 stdout, stderr = io.StringIO(), io.StringIO()
                 env = {
                     "OPENAI_MODEL": "smoke-model",
@@ -164,7 +170,7 @@ class HermesEntrypointTest(unittest.TestCase):
                 }
                 with patch.dict(os.environ, env, clear=True), patch.object(
                     entrypoint, "STATE_DIR", Path(tmpdir)
-                ), patch.object(entrypoint, "mounted_config", return_value={"task": "Answer 5"}), patch.dict(
+                ), patch.object(entrypoint, "mounted_config", return_value=config), patch.dict(
                     sys.modules, {"run_agent": types.SimpleNamespace(AIAgent=Agent)}
                 ), redirect_stdout(stdout), redirect_stderr(stderr):
                     if outcome == "success":
@@ -173,7 +179,13 @@ class HermesEntrypointTest(unittest.TestCase):
                         with self.assertRaises(SystemExit) as raised:
                             entrypoint.main()
                         self.assertEqual(raised.exception.code, 1)
-                self.assertEqual(stdout.getvalue(), "5\n" if outcome == "success" else "")
+                expected = answer + "\n"
+                if result_format is not None:
+                    expected = "AIRUNWAY_RESULT_V1 " + json.dumps({"output": answer}, separators=(",", ":")) + "\n"
+                self.assertEqual(stdout.getvalue(), expected if outcome == "success" else "")
+                if outcome == "success" and result_format is not None:
+                    self.assertEqual(len(stdout.getvalue().splitlines()), 1)
+                    self.assertEqual(json.loads(stdout.getvalue().removeprefix("AIRUNWAY_RESULT_V1 ")), {"output": answer})
                 self.assertEqual(stderr.getvalue(), "" if outcome == "success" else "Hermes task failed.\n")
                 self.assertTrue(instances[0].closed)
                 self.assertEqual(
@@ -186,6 +198,21 @@ class HermesEntrypointTest(unittest.TestCase):
                     "quiet_mode": True, "enabled_toolsets": [],
                     "platform": "api_server", "load_soul_identity": True,
                 })
+
+    def test_job_rejects_unknown_result_format_before_native_invocation(self) -> None:
+        for result_format in ("private-config-value", "", None, True, 1, [], {}):
+            with self.subTest(result_format=result_format):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with patch.dict(os.environ, {"AIRUNWAY_AGENT_MODE": "job"}, clear=True), patch.object(
+                    entrypoint, "mounted_config", return_value={"task": "Answer", "resultFormat": result_format}
+                ), patch.object(entrypoint, "write_runtime_config"), patch.object(
+                    entrypoint, "run_one_shot"
+                ) as invoke, redirect_stdout(stdout), redirect_stderr(stderr), self.assertRaises(ValueError) as raised:
+                    entrypoint.main()
+                self.assertEqual(str(raised.exception), "spec.config.resultFormat must be airunway-json-v1 when set")
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "")
+                invoke.assert_not_called()
 
     def test_body_deadline(self) -> None:
         class DripReader:

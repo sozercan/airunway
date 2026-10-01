@@ -267,6 +267,9 @@ func run(ctx context.Context, words []string, flags Flags, streams *IO, opts Run
 		}
 		return usage("Unknown command. Run airunway --help.")
 	}
+	if noun == "agent" && len(words) > 1 && words[1] == "run" {
+		return runAgentOnce(words, command, config, localPreview)
+	}
 	return runResource(words, command, config, localPreview)
 }
 func runResource(words []string, c *CommandContext, config *CLIConfig, localPreview bool) error {
@@ -295,7 +298,7 @@ func runResource(words []string, c *CommandContext, config *CLIConfig, localPrev
 		if err != nil {
 			return err
 		}
-		return writeOutput(c.IO, f, value)
+		return writeResourceOutput(c.IO, f, noun, "list", value)
 	}
 	if err := assertPositionals(words, 3); err != nil {
 		return err
@@ -316,79 +319,18 @@ func runResource(words []string, c *CommandContext, config *CLIConfig, localPrev
 	if !ok {
 		return usage("Unknown action. Run airunway --help.")
 	}
+	if noun == "model" && action == actionChat {
+		options = append(options, "system", "system-file")
+	}
 	if err := assertFlags(f, options); err != nil {
 		return err
 	}
 	if action == "create" {
-		dry, err := dryRun(f)
+		created, err := createResource(noun, name, c, config, localPreview, nil)
 		if err != nil {
 			return err
 		}
-		creation := f
-		if noun == "agent" {
-			creation = mergeAgentDefaults(f, effectiveDefaults(config, c.ContextName, c.Namespace))
-			if f.Has("preset") {
-				if localPreview {
-					return usage("Preset resolution needs a cluster. Use --dry-run server or provide framework configuration directly.")
-				}
-				client, err := c.Client()
-				if err != nil {
-					return err
-				}
-				preset, err := resolvePreset(c.Context, client, f.Text("preset"))
-				if err != nil {
-					return err
-				}
-				framework := stringAt(preset, "framework")
-				if f.Has("framework") && f.Text("framework") != framework {
-					return usage("The preset and --framework disagree.")
-				}
-				creation["framework"] = []string{framework}
-				b, _ := json.Marshal(preset["config"])
-				creation["__preset-config"] = []string{string(b)}
-			}
-		}
-		builder := buildModel
-		if noun == "agent" {
-			builder = buildAgent
-		}
-		resource, err := builder(name, creation, c.Namespace, c.IO)
-		if err != nil {
-			return err
-		}
-		wait, err := writeWaitEnabled(noun, nil, resource, f, dry)
-		if err != nil {
-			return err
-		}
-		if dry == "client" {
-			return writeOutput(c.IO, f, resource)
-		}
-		client, err := c.Client()
-		if err != nil {
-			return err
-		}
-		if err := preflight(resource, noun, c, client); err != nil {
-			return err
-		}
-		created, err := client.Create(c.Context, resource, dry == "server")
-		if err != nil {
-			return err
-		}
-		if !wait {
-			return writeOutput(c.IO, f, created)
-		}
-		progress(c, fmt.Sprintf("Created %s %q in %s. Waiting; timeout or interruption will not delete it.", noun, name, c.Namespace))
-		waitFlags := f.Copy()
-		target := "ready"
-		if stringAt(resource, "spec", "lifecycle") == "job" {
-			target = "completed"
-		}
-		waitFlags["for"] = []string{target}
-		ready, err := waitForResource(c.Context, client, noun, created, waitFlags, c.IO)
-		if err != nil {
-			return err
-		}
-		return writeOutput(c.IO, f, ready)
+		return writeResourceOutput(c.IO, f, noun, "created", created)
 	}
 	if action == "update" {
 		dry, err := dryRun(f)
@@ -419,13 +361,13 @@ func runResource(words []string, c *CommandContext, config *CLIConfig, localPrev
 			return err
 		}
 		if !wait {
-			return writeOutput(c.IO, f, updated)
+			return writeResourceOutput(c.IO, f, noun, "updated", updated)
 		}
 		ready, err := waitForResource(c.Context, client, noun, updated, f, c.IO)
 		if err != nil {
 			return err
 		}
-		return writeOutput(c.IO, f, ready)
+		return writeResourceOutput(c.IO, f, noun, action, ready)
 	}
 	if action == "get" || action == "delete" || action == "wait" {
 		client, err := c.Client()
@@ -438,13 +380,13 @@ func runResource(words []string, c *CommandContext, config *CLIConfig, localPrev
 		}
 		switch action {
 		case "get":
-			return writeOutput(c.IO, f, resource)
+			return writeResourceOutput(c.IO, f, noun, "get", resource)
 		case "wait":
 			ready, err := waitForResource(c.Context, client, noun, resource, f, c.IO)
 			if err != nil {
 				return err
 			}
-			return writeOutput(c.IO, f, ready)
+			return writeResourceOutput(c.IO, f, noun, action, ready)
 		case "delete":
 			uid := stringAt(resource, "metadata", "uid")
 			if err := client.Delete(c.Context, t, c.Namespace, name, uid); err != nil {
@@ -483,7 +425,8 @@ func runResource(words []string, c *CommandContext, config *CLIConfig, localPrev
 					}
 				}
 			}
-			return writeOutput(c.IO, f, Object{"name": name, "namespace": c.Namespace, "deletionRequested": true})
+			return writeResourceOutput(c.IO, f, noun, "deletion requested",
+				Object{"name": name, "namespace": c.Namespace, "deletionRequested": true})
 		}
 	}
 	return runAccess(noun, action, name, c)
@@ -619,10 +562,10 @@ func runDoctor(c *CommandContext, words []string) error {
 	if err := assertFlags(c.Flags, nil); err != nil {
 		return err
 	}
+	client, connectErr := c.Client()
 	checks := []Object{}
-	all := true
 	for _, noun := range []string{"model", "agent", "provider", "framework"} {
-		client, err := c.Client()
+		err := connectErr
 		var values []Object
 		if err == nil {
 			values, err = client.List(c.Context, resourceTypes[noun], c.Namespace, nil)
@@ -630,35 +573,42 @@ func runDoctor(c *CommandContext, words []string) error {
 		detail := fmt.Sprintf("%d visible", len(values))
 		if err != nil {
 			detail = err.Error()
-			all = false
 		}
 		checks = append(checks, Object{"check": noun, "ok": err == nil, "detail": detail})
 	}
-	client, err := c.Client()
-	if err != nil {
-		return err
-	}
 	for _, noun := range []string{"model", "agent"} {
-		result, err := client.Request(c.Context, "POST", "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews", Object{"apiVersion": "authorization.k8s.io/v1", "kind": "SelfSubjectAccessReview", "spec": Object{"resourceAttributes": Object{"namespace": c.Namespace, "group": "airunway.ai", "resource": resourceTypes[noun].Plural, "verb": "create"}}}, RequestOptions{})
-		if err != nil {
-			return err
-		}
-		ok := boolAt(result, "status", "allowed")
-		detail := "Allowed"
-		if !ok {
-			all = false
-			detail = "Not allowed"
-		}
-		checks = append(checks, Object{"check": "create " + noun, "ok": ok, "detail": detail})
+		checks = append(checks, doctorCreateCheck(c, client, connectErr, noun))
 	}
-	if err := writeOutput(c.IO, c.Flags, Object{"context": c.ContextName, "namespace": c.Namespace, "checks": checks}); err != nil {
+	if err := writeDoctorOutput(c, checks); err != nil {
 		return err
 	}
-	if !all {
-		return cliError(1, "DOCTOR", "One or more cluster checks failed.")
+	for _, check := range checks {
+		if !boolAt(check, "ok") {
+			return cliError(1, "DOCTOR", "One or more cluster access checks failed.")
+		}
 	}
 	return nil
 }
+
+func doctorCreateCheck(c *CommandContext, client ClusterClient, err error, noun string) Object {
+	var result Object
+	if err == nil {
+		body := Object{"apiVersion": "authorization.k8s.io/v1", "kind": "SelfSubjectAccessReview",
+			"spec": Object{"resourceAttributes": Object{"namespace": c.Namespace, "group": "airunway.ai",
+				"resource": resourceTypes[noun].Plural, "verb": "create"}}}
+		result, err = client.Request(c.Context, "POST", "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+			body, RequestOptions{})
+	}
+	ok, detail := err == nil && boolAt(result, "status", "allowed"), "Allowed"
+	if !ok {
+		detail = "Not allowed"
+	}
+	if err != nil {
+		detail = err.Error()
+	}
+	return Object{"check": "create " + noun, "ok": ok, "detail": detail}
+}
+
 func runDashboard(ctx context.Context, words []string, flags Flags, streams *IO) error {
 	command := "serve"
 	if len(words) > 0 {

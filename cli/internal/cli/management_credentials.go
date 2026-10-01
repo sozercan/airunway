@@ -204,7 +204,7 @@ func managementCredential(words []string, ctx *CommandContext) error {
 				return err
 			}
 		}
-		return writeOutput(ctx.IO, ctx.Flags, managementCredentialMetadata(result))
+		return writeResourceOutput(ctx.IO, ctx.Flags, "credential", "created", managementCredentialMetadata(result))
 	}
 	client, err := ctx.Client()
 	if err != nil {
@@ -221,7 +221,7 @@ func managementCredential(words []string, ctx *CommandContext) error {
 				result = append(result, managementCredentialMetadata(item))
 			}
 		}
-		return writeOutput(ctx.IO, ctx.Flags, result)
+		return writeResourceOutput(ctx.IO, ctx.Flags, "credential", "list", result)
 	}
 	existing, err := client.Get(ctx.Context, resourceTypes["credential"], ns, name)
 	if err != nil {
@@ -232,7 +232,7 @@ func managementCredential(words []string, ctx *CommandContext) error {
 		return err
 	}
 	if action == "get" {
-		return writeOutput(ctx.IO, ctx.Flags, managementCredentialMetadata(existing))
+		return writeResourceOutput(ctx.IO, ctx.Flags, "credential", action, managementCredentialMetadata(existing))
 	}
 	if action == "update" {
 		if ctx.Flags.Has("type") {
@@ -263,7 +263,7 @@ func managementCredential(words []string, ctx *CommandContext) error {
 				return err
 			}
 		}
-		return writeOutput(ctx.IO, ctx.Flags, managementCredentialMetadata(result))
+		return writeResourceOutput(ctx.IO, ctx.Flags, "credential", "updated", managementCredentialMetadata(result))
 	}
 	uid := stringAt(existing, "metadata", "uid")
 	if uid == "" {
@@ -287,5 +287,5 @@ func managementCredential(words []string, ctx *CommandContext) error {
 	if err := client.Delete(ctx.Context, resourceTypes["credential"], ns, name, uid); err != nil {
 		return err
 	}
-	return writeOutput(ctx.IO, ctx.Flags, managementCredentialMetadata(existing))
+	return writeResourceOutput(ctx.IO, ctx.Flags, "credential", "deleted", managementCredentialMetadata(existing))
 }
