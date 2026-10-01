@@ -1,4 +1,4 @@
-# Requires Dynamo 1.5 with native beta DGD overrides and args append support.
+# Supports Dynamo 1.1.1 and 1.5 native tool parsing.
 # GPU discovery and the installation's profiler credentials must be available.
 apiVersion: airunway.ai/v1alpha1
 kind: ModelDeployment
@@ -11,6 +11,7 @@ spec:
     source: huggingface
   engine:
     type: vllm
+    toolCalling: true
   provider:
     name: dynamo
     overrides:
@@ -22,24 +23,6 @@ spec:
         overrides:
           profilingJob:
             activeDeadlineSeconds: 1800
-          dgd:
-            apiVersion: nvidia.com/v1beta1
-            kind: DynamoGraphDeployment
-            spec:
-              components:
-                - name: VllmDecodeWorker
-                  podTemplate:
-                    spec:
-                      containers:
-                        - name: main
-                          # Keep generated launch arguments and add the Qwen3 parsers.
-                          $patch:
-                            args: append
-                          args:
-                            - --dyn-tool-call-parser
-                            - hermes
-                            - --dyn-reasoning-parser
-                            - qwen3
         workload:
           isl: 1024
           osl: 256

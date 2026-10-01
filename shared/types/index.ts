@@ -13,3 +13,4 @@ export * from './aikit';
 export * from './vllmRecipes';
 
 export * from './dynamo';
+export * from './dynamo-tool-calling';

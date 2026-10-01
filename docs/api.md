@@ -878,6 +878,18 @@ Create a new deployment.
 - `imageRef` - Optional custom image. For provider/runtime `vllm`, maps to `spec.engine.image`; for other providers, maps to legacy top-level `spec.image`.
 - `engineArgs` - Optional object mapped to `spec.engine.args`.
 - `engineExtraArgs` - Optional string array mapped to `spec.engine.extraArgs`.
+- `toolCalling` - Optional boolean mapped to `spec.engine.toolCalling`. Enables Dynamo-native tool parsing in manual and automatic configuration.
+- `toolCallParser` - Optional native parser identifier. Known Qwen3 model IDs use defaults; other models need an explicit parser.
+- `reasoningParser` - Optional native reasoning parser identifier. Omit for model defaults; `none` is rejected because it does not disable Dynamo parsing. Parser overrides require `toolCalling: true`.
+
+The tool-calling fields are also accepted by
+`POST /deployments/:namespace/:name/reconfigure` together with its required
+`resourceVersion`. Omitted fields preserve the current settings. Send `null` for
+a parser override to restore the model default; `toolCalling: false` clears both
+parser overrides. Conflicting raw parser or chat-processor settings are rejected.
+See [Dynamo configuration](providers.md#automatic-configuration) for supported
+model defaults and request lifecycle behavior.
+
 
 **Response:**
 

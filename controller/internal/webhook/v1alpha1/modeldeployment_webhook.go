@@ -272,7 +272,9 @@ func (v *ModelDeploymentCustomValidator) validateSpec(ctx context.Context, obj *
 	var allErrs field.ErrorList
 	spec := &obj.Spec
 	specPath := field.NewPath("spec")
-	if err := dynamointent.Validate(obj); err != nil {
+	if err := dynamointent.ValidateToolCalling(obj); err != nil {
+		allErrs = append(allErrs, field.Invalid(specPath.Child("engine", "toolCalling"), spec.Engine.ToolCalling, err.Error()))
+	} else if err := dynamointent.Validate(obj); err != nil {
 		allErrs = append(allErrs, field.Invalid(specPath.Child("provider", "overrides", "intent"), "<intent>", err.Error()))
 	}
 

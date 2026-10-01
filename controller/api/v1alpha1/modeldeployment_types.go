@@ -243,6 +243,24 @@ type EngineSpec struct {
 	// +optional
 	Type EngineType `json:"type,omitempty"`
 
+	// toolCalling enables Dynamo-native tool parsing. Known Qwen3 models use
+	// compatible defaults; other models require toolCallParser.
+	// +optional
+	ToolCalling bool `json:"toolCalling,omitempty"`
+
+	// toolCallParser overrides the Dynamo-native tool parser. Requires toolCalling.
+	// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9_]*$`
+	// +kubebuilder:validation:MaxLength=64
+	// +optional
+	ToolCallParser string `json:"toolCallParser,omitempty"`
+
+	// reasoningParser overrides reasoning parsing when toolCalling is enabled.
+	// Omission uses a model-family default when known. Dynamo has no "none" disable value.
+	// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9_]*$`
+	// +kubebuilder:validation:MaxLength=64
+	// +optional
+	ReasoningParser string `json:"reasoningParser,omitempty"`
+
 	// image is an engine-specific container image override. For direct vLLM
 	// deployments this is the vLLM OpenAI-compatible server image.
 	// +optional
@@ -467,6 +485,16 @@ type ProviderResourceReference struct {
 
 // ProviderIntentStatus records the accepted, immutable profiling attempt.
 type ProviderIntentStatus struct {
+	// hardware records upstream hardware values, without substituting another GPU profile.
+	// +optional
+	Hardware *ProviderIntentHardwareStatus `json:"hardware,omitempty"`
+	// plan summarizes the selected graph or, when unavailable, the serving workload.
+	// +optional
+	Plan *ProviderIntentPlanStatus `json:"plan,omitempty"`
+	// diagnostic suggests a next step only when an upstream failure identifies one.
+	// +kubebuilder:validation:MaxLength=1024
+	// +optional
+	Diagnostic string `json:"diagnostic,omitempty"`
 	// +optional
 	Phase string `json:"phase,omitempty"`
 	// +optional

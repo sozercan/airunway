@@ -109,6 +109,9 @@ func Parse(md *api.ModelDeployment) (*Spec, error) {
 
 // Validate is shared by admission and provider reconciliation.
 func Validate(md *api.ModelDeployment) error {
+	if err := ValidateToolCalling(md); err != nil {
+		return err
+	}
 	spec, err := Parse(md)
 	if err != nil {
 		return err
@@ -229,6 +232,10 @@ func Fingerprint(md *api.ModelDeployment) (string, error) {
 		return "", err
 	}
 	input := map[string]any{"model": md.Spec.Model, "backend": md.ResolvedEngineType(), "secrets": md.Spec.Secrets, "nodeSelector": md.Spec.NodeSelector, "tolerations": md.Spec.Tolerations, "env": md.Spec.Env}
+	// Keep hashes unchanged for existing deployments without the convenience setting.
+	if md.Spec.Engine.ToolCalling || md.Spec.Engine.ToolCallParser != "" || md.Spec.Engine.ReasoningParser != "" {
+		input["toolCalling"] = map[string]any{"enabled": md.Spec.Engine.ToolCalling, "parser": md.Spec.Engine.ToolCallParser, "reasoningParser": md.Spec.Engine.ReasoningParser}
+	}
 	if s, err := Parse(md); err != nil {
 		return "", err
 	} else if s != nil {

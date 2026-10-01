@@ -1,5 +1,6 @@
-import { defaultDynamoIntent, getDynamoIntent } from '@airunway/shared'
+import { defaultDynamoIntent, getDynamoIntent, getDynamoToolCallingError } from '@airunway/shared'
 import { DynamoIntentFields } from './DynamoIntentFields'
+import { DynamoToolCallingFields } from './DynamoToolCallingFields'
 import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
@@ -593,11 +594,13 @@ export function DeploymentForm({ model, onAutomaticConfigurationChange, detailed
 
   const intent = getDynamoIntent(config.provider, config.providerOverrides)
   const automatic = !!intent
+  const toolCallingError = getDynamoToolCallingError(config)
   const [intentValid, setIntentValid] = useState(true)
   useEffect(() => { onAutomaticConfigurationChange?.(automatic) }, [automatic, onAutomaticConfigurationChange])
   const manualConfig = useRef<DeploymentConfig | null>(null)
   const changeConfigurationMode = (mode: string) => {
     if ((mode === 'automatic') === automatic) return
+    setIntentValid(true)
     setTopologyManagedByAIConfig(false)
     if (mode === 'automatic') {
       manualConfig.current = config
@@ -615,6 +618,7 @@ export function DeploymentForm({ model, onAutomaticConfigurationChange, detailed
       setConfig(prev => ({ ...(manualConfig.current || prev),
         name: prev.name, namespace: prev.namespace, modelId: prev.modelId, engine: prev.engine,
         gatewayEnabled: prev.gatewayEnabled,
+        toolCalling: prev.toolCalling, toolCallParser: prev.toolCallParser, reasoningParser: prev.reasoningParser,
         providerOverrides: manualConfig.current?.providerOverrides,
       }))
     }
@@ -633,6 +637,9 @@ export function DeploymentForm({ model, onAutomaticConfigurationChange, detailed
       return {
         ...prev,
         provider: runtime,
+        toolCalling: runtime === 'dynamo' ? prev.toolCalling : undefined,
+        toolCallParser: runtime === 'dynamo' ? prev.toolCallParser : undefined,
+        reasoningParser: runtime === 'dynamo' ? prev.reasoningParser : undefined,
         namespace: getRuntimeDefaultNamespace(runtime),
         engine: runtime === 'vllm' ? 'vllm' : getDefaultEngineForRuntime(runtime),
         mode: runtime === 'kaito' || runtime === 'vllm' ? 'aggregated' : prev.mode,
@@ -947,6 +954,8 @@ export function DeploymentForm({ model, onAutomaticConfigurationChange, detailed
   // Handle runtime change - update namespace and engine
   const handleRuntimeChange = (runtime: string) => {
     if (runtime === selectedRuntime) return
+    manualConfig.current = null
+    setIntentValid(true)
     runtimeManuallySelectedRef.current = true
     setTopologyManagedByAIConfig(false)
     setSelectedRuntime(runtime)
@@ -986,6 +995,9 @@ export function DeploymentForm({ model, onAutomaticConfigurationChange, detailed
       return {
         ...prev,
         provider: runtime,
+        toolCalling: runtime === 'dynamo' ? prev.toolCalling : undefined,
+        toolCallParser: runtime === 'dynamo' ? prev.toolCallParser : undefined,
+        reasoningParser: runtime === 'dynamo' ? prev.reasoningParser : undefined,
         namespace: getRuntimeDefaultNamespace(runtime),
         // Reset engine if current one isn't supported by new runtime
         engine: runtime === 'vllm' ? 'vllm' : nextEngine,
@@ -1049,7 +1061,7 @@ export function DeploymentForm({ model, onAutomaticConfigurationChange, detailed
 
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault()
-    if (automatic && !intentValid) return
+    if (toolCallingError || (automatic && !intentValid)) return
 
     try {
       // Build the deployment config, adding KAITO-specific fields if needed
@@ -1175,7 +1187,7 @@ export function DeploymentForm({ model, onAutomaticConfigurationChange, detailed
         variant: 'destructive',
       })
     }
-  }, [automatic, intentValid, config, createDeployment, navigate, toast, triggerConfetti, selectedRuntime, directVllmCustomImageRequired, directVllmImageRef, kaitoComputeType, kaitoResourceType, selectedPremadeModel, isHuggingFaceGgufModel, isVllmModel, model.id, model.gated, ggufFile, ggufRunMode, maxModelLen, gatewayInfo?.available])
+  }, [automatic, intentValid, toolCallingError, config, createDeployment, navigate, toast, triggerConfetti, selectedRuntime, directVllmCustomImageRequired, directVllmImageRef, kaitoComputeType, kaitoResourceType, selectedPremadeModel, isHuggingFaceGgufModel, isVllmModel, model.id, model.gated, ggufFile, ggufRunMode, maxModelLen, gatewayInfo?.available])
 
   const updateConfig = <K extends keyof DeploymentConfig>(
     key: K,
@@ -1566,6 +1578,8 @@ export function DeploymentForm({ model, onAutomaticConfigurationChange, detailed
             <span>Automatic configuration<span className="block text-xs text-muted-foreground mt-1">Give Dynamo a GPU budget and performance targets. It chooses the serving layout.</span></span>
           </Label>
         </RadioGroup>
+        <DynamoToolCallingFields value={config} modelId={config.modelId} error={toolCallingError}
+          onChange={settings => setConfig(prev => ({ ...prev, ...settings }))} />
         {intent && <DynamoIntentFields value={intent} onValidityChange={setIntentValid} onChange={next => setConfig(prev => ({ ...prev, providerOverrides: { deploymentMode: 'intent', intent: next } }))} />}
       </section>}
 
@@ -2657,6 +2671,7 @@ export function DeploymentForm({ model, onAutomaticConfigurationChange, detailed
 
         {/* Manifest Preview - build config with runtime-specific fields */}
         {(() => {
+          if (toolCallingError) return <p className="text-sm text-destructive">Fix tool calling settings to preview or deploy.</p>
           if (automatic && !intentValid) return <p className="text-sm text-destructive">Fix advanced configuration to preview or deploy.</p>
           // Build preview config with all necessary fields
           let previewConfig = normalizeGatewayAvailability(config, gatewayInfo?.available);
@@ -2743,7 +2758,7 @@ export function DeploymentForm({ model, onAutomaticConfigurationChange, detailed
         </Button>
         <Button
           type="submit"
-          disabled={createDeployment.isProcessing || needsHfAuth || !isRuntimeReady || !isKaitoConfigValid || (fp8Blocked && !automatic) || (automatic && !intentValid)}
+          disabled={!!toolCallingError || createDeployment.isProcessing || needsHfAuth || !isRuntimeReady || !isKaitoConfigValid || (fp8Blocked && !automatic) || (automatic && !intentValid)}
           loading={createDeployment.isProcessing}
           className={cn(
             "flex-1 h-14 rounded-2xl bg-primary text-primary-foreground font-bold shadow-glow-button gap-2",

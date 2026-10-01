@@ -17,6 +17,9 @@ import (
 // apiVersion may be qualified (nvidia.com/v1beta1) or just v1beta1. Discovery
 // and preserving an existing deployment's runtime are the caller's concern.
 func (t *Transformer) TransformForVersion(ctx context.Context, md *api.ModelDeployment, apiVersion, runtimeVersion string) ([]*unstructured.Unstructured, error) {
+	if err := dynamointent.ValidateToolCalling(md); err != nil {
+		return nil, err
+	}
 	apiVersion = strings.TrimPrefix(apiVersion, DynamoAPIGroup+"/")
 	if apiVersion != "v1alpha1" && apiVersion != "v1beta1" {
 		return nil, fmt.Errorf("unsupported Dynamo API version %q", apiVersion)
@@ -107,6 +110,9 @@ func (t *Transformer) TransformForVersion(ctx context.Context, md *api.ModelDepl
 		}
 		resource.Object["spec"] = spec
 		resource.SetAPIVersion(DynamoAPIGroup + "/v1beta1")
+		if err := render.applyToolCalling(md, resource); err != nil {
+			return nil, err
+		}
 	}
 	return resources, nil
 }

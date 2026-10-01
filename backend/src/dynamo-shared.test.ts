@@ -38,3 +38,17 @@ describe('automatic deployment conversion', () => {
     expect(buildPortForwardCommand(result)).toContain('svc/custom-frontend 8000:9000 -n serving');
   });
 });
+
+test('shared adapters preserve tool settings and the bounded provider summary verbatim', () => {
+  const fields = { toolCalling: true, toolCallParser: 'hermes', reasoningParser: 'basic' };
+  const spec = toModelDeploymentSpec({ ...config, ...fields });
+  expect(deploymentRequest({ ...config, ...fields })).toMatchObject(fields);
+  expect(spec.engine).toMatchObject(fields);
+  const summary = { phase: 'Profiling', profilingPhase: 'SelectingConfig', hardware: { gpuSku: 'H100', vramMb: 81920, numGpusPerNode: 8, source: 'mixed' as const },
+    plan: { source: 'selectedConfig' as const, engine: 'vllm', servingMode: 'disaggregated', workers: [{ name: 'prefill', role: 'prefill', replicas: 2, gpusPerReplica: 4, tensorParallelism: 4, pipelineParallelism: 1 }] },
+    diagnostic: 'Only the first 32 workers are included.' };
+  const md: ModelDeployment = { apiVersion: 'airunway.ai/v1alpha1', kind: 'ModelDeployment', metadata: { name: 'auto', namespace: 'models' }, spec, status: { provider: { name: 'dynamo', intent: summary } } };
+  const status = toDeploymentStatus(md);
+  expect(status).toMatchObject(fields);
+  expect(status.providerStatus?.intent).toEqual(summary);
+});

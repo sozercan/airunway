@@ -39,12 +39,20 @@ func (r *DynamoProviderReconciler) readServingStatus(ctx context.Context, md *ap
 			p.Intent.InputHash = hash
 		}
 		p.Intent.Attempt = upstream.GetAnnotations()[dynamointent.AttemptAnnotation]
+		// Replace summaries on every observation. Missing fields and a new
+		// attempt must not inherit the previous plan, hardware or diagnostic.
+		p.Intent.Hardware = intentHardware(md, upstream)
+		p.Intent.Plan = intentPlan(upstream, nil)
+		p.Intent.Diagnostic = intentDiagnostic(upstream)
 		workload, err = r.resolveGeneratedDGD(ctx, md, upstream)
 		if err != nil {
 			return nil, err
 		}
 		if workload == nil {
 			return result, nil
+		}
+		if p.Intent.Plan == nil {
+			p.Intent.Plan = intentPlan(nil, workload)
 		}
 		result, err = r.StatusTranslator.TranslateStatus(workload)
 		if err != nil {

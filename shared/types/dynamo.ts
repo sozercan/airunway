@@ -29,6 +29,10 @@ export interface DynamoIntent {
 
 export interface DynamoReconfigureRequest {
   resourceVersion: string;
+  toolCalling?: boolean;
+  /** Null clears an explicit parser; omission preserves it. */
+  toolCallParser?: string | null;
+  reasoningParser?: string | null;
   intent?: DynamoIntent;
   modelId?: string;
   engine?: 'vllm' | 'sglang' | 'trtllm';

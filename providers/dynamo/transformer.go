@@ -146,6 +146,9 @@ func (t *Transformer) Transform(ctx context.Context, md *airunwayv1alpha1.ModelD
 }
 
 func (t *Transformer) transformAlpha(ctx context.Context, md *airunwayv1alpha1.ModelDeployment) ([]*unstructured.Unstructured, error) {
+	if err := dynamointent.ValidateToolCalling(md); err != nil {
+		return nil, err
+	}
 	// Parse overrides if present
 	overrides, err := t.parseOverrides(md)
 	if err != nil {
@@ -242,6 +245,9 @@ func (t *Transformer) transformAlpha(ctx context.Context, md *airunwayv1alpha1.M
 		return nil, fmt.Errorf("failed to apply provider overrides: %w", err)
 	}
 
+	if err := t.applyToolCalling(md, dgd); err != nil {
+		return nil, err
+	}
 	return []*unstructured.Unstructured{dgd}, nil
 }
 
@@ -315,6 +321,9 @@ func (t *Transformer) transformIntent(
 	}
 	if err := unstructured.SetNestedField(dgdr.Object, spec, "spec"); err != nil {
 		return nil, fmt.Errorf("failed to set DGDR spec: %w", err)
+	}
+	if err := t.applyToolCalling(md, dgdr); err != nil {
+		return nil, err
 	}
 	return []*unstructured.Unstructured{dgdr}, nil
 }

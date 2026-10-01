@@ -1,3 +1,4 @@
+import { getDynamoToolCallingError } from '@airunway/shared';
 import { dynamoOverridesSchema, dynamoReconfigureSchema, reconfigureDynamoDeployment } from '../lib/dynamo-intent';
 import { Hono } from 'hono';
 import type { Context } from 'hono';
@@ -177,6 +178,9 @@ const createDeploymentSchema = z.unknown().superRefine((raw, ctx) => {
     gpu: z.number().int().min(0),
     memory: z.string().optional(),
   }).optional(),
+  toolCalling: z.boolean().optional(),
+  toolCallParser: z.string().optional(),
+  reasoningParser: z.string().optional(),
   engineArgs: z.record(z.string(), z.unknown()).optional(),
   engineExtraArgs: z.array(z.string()).optional(),
   env: z.record(z.string(), z.string()).optional(),
@@ -196,6 +200,8 @@ const createDeploymentSchema = z.unknown().superRefine((raw, ctx) => {
   recipeProvenance: recipeProvenanceSchema,
   storage: storageSchema,
 }).superRefine((data, ctx) => {
+  const toolCallingError = getDynamoToolCallingError(data);
+  if (toolCallingError) ctx.addIssue({ code: 'custom', message: toolCallingError, path: ['toolCalling'] });
   if (data.providerOverrides?.intent !== undefined || isDynamoIntent(data.provider, data.providerOverrides)) {
     if (data.provider !== 'dynamo') {
       ctx.addIssue({ code: 'custom', message: 'Automatic configuration requires the Dynamo provider', path: ['provider'] });

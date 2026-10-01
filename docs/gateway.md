@@ -2,6 +2,15 @@
 
 > **Pinned versions:** the `GAIE_VERSION` referenced in this document is sourced from [`/versions.env`](https://github.com/ai-runway/airunway/blob/main/versions.env) at the repo root. Substitute that value (currently `v1.5.0`) when running the commands below, or `source` the file in your shell: `set -a; source versions.env; set +a`.
 
+### Stable access for automatically configured models
+
+Connect agents and external clients to the gateway endpoint and the model name
+published in `ModelDeployment.status.gateway`. Do not bind them to a generated
+Dynamo frontend Service name containing the profiling request hash. Runway
+updates the model route when a replacement workload becomes ready, so a backend
+name change does not require changing the client's base URL. Replacement may
+still interrupt service; a stable endpoint is not a zero-downtime guarantee.
+
 ## Overview
 
 AI Runway integrates with the [Gateway API Inference Extension](https://github.com/kubernetes-sigs/gateway-api-inference-extension) to provide a unified inference gateway. Instead of accessing each model's Service individually, you deploy a single Gateway and call **all** models through one endpoint using the standard OpenAI-compatible API. The Gateway routes requests to the correct model based on the `model` field in the request body.

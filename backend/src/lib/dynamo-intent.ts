@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { DYNAMO_ATTEMPT_ANNOTATION, type ModelDeployment, type DynamoReconfigureRequest } from '@airunway/shared';
+import { DYNAMO_ATTEMPT_ANNOTATION, DYNAMO_PARSER_IDENTIFIER, getDynamoToolCallingError, type ModelDeployment, type DynamoReconfigureRequest } from '@airunway/shared';
 import { HTTPException } from 'hono/http-exception';
 
 const positive = () => z.number().finite().positive();
@@ -91,12 +91,23 @@ export const dynamoOverridesSchema = z.object({
   intent: dynamoIntentSchema,
 }).strict();
 
+const parserSchema = z.string().min(1).max(64).regex(DYNAMO_PARSER_IDENTIFIER)
+  .refine(value => value !== 'auto', 'Omit the parser or use null to clear it, not "auto"')
+  .refine(value => value !== 'none', 'Dynamo has no "none" parser disable value; omit the parser or use null for model defaults');
+
 export const dynamoReconfigureSchema = z.object({
   resourceVersion: z.string().min(1).max(256),
   intent: dynamoIntentSchema.optional(),
   modelId: z.string().trim().min(1).max(512).optional(),
   engine: z.enum(['vllm', 'sglang', 'trtllm']).optional(),
-}).strict();
+  toolCalling: z.boolean().optional(),
+  toolCallParser: parserSchema.nullable().optional(),
+  reasoningParser: parserSchema.nullable().optional(),
+}).strict().superRefine((data, ctx) => {
+  if (data.toolCalling === false && (data.toolCallParser != null || data.reasoningParser != null)) {
+    ctx.addIssue({ code: 'custom', message: 'Parser fields require toolCalling=true', path: ['toolCalling'] });
+  }
+});
 
 /** Prepare one optimistic update. Never retry a stale read or drop unrelated fields. */
 export function reconfigureDynamoDeployment(
@@ -135,6 +146,17 @@ export function reconfigureDynamoDeployment(
   next.spec.provider!.overrides = overrides;
   if (request.modelId !== undefined) next.spec.model.id = request.modelId;
   if (request.engine !== undefined) next.spec.engine.type = request.engine;
+  if (request.toolCalling !== undefined) next.spec.engine.toolCalling = request.toolCalling;
+  for (const field of ['toolCallParser', 'reasoningParser'] as const) {
+    if (request.toolCalling === false || request[field] === null) delete next.spec.engine[field];
+    else if (request[field] !== undefined) next.spec.engine[field] = request[field];
+  }
+  const toolCallingError = getDynamoToolCallingError({
+    ...next.spec.engine, modelId: next.spec.model.id, engine: next.spec.engine.type,
+    provider: next.spec.provider?.name, providerOverrides: next.spec.provider?.overrides,
+    engineArgs: next.spec.engine.args, engineExtraArgs: next.spec.engine.extraArgs, env: next.spec.env,
+  }, next.status?.provider?.name);
+  if (toolCallingError) throw new HTTPException(422, { message: toolCallingError });
   delete next.spec.resources;
   delete next.spec.scaling;
   delete next.spec.serving;

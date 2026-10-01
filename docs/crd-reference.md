@@ -60,6 +60,9 @@ spec:
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `type` | string | no | Engine type: `vllm`, `sglang`, `trtllm`, or `llamacpp`. If omitted, the controller auto-selects from provider capabilities. |
+| `toolCalling` | bool | no | Enable Dynamo-native tool parsing in manual or automatic configuration. Known Qwen3 IDs have parser defaults; unknown models require `toolCallParser`. Currently Dynamo-only. |
+| `toolCallParser` | string | no | Explicit Dynamo-native tool parser. Requires `toolCalling: true`. Must be a lowercase identifier of at most 64 characters. |
+| `reasoningParser` | string | no | Reasoning parser override when tool calling is enabled. Omit for model defaults. Dynamo has no `none` disable value. Same identifier rules as `toolCallParser`. |
 | `image` | string | no | Engine-specific container image override. This is the preferred field for Direct vLLM and custom vLLM OpenAI-compatible server images. |
 | `contextLength` | int | no | Maximum context length. Providers map this to engine-specific flags such as vLLM `--max-model-len`. |
 | `trustRemoteCode` | bool | no | Allows remote HuggingFace model code execution when supported by the engine. |
@@ -167,6 +170,23 @@ For automatic Dynamo deployments, `requestRef` identifies the DGDR and
 `workloadRef` identifies the generated DGD. `intent` contains `phase`,
 `profilingPhase`, `inputHash`, and the accepted `attempt` token. These fields are
 controller-owned status, not configuration users should populate.
+
+The same intent status also exposes:
+
+| Field | Description |
+|---|---|
+| `hardware.gpuSku`, `hardware.vramMb`, `hardware.numGpusPerNode` | Known upstream hardware values. Memory uses MiB; only exact integral values are reported. Unknown values are omitted. |
+| `hardware.source` | `provided`, `discovered`, or `mixed`, compared with the original request. Discovery is not a guarantee that the profiler supports the GPU. |
+| `plan.source` | `selectedConfig` for the profiler's selected graph, or `workload` for a fallback summary of the serving workload. |
+| `plan.engine`, `plan.servingMode` | Known engine and serving layout from that graph. |
+| `plan.workers[]` | Up to 32 workers with `name`, optional `role`, `replicas`, `gpusPerReplica`, `tensorParallelism`, and `pipelineParallelism`. Unknown or ambiguous values are omitted. |
+| `diagnostic` | Actionable hint for a recognized upstream failure; it does not replace the original status message. |
+
+No candidate count, alternative ranking, performance estimate, or percentage
+complete is inferred from the selected graph. Tool-calling settings are included
+in the immutable profiling input identity. Change the attempt token or use
+Reconfigure to change parser settings on an active request.
+
 
 See [Dynamo deployment modes](providers.md#dynamo-deployment-modes) for typed intent
 inputs and explicit reconfiguration semantics.

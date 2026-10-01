@@ -1,5 +1,6 @@
 import { getDynamoIntent, isDynamoIntent, type DynamoIntent } from './dynamo';
 import { Engine } from './model';
+import type { DynamoToolCallingConfig } from './dynamo-tool-calling';
 
 // ==================== ModelDeployment CRD Types ====================
 // These types mirror the Go CRD types in controller/api/v1alpha1/
@@ -46,7 +47,7 @@ export interface RecipeProvenance {
   revision?: string;
 }
 
-export interface DeploymentConfig {
+export interface DeploymentConfig extends DynamoToolCallingConfig {
   name: string;
   namespace: string;
   modelId: string;
@@ -98,7 +99,7 @@ export interface ProviderSpec {
   overrides?: Record<string, unknown>;
 }
 
-export interface EngineSpec {
+export interface EngineSpec extends DynamoToolCallingConfig {
   type: EngineType;
   image?: string;
   contextLength?: number;
@@ -200,6 +201,26 @@ export interface ProviderIntentStatus {
   profilingPhase?: string;
   inputHash?: string;
   attempt?: string;
+  hardware?: {
+    gpuSku?: string;
+    vramMb?: number;
+    numGpusPerNode?: number;
+    source?: 'provided' | 'discovered' | 'mixed';
+  };
+  plan?: {
+    source: 'selectedConfig' | 'workload';
+    engine?: string;
+    servingMode?: string;
+    workers?: Array<{
+      name: string;
+      role?: string;
+      replicas?: number;
+      gpusPerReplica?: number;
+      tensorParallelism?: number;
+      pipelineParallelism?: number;
+    }>;
+  };
+  diagnostic?: string;
 }
 
 export interface ProviderStatus {
@@ -320,7 +341,7 @@ export interface PodStatus {
   message?: string;
 }
 
-export interface DeploymentStatus {
+export interface DeploymentStatus extends DynamoToolCallingConfig {
   resourceVersion?: string;
   providerStatus?: ProviderStatus;
   configurationMode?: 'manual' | 'automatic';
@@ -605,6 +626,9 @@ export function toModelDeploymentSpec(config: DeploymentConfig): ModelDeployment
     },
     engine: {
       type: resolveEngineType(config),
+      toolCalling: config.toolCalling,
+      toolCallParser: config.toolCallParser,
+      reasoningParser: config.reasoningParser,
       contextLength: config.contextLength || config.maxModelLen,
       trustRemoteCode: config.trustRemoteCode,
       enablePrefixCaching: config.enablePrefixCaching,
@@ -727,6 +751,9 @@ export function toDeploymentStatus(md: ModelDeployment, pods: PodStatus[] = []):
     frontendNamespace: status.endpoint?.namespace || status.provider?.workloadRef?.namespace || md.metadata.namespace,
     modelId: spec.model.id,
     servedModelName: spec.model.servedName,
+    toolCalling: spec.engine?.toolCalling,
+    toolCallParser: spec.engine?.toolCallParser,
+    reasoningParser: spec.engine?.reasoningParser,
     engine: (spec.engine?.type as Engine) || (status.engine?.type as Engine) || undefined,
     mode: spec.serving?.mode || 'aggregated',
     phase: automatic ? (status.phase || 'Pending') : resolveDeploymentPhase(spec, status, pods),

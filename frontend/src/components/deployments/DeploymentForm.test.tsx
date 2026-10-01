@@ -110,7 +110,7 @@ function createRuntime(overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
       engines: ['vllm', 'sglang', 'trtllm', 'llamacpp'],
       modes: ['aggregated', 'disaggregated'],
       modelSources: ['huggingface'],
-      routerModes: ['none'],
+      routerModes: ['basic'],
       features: {},
     },
     ...overrides,
@@ -123,6 +123,79 @@ describe('DeploymentForm', () => {
     toast.mockReset()
     manifestViewerMock.mockReset()
     gatewayMock.data = { available: false }
+  })
+
+  it.each(['manual', 'automatic'])('preserves tool calling in %s create and preview payloads, and clears disabled parsers', async mode => {
+    const model = createModel({ id: 'Qwen/Qwen3-0.6B', name: 'Qwen3', size: '0.6B', parameterCount: 600_000_000, estimatedGpuMemoryGb: 2 })
+    render(<MemoryRouter><DeploymentForm model={model} runtimes={[createRuntime({ id: 'dynamo', name: 'Dynamo' })]} /></MemoryRouter>)
+    if (mode === 'automatic') fireEvent.click(screen.getByRole('radio', { name: /Automatic configuration/ }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable tool calling' }))
+    expect(screen.getByLabelText('Tool parser')).toHaveValue('')
+    expect(screen.getByLabelText('Tool parser')).toHaveAttribute('placeholder', 'hermes')
+    expect(manifestViewerMock.mock.lastCall?.[0].config.toolCallParser).toBeUndefined()
+    fireEvent.change(screen.getByLabelText('Tool parser'), { target: { value: 'custom_tool' } })
+    fireEvent.change(screen.getByLabelText('Reasoning parser'), { target: { value: 'basic' } })
+    expect(manifestViewerMock.mock.lastCall?.[0].config).toMatchObject({ toolCalling: true, toolCallParser: 'custom_tool', reasoningParser: 'basic' })
+    const form = screen.getByRole('button', { name: /Deploy Model/ }).closest('form')!
+    fireEvent.submit(form)
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1))
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({ toolCalling: true, toolCallParser: 'custom_tool', reasoningParser: 'basic' })
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable tool calling' }))
+    expect(screen.queryByLabelText('Tool parser')).not.toBeInTheDocument()
+    const disabled = manifestViewerMock.mock.lastCall?.[0].config
+    expect(disabled.toolCalling).toBe(false)
+    expect(disabled.toolCallParser).toBeUndefined()
+    expect(disabled.reasoningParser).toBeUndefined()
+    fireEvent.submit(form)
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(2))
+    expect(mutateAsync.mock.calls[1][0].toolCallParser).toBeUndefined()
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable tool calling' }))
+    expect(screen.getByLabelText('Tool parser')).toHaveValue('')
+    expect(screen.getByLabelText('Reasoning parser')).toHaveValue('')
+  })
+
+  it('blocks unknown model defaults and invalid parsers in create and preview, even through direct submit', () => {
+    render(<MemoryRouter><DeploymentForm model={createModel()} runtimes={[createRuntime({ id: 'dynamo', name: 'Dynamo' })]} /></MemoryRouter>)
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable tool calling' }))
+    const submit = screen.getByRole('button', { name: /Deploy Model/ })
+    expect(submit).toBeDisabled()
+    expect(screen.getByRole('alert')).toHaveTextContent('No automatic tool parser')
+    expect(screen.queryByTestId('manifest-preview')).not.toBeInTheDocument()
+    fireEvent.submit(submit.closest('form')!)
+    expect(mutateAsync).not.toHaveBeenCalled()
+    for (const invalid of ['auto', 'Hermes', 'tool-call']) {
+      fireEvent.change(screen.getByLabelText('Tool parser'), { target: { value: invalid } })
+      expect(submit).toBeDisabled()
+    }
+    fireEvent.change(screen.getByLabelText('Tool parser'), { target: { value: 'hermes' } })
+    expect(submit).toBeEnabled()
+    expect(screen.getByTestId('manifest-preview')).toBeInTheDocument()
+  })
+
+  it('keeps current tool settings across modes without restoring stale hidden values across providers', () => {
+    const model = createModel({ id: 'Qwen/Qwen3-0.6B', estimatedGpuMemoryGb: 2 })
+    render(<MemoryRouter><DeploymentForm model={model} runtimes={[createRuntime({ id: 'dynamo', name: 'Dynamo' }), createRuntime({ id: 'kuberay', name: 'KubeRay' })]} /></MemoryRouter>)
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable tool calling' }))
+    fireEvent.change(screen.getByLabelText('Tool parser'), { target: { value: 'manual_parser' } })
+    fireEvent.click(screen.getByRole('radio', { name: /Automatic configuration/ }))
+    expect(screen.getByLabelText('Tool parser')).toHaveValue('manual_parser')
+    fireEvent.change(screen.getByLabelText('Tool parser'), { target: { value: 'new_parser' } })
+    fireEvent.click(screen.getByRole('radio', { name: /Manual configuration/ }))
+    expect(screen.getByLabelText('Tool parser')).toHaveValue('new_parser')
+    fireEvent.click(screen.getByRole('radio', { name: /Automatic configuration/ }))
+    fireEvent.click(screen.getByText('KubeRay').closest('[role="radio"]')!)
+    expect(screen.queryByRole('checkbox', { name: 'Enable tool calling' })).not.toBeInTheDocument()
+    expect(manifestViewerMock.mock.lastCall?.[0].config.toolCalling).toBeUndefined()
+    expect(manifestViewerMock.mock.lastCall?.[0].config.toolCallParser).toBeUndefined()
+    fireEvent.click(screen.getByText('Dynamo').closest('[role="radio"]')!)
+    expect(screen.getByRole('checkbox', { name: 'Enable tool calling' })).not.toBeChecked()
+    fireEvent.click(screen.getByRole('radio', { name: /Automatic configuration/ }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable tool calling' }))
+    expect(screen.getByLabelText('Tool parser')).toHaveValue('')
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable tool calling' }))
+    fireEvent.click(screen.getByRole('radio', { name: /Manual configuration/ }))
+    expect(manifestViewerMock.mock.lastCall?.[0].config.toolCalling).toBe(false)
+    expect(manifestViewerMock.mock.lastCall?.[0].config.toolCallParser).toBeUndefined()
   })
 
   it.each([

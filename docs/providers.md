@@ -98,7 +98,7 @@ latency targets. Do not specify manual resources or replica counts: Dynamo choos
 the topology and allocation within the profiling budget.
 
 ```yaml
-# Requires Dynamo 1.5 with native beta DGD overrides and args append support.
+# Supports Dynamo 1.1.1 and 1.5 native tool parsing.
 # GPU discovery and the installation's profiler credentials must be available.
 apiVersion: airunway.ai/v1alpha1
 kind: ModelDeployment
@@ -111,6 +111,7 @@ spec:
     source: huggingface
   engine:
     type: vllm
+    toolCalling: true
   provider:
     name: dynamo
     overrides:
@@ -122,24 +123,6 @@ spec:
         overrides:
           profilingJob:
             activeDeadlineSeconds: 1800
-          dgd:
-            apiVersion: nvidia.com/v1beta1
-            kind: DynamoGraphDeployment
-            spec:
-              components:
-                - name: VllmDecodeWorker
-                  podTemplate:
-                    spec:
-                      containers:
-                        - name: main
-                          # Keep generated launch arguments and add the Qwen3 parsers.
-                          $patch:
-                            args: append
-                          args:
-                            - --dyn-tool-call-parser
-                            - hermes
-                            - --dyn-reasoning-parser
-                            - qwen3
         workload:
           isl: 1024
           osl: 256
@@ -150,6 +133,35 @@ spec:
   gateway:
     enabled: true
 ```
+
+For a tool-calling model, set `engine.toolCalling: true`. The same setting works
+in manual Dynamo deployments. Runway resolves native parser defaults for known
+Qwen3 model IDs and passes them through graph-level environment variables, so
+no generated worker name or argument patch is needed:
+
+| Model ID prefix | Tool parser | Reasoning parser |
+|---|---|---|
+| `Qwen/Qwen3-Coder` | `qwen3_coder` | Not set by Runway |
+| `Qwen/Qwen3.5-` | `qwen3_coder` | `qwen3` |
+| `Qwen/Qwen3-` | `hermes` | `qwen3` |
+
+Matching is case-insensitive and checks the more specific prefixes first. Other
+model IDs, including aliases and fine-tunes under another owner, require an
+explicit `engine.toolCallParser`. Use `engine.reasoningParser` to select another
+reasoning parser. Omission or clearing an override restores the model default;
+it does not unset parser configuration imported by the runtime. Dynamo has no
+`none` disable sentinel, so Runway rejects that value rather than claim it
+disables inherited parsing. Explicit parser names
+must be supported by the installed Dynamo runtime and match the model's output
+format; accepting the name does not verify model compatibility.
+
+These fields currently require Dynamo. They select Dynamo-native parsing, not
+the vLLM frontend chat-processor fallback. Do not combine them with raw parser
+or chat-processor flags or environment overrides. Admission and rendering reject
+those conflicts rather than letting a worker silently use another parser. Parser
+changes participate in the request hash and require **Reconfigure** after a
+profiling attempt starts. Existing deployments without these settings keep their
+current request hashes.
 
 The typed `intent` block is validated by admission and provider reconciliation:
 
@@ -182,6 +194,9 @@ extra `spec` block. Leave it blank to omit overrides, or clear it to remove save
 overrides. Invalid JSON or malformed root/child objects block preview, creation,
 and reconfiguration until corrected. The server checks native fields, version
 compatibility, and policy.
+
+The raw parser examples below are an alternative to `engine.toolCalling`, not
+something to combine with it.
 
 Only two optional children are accepted:
 
@@ -266,6 +281,40 @@ the gateway routes to that Service.
 Deleting a native DGDR leaves its DGD running. Deleting a Runway ModelDeployment
 instead cleans up its managed request and serving workload, using their recorded
 identities rather than treating a matching name as ownership.
+
+#### Selected configuration and hardware
+
+The deployment details page shows the current configuration step, observed
+hardware, and a selected-plan summary. These come from
+`status.provider.intent`, not from parsing profiler logs.
+
+- `hardware` reports the GPU SKU, memory in MiB, and GPUs per node available in
+  the upstream request. The source is `provided`, `discovered`, or `mixed`
+  relative to the original request. Discovered values may be inferred by Dynamo;
+  they are not measurements performed by Runway.
+- `plan` summarizes `profilingResults.selectedConfig`, or the serving workload
+  when that output is unavailable. It lists known worker roles, replica counts,
+  GPUs per replica, and explicitly represented parallelism. Unknown values stay
+  absent. A replacement profiling attempt clears the previous summary.
+- `diagnostic` adds an actionable hint only when an upstream failure identifies
+  a discovery or profiler-support problem. The original status message remains
+  available.
+
+Dynamo tries DCGM discovery and then node labels. The node-label path requires
+`nvidia.com/gpu.product`, `nvidia.com/gpu.count`, and `nvidia.com/gpu.memory`.
+A product label such as `NVIDIA-A100-80GB-PCIe` alone is insufficient. Check those
+prerequisites and the operator's access before supplying explicit hardware.
+Runway's capacity display has different fallbacks, so a visible GPU count does
+not prove Dynamo discovery can succeed.
+
+Keep the actual GPU identity. `a100_pcie` and `a100_sxm` are not interchangeable
+performance profiles. Hardware discovery succeeding does not establish that the
+profiler has performance data for that model, backend, and GPU. Unsupported rapid
+search combinations may use a fallback whose SLA is unverified.
+
+Dynamo 1.5 exposes the selected graph but not a candidate count or a ranked
+performance comparison in DGDR status. Runway does not invent those estimates,
+parse ANSI tables, or present one short request as a throughput benchmark.
 
 #### Manual configuration and legacy overrides
 
