@@ -20,6 +20,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"math"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -34,6 +36,7 @@ import (
 
 	airunwayv1alpha1 "github.com/ai-runway/airunway/controller/api/v1alpha1"
 	"github.com/ai-runway/airunway/controller/internal/validation"
+	"github.com/ai-runway/airunway/controller/pkg/dynamointent"
 )
 
 const (
@@ -83,6 +86,10 @@ func (d *ModelDeploymentCustomDefaulter) Default(_ context.Context, obj *airunwa
 	modeldeploymentlog.Info("Defaulting for ModelDeployment", "name", obj.GetName())
 
 	spec := &obj.Spec
+	intent, err := dynamointent.Parse(obj)
+	if err != nil {
+		return err
+	}
 
 	// Default model source to huggingface
 	if spec.Model.Source == "" {
@@ -99,7 +106,7 @@ func (d *ModelDeploymentCustomDefaulter) Default(_ context.Context, obj *airunwa
 	}
 
 	// Default scaling replicas to 1 for aggregated mode
-	if spec.Serving.Mode == airunwayv1alpha1.ServingModeAggregated {
+	if intent == nil && spec.Serving.Mode == airunwayv1alpha1.ServingModeAggregated {
 		if spec.Scaling == nil {
 			spec.Scaling = &airunwayv1alpha1.ScalingSpec{
 				Replicas: 1,
@@ -115,7 +122,7 @@ func (d *ModelDeploymentCustomDefaulter) Default(_ context.Context, obj *airunwa
 	// - engine is not specified (auto-selection will determine GPU requirements)
 	// - engine is llamacpp (supports CPU-only inference)
 	// - the user provided a custom image (may not need GPU)
-	if spec.Serving.Mode == airunwayv1alpha1.ServingModeAggregated && spec.Resources == nil &&
+	if intent == nil && spec.Serving.Mode == airunwayv1alpha1.ServingModeAggregated && spec.Resources == nil &&
 		spec.Engine.Type != "" && spec.Engine.Type != airunwayv1alpha1.EngineTypeLlamaCpp &&
 		spec.Image == "" {
 		spec.Resources = &airunwayv1alpha1.ResourceSpec{
@@ -235,6 +242,10 @@ func (v *ModelDeploymentCustomValidator) ValidateUpdate(ctx context.Context, old
 	warnings = append(warnings, specWarnings...)
 	allErrs = append(allErrs, specErrs...)
 
+	if err := dynamointent.ValidateUpdate(oldObj, newObj); err != nil {
+		allErrs = append(allErrs, field.Forbidden(field.NewPath("spec", "provider", "overrides"), err.Error()))
+	}
+
 	// Validate immutable fields (identity fields that trigger delete+recreate)
 	allErrs = append(allErrs, v.validateImmutableFields(oldObj, newObj)...)
 
@@ -261,6 +272,11 @@ func (v *ModelDeploymentCustomValidator) validateSpec(ctx context.Context, obj *
 	var allErrs field.ErrorList
 	spec := &obj.Spec
 	specPath := field.NewPath("spec")
+	if err := dynamointent.ValidateToolCalling(obj); err != nil {
+		allErrs = append(allErrs, field.Invalid(specPath.Child("engine", "toolCalling"), spec.Engine.ToolCalling, err.Error()))
+	} else if err := dynamointent.Validate(obj); err != nil {
+		allErrs = append(allErrs, field.Invalid(specPath.Child("provider", "overrides", "intent"), "<intent>", err.Error()))
+	}
 
 	// Validate image override fields are not conflicting.
 	if err := spec.ValidateImageFields(); err != nil {
@@ -386,10 +402,7 @@ func (v *ModelDeploymentCustomValidator) validateSpec(ctx context.Context, obj *
 				spec.Provider.Name, err,
 			))
 		case providerConfig.Spec.Capabilities != nil:
-			gpuCount := int32(0)
-			if spec.Resources != nil && spec.Resources.GPU != nil {
-				gpuCount = spec.Resources.GPU.Count
-			}
+			gpuCount := dynamointent.GPUCount(obj)
 			for _, ce := range validation.CheckProviderCompatibility(
 				spec.Provider.Name,
 				&providerConfig,
@@ -529,9 +542,10 @@ func (v *ModelDeploymentCustomValidator) validateImmutableFields(oldObj, newObj 
 
 	oldSpec := &oldObj.Spec
 	newSpec := &newObj.Spec
+	reconfigure := dynamointent.Enabled(oldObj) && dynamointent.Enabled(newObj) && oldObj.Annotations[dynamointent.AttemptAnnotation] != newObj.Annotations[dynamointent.AttemptAnnotation]
 
 	// model.id is an identity field
-	if oldSpec.Model.ID != newSpec.Model.ID {
+	if !reconfigure && oldSpec.Model.ID != newSpec.Model.ID {
 		allErrs = append(allErrs, field.Invalid(
 			specPath.Child("model", "id"),
 			newSpec.Model.ID,
@@ -549,7 +563,7 @@ func (v *ModelDeploymentCustomValidator) validateImmutableFields(oldObj, newObj 
 	}
 
 	// engine.type is an identity field (once set)
-	if oldSpec.Engine.Type != "" && newSpec.Engine.Type != "" && oldSpec.Engine.Type != newSpec.Engine.Type {
+	if !reconfigure && oldSpec.Engine.Type != "" && newSpec.Engine.Type != "" && oldSpec.Engine.Type != newSpec.Engine.Type {
 		allErrs = append(allErrs, field.Invalid(
 			specPath.Child("engine", "type"),
 			newSpec.Engine.Type,
@@ -1004,7 +1018,8 @@ func (v *ModelDeploymentCustomValidator) validateOverrides(spec *airunwayv1alpha
 
 	providerOverridesPath := specPath.Child("provider", "overrides")
 	allErrs = append(allErrs, checkBlockedKeys(overrideMap, providerOverridesPath)...)
-	allErrs = append(allErrs, checkSizingOverrideKeys(overrideMap, providerOverridesPath)...)
+	allowIntentDGDSizing := spec.Provider.Name == "dynamo" && overrideMap["deploymentMode"] == "intent"
+	allErrs = append(allErrs, checkSizingOverrideKeys(overrideMap, providerOverridesPath, allowIntentDGDSizing)...)
 
 	return allErrs
 }
@@ -1027,12 +1042,25 @@ func checkBlockedKeys(m map[string]interface{}, fldPath *field.Path) field.Error
 	})
 }
 
-// checkSizingOverrideKeys recursively walks provider overrides and rejects
-// fields that would let raw provider overrides bypass resource/replica ceilings.
-func checkSizingOverrideKeys(m map[string]interface{}, fldPath *field.Path) field.ErrorList {
-	allErrs := checkForbiddenOverrideKeys(m, fldPath, sizingOverrideKeys, func(key string) string {
+// checkSizingOverrideKeys recursively walks provider overrides and rejects fields
+// that would let raw provider overrides bypass resource/replica ceilings. Dynamo
+// intent mode may customize its embedded DGD after those values are validated.
+func checkSizingOverrideKeys(m map[string]any, fldPath *field.Path, allowIntentDGD bool) field.ErrorList {
+	checkedOverrides := m
+	var allErrs field.ErrorList
+	if allowIntentDGD {
+		if dgdSpec, found := intentDGDOverrideSpec(m); found {
+			checkedOverrides = withoutIntentDGDOverrideSpec(m)
+			allErrs = append(allErrs, validateIntentDGDOverrideSizing(
+				dgdSpec,
+				fldPath.Child("spec", "overrides", "dgd", "spec"),
+			)...)
+		}
+	}
+
+	allErrs = append(allErrs, checkForbiddenOverrideKeys(checkedOverrides, fldPath, sizingOverrideKeys, func(key string) string {
 		return fmt.Sprintf("overriding %q is not allowed because it can bypass admission resource limits; use spec.resources / spec.scaling instead", key)
-	})
+	})...)
 
 	// KAITO names its replica field resource.count rather than replicas. Keep this
 	// check path-specific: other count fields in provider-specific configuration do
@@ -1047,6 +1075,146 @@ func checkSizingOverrideKeys(m map[string]interface{}, fldPath *field.Path) fiel
 	}
 
 	return allErrs
+}
+
+func intentDGDOverrideSpec(overrides map[string]any) (map[string]any, bool) {
+	spec, ok := overrides["spec"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	dgdrOverrides, ok := spec["overrides"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	dgd, ok := dgdrOverrides["dgd"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	dgdSpec, ok := dgd["spec"].(map[string]any)
+	return dgdSpec, ok
+}
+
+func withoutIntentDGDOverrideSpec(overrides map[string]any) map[string]any {
+	result := cloneOverrideMap(overrides)
+	spec := cloneOverrideMap(result["spec"].(map[string]any))
+	dgdrOverrides := cloneOverrideMap(spec["overrides"].(map[string]any))
+	dgd := cloneOverrideMap(dgdrOverrides["dgd"].(map[string]any))
+	delete(dgd, "spec")
+	dgdrOverrides["dgd"] = dgd
+	spec["overrides"] = dgdrOverrides
+	result["spec"] = spec
+	return result
+}
+
+func cloneOverrideMap(source map[string]any) map[string]any {
+	clone := make(map[string]any, len(source))
+	maps.Copy(clone, source)
+	return clone
+}
+
+func validateIntentDGDOverrideSizing(dgdSpec map[string]any, fldPath *field.Path) field.ErrorList {
+	var allErrs field.ErrorList
+	for key, value := range dgdSpec {
+		valuePath := fldPath.Child(key)
+		switch key {
+		case "replicas":
+			allErrs = append(allErrs, validateIntentDGDReplicas(value, valuePath)...)
+		case "resources":
+			allErrs = append(allErrs, validateIntentDGDResources(value, valuePath)...)
+		default:
+			allErrs = append(allErrs, validateIntentDGDOverrideSizingValue(value, valuePath)...)
+		}
+	}
+	return allErrs
+}
+
+func validateIntentDGDOverrideSizingValue(value any, fldPath *field.Path) field.ErrorList {
+	switch typedValue := value.(type) {
+	case map[string]any:
+		return validateIntentDGDOverrideSizing(typedValue, fldPath)
+	case []any:
+		var allErrs field.ErrorList
+		for index, item := range typedValue {
+			allErrs = append(allErrs, validateIntentDGDOverrideSizingValue(item, fldPath.Index(index))...)
+		}
+		return allErrs
+	default:
+		return nil
+	}
+}
+
+func validateIntentDGDReplicas(value any, fldPath *field.Path) field.ErrorList {
+	replicas, ok := value.(float64)
+	if !ok || math.Trunc(replicas) != replicas {
+		return field.ErrorList{field.Invalid(fldPath, value, "must be an integer")}
+	}
+	if replicas > MaxReplicas {
+		return field.ErrorList{field.Invalid(
+			fldPath,
+			value,
+			fmt.Sprintf("exceeds maximum allowed (%d)", MaxReplicas),
+		)}
+	}
+	return nil
+}
+
+func validateIntentDGDResources(value any, fldPath *field.Path) field.ErrorList {
+	resources, ok := value.(map[string]any)
+	if !ok {
+		return field.ErrorList{field.Invalid(fldPath, value, "must be an object")}
+	}
+
+	allErrs := validateIntentDGDResourceList(resources, fldPath)
+	for _, listName := range []string{"limits", "requests"} {
+		if resourceList, found := resources[listName].(map[string]any); found {
+			allErrs = append(allErrs, validateIntentDGDResourceList(resourceList, fldPath.Child(listName))...)
+		}
+	}
+	return allErrs
+}
+
+func validateIntentDGDResourceList(resources map[string]any, fldPath *field.Path) field.ErrorList {
+	var allErrs field.ErrorList
+	for resourceName, value := range resources {
+		valueString := fmt.Sprint(value)
+		valuePath := fldPath.Child(resourceName)
+		switch {
+		case resourceName == "cpu":
+			allErrs = append(allErrs, validateResourceQuantity(valueString, MaxCPU, valuePath)...)
+		case resourceName == "memory":
+			allErrs = append(allErrs, validateResourceQuantity(valueString, MaxMemory, valuePath)...)
+		case isIntentDGDGPUResource(resourceName):
+			allErrs = append(allErrs, validateIntentDGDGPUQuantity(valueString, valuePath)...)
+		case resourceName == "custom":
+			// Alpha ResourceList stores native extended resources under custom.
+			if custom, ok := value.(map[string]any); ok {
+				allErrs = append(allErrs, validateIntentDGDResourceList(custom, valuePath)...)
+			}
+		}
+	}
+	return allErrs
+}
+
+// GPU partitions and shared devices are still integer-count accelerators. Match
+// the supported vendor forms without imposing GPU policy on other resources.
+func isIntentDGDGPUResource(name string) bool {
+	return name == "gpu" || strings.HasSuffix(name, "/gpu") ||
+		name == "nvidia.com/gpu.shared" || strings.HasPrefix(name, "nvidia.com/mig-") ||
+		name == "gpu.intel.com/i915" || name == "gpu.intel.com/xe"
+}
+
+func validateIntentDGDGPUQuantity(value string, fldPath *field.Path) field.ErrorList {
+	quantity, err := resource.ParseQuantity(value)
+	if err != nil {
+		return field.ErrorList{field.Invalid(fldPath, value, "invalid resource quantity")}
+	}
+	if quantity.Cmp(*resource.NewQuantity(MaxGPUCount, resource.DecimalSI)) > 0 {
+		return field.ErrorList{field.Invalid(fldPath, value, fmt.Sprintf("exceeds maximum allowed (%d)", MaxGPUCount))}
+	}
+	if quantity.Sign() < 0 || quantity.Cmp(*resource.NewQuantity(quantity.Value(), resource.DecimalSI)) != 0 {
+		return field.ErrorList{field.Invalid(fldPath, value, "must be a nonnegative integer GPU count")}
+	}
+	return nil
 }
 
 // checkForbiddenOverrideKeys recursively walks an unmarshalled JSON object and

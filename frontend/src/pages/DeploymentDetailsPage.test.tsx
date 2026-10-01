@@ -113,7 +113,7 @@ describe('DeploymentDetailsPage chat panel', () => {
     toastMock.mockReset()
   })
 
-  it('shows chat only for running deployments with a frontend service', () => {
+  it('shows direct-service chat only for running deployments with an endpoint', () => {
     const running = renderDetailsPage()
     expect(screen.getByRole('heading', { name: 'Chat with model' })).toBeInTheDocument()
     running.unmount()
@@ -123,9 +123,45 @@ describe('DeploymentDetailsPage chat panel', () => {
     expect(screen.queryByRole('heading', { name: 'Chat with model' })).not.toBeInTheDocument()
     pending.unmount()
 
-    deploymentMock.current = createDeployment({ frontendService: undefined })
+    deploymentMock.current = createDeployment({ frontendService: undefined, gateway: undefined })
     renderDetailsPage()
     expect(screen.queryByRole('heading', { name: 'Chat with model' })).not.toBeInTheDocument()
+  })
+
+  it('shows and enables gateway-only chat without suggesting a fake direct service', async () => {
+    deploymentMock.current = createDeployment({ provider: 'dynamo', frontendService: undefined })
+    chatMock.mockResolvedValue(streamResponse([
+      'data: {"choices":[{"delta":{"content":"Hello from gateway"}}]}\n\n',
+      'data: [DONE]\n\n',
+    ]))
+    renderDetailsPage()
+
+    expect(screen.getByRole('heading', { name: 'Chat with model' })).toBeInTheDocument()
+    expect(screen.getByLabelText('Message')).not.toBeDisabled()
+    expect(screen.getByRole('button', { name: /send/i })).toBeDisabled()
+    expect(screen.queryByText(/kubectl port-forward/)).not.toBeInTheDocument()
+    await userEvent.type(screen.getByLabelText('Message'), 'Hello')
+    expect(screen.getByRole('button', { name: /send/i })).not.toBeDisabled()
+    await userEvent.click(screen.getByRole('button', { name: /send/i }))
+
+    expect(await screen.findByText('Hello from gateway')).toBeInTheDocument()
+    expect(chatMock).toHaveBeenCalledWith(
+      deploymentMock.current.name,
+      { messages: [{ role: 'user', content: 'Hello' }] },
+      deploymentMock.current.namespace,
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    )
+  })
+
+  it.each([
+    { phase: 'Pending' as const },
+    { gateway: undefined },
+    { gateway: { endpoint: '' } },
+  ])('hides gateway-only chat when the deployment or endpoint is unavailable: %o', overrides => {
+    deploymentMock.current = createDeployment({ provider: 'dynamo', frontendService: undefined, ...overrides })
+    renderDetailsPage()
+    expect(screen.queryByRole('heading', { name: 'Chat with model' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /send/i })).not.toBeInTheDocument()
   })
 
   it('renders the empty transcript as a hint instead of an input-like box', () => {

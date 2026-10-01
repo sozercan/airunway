@@ -79,11 +79,315 @@ The Web UI backend reads provider information (capabilities, installation steps,
 
 | Provider      | Upstream CRD          | Status      | Shim YAML | Description                                                                    |
 | ------------- | --------------------- | ----------- | --------- | ------------------------------------------------------------------------------ |
-| NVIDIA Dynamo | DynamoGraphDeployment | ✅ Available | [dynamo.yaml](https://github.com/ai-runway/airunway/blob/main/providers/dynamo/deploy/dynamo.yaml) | High-performance GPU inference with KV-cache routing and disaggregated serving |
+| NVIDIA Dynamo | DynamoGraphDeployment / DynamoGraphDeploymentRequest | ✅ Available | [dynamo.yaml](https://github.com/ai-runway/airunway/blob/main/providers/dynamo/deploy/dynamo.yaml) | High-performance GPU inference with KV-cache routing, intent-based profiling and disaggregated serving|
 | KubeRay       | RayService            | ✅ Available | [kuberay.yaml](https://github.com/ai-runway/airunway/blob/main/providers/kuberay/deploy/kuberay.yaml) | Ray-based distributed inference with autoscaling                               |
 | KAITO         | Workspace             | ✅ Available | [kaito.yaml](https://github.com/ai-runway/airunway/blob/main/providers/kaito/deploy/kaito.yaml) | Flexible inference with vLLM (GPU) or llama.cpp (CPU/GPU)                      |
 | llm-d         | none                  | ✅ Available | [llmd.yaml](https://github.com/ai-runway/airunway/blob/main/providers/llmd/deploy/llmd.yaml) | Flexible inference with vLLM (GPU) with KV-cache routing and disaggregated serving |
 | Direct vLLM   | Deployment            | ✅ Available | [vllm.yaml](https://github.com/ai-runway/airunway/blob/main/providers/vllm/deploy/vllm.yaml) | Direct vLLM OpenAI-compatible server deployments using `spec.engine.image`; see [Direct vLLM guide](providers/vllm.md) |
+
+### Dynamo deployment modes
+
+Dynamo supports manual configuration through `DynamoGraphDeployment` (DGD) and
+automatic configuration through `DynamoGraphDeploymentRequest` (DGDR). Both are
+managed through `ModelDeployment`. The web UI exposes the same two modes.
+
+#### Automatic configuration
+
+Specify the model, backend, total GPU budget, expected traffic, and optional
+latency targets. Do not specify manual resources or replica counts: Dynamo chooses
+the topology and allocation within the profiling budget.
+
+```yaml
+# Supports Dynamo 1.1.1 and 1.5 native tool parsing.
+# GPU discovery and the installation's profiler credentials must be available.
+apiVersion: airunway.ai/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: qwen-auto
+  namespace: default
+spec:
+  model:
+    id: Qwen/Qwen3-0.6B
+    source: huggingface
+  engine:
+    type: vllm
+    toolCalling: true
+  provider:
+    name: dynamo
+    overrides:
+      deploymentMode: intent
+      intent:
+        hardware:
+          totalGpus: 1
+        searchStrategy: rapid
+        overrides:
+          profilingJob:
+            activeDeadlineSeconds: 1800
+        workload:
+          isl: 1024
+          osl: 256
+          requestRate: 1
+        sla:
+          ttft: 1000
+          itl: 50
+  gateway:
+    enabled: true
+```
+
+For a tool-calling model, set `engine.toolCalling: true`. The same setting works
+in manual Dynamo deployments. Runway resolves native parser defaults for known
+Qwen3 model IDs and passes them through graph-level environment variables, so
+no generated worker name or argument patch is needed:
+
+| Model ID prefix | Tool parser | Reasoning parser |
+|---|---|---|
+| `Qwen/Qwen3-Coder` | `qwen3_coder` | Not set by Runway |
+| `Qwen/Qwen3.5-` | `qwen3_coder` | `qwen3` |
+| `Qwen/Qwen3-` | `hermes` | `qwen3` |
+
+Matching is case-insensitive and checks the more specific prefixes first. Other
+model IDs, including aliases and fine-tunes under another owner, require an
+explicit `engine.toolCallParser`. Use `engine.reasoningParser` to select another
+reasoning parser. Omission or clearing an override restores the model default;
+it does not unset parser configuration imported by the runtime. Dynamo has no
+`none` disable sentinel, so Runway rejects that value rather than claim it
+disables inherited parsing. Explicit parser names
+must be supported by the installed Dynamo runtime and match the model's output
+format; accepting the name does not verify model compatibility.
+
+These fields currently require Dynamo. They select Dynamo-native parsing, not
+the vLLM frontend chat-processor fallback. Do not combine them with raw parser
+or chat-processor flags or environment overrides. Admission and rendering reject
+those conflicts rather than letting a worker silently use another parser. Parser
+changes participate in the request hash and require **Reconfigure** after a
+profiling attempt starts. Existing deployments without these settings keep their
+current request hashes.
+
+The typed `intent` block is validated by admission and provider reconciliation:
+
+- `hardware.totalGpus` is a required budget from 1 through 64. Optional `gpuSku`,
+  `vramMb`, and `numGpusPerNode` supply hardware information when discovery is not
+  available. This budget does not reserve GPUs in the cluster.
+- `workload.isl` and `osl` are positive token counts. Use `requestRate` or
+  `concurrency`, not both.
+- `sla.ttft` and `itl` are millisecond targets. Alternatively specify `e2eLatency`.
+  Targets must be positive and end-to-end latency cannot be combined with the
+  other targets.
+- The initial typed workflow supports `searchStrategy: rapid` and submits
+  `autoApply: true`. Real-GPU thorough searches, Planner controls, and
+  review-before-apply are not exposed by this workflow.
+- The installed operator supplies its matching profiler image. Ensure GPU
+  discovery is available, or supply complete hardware information. Upstream's
+  default profiler expects a namespace-local `hf-token-secret` with an `HF_TOKEN`
+  key.
+
+Rapid profiling uses performance estimates and can fall back to a basic
+configuration. A generated configuration or healthy deployment is not proof that
+it meets the requested performance targets.
+
+#### Advanced automatic configuration
+
+The web UI's **Advanced configuration** JSON field is available in Automatic
+configuration and in Reconfigure. Enter the contents of
+`spec.provider.overrides.intent.overrides`, not a whole ModelDeployment or an
+extra `spec` block. Leave it blank to omit overrides, or clear it to remove saved
+overrides. Invalid JSON or malformed root/child objects block preview, creation,
+and reconfiguration until corrected. The server checks native fields, version
+compatibility, and policy.
+
+The raw parser examples below are an alternative to `engine.toolCalling`, not
+something to combine with it.
+
+Only two optional children are accepted:
+
+- `profilingJob`, an object with native profiling-job settings. The example above
+  sets `activeDeadlineSeconds: 1800`.
+- `dgd`, a partial versioned `DynamoGraphDeployment` with `apiVersion`, `kind`, a
+  `spec` object, and optional `metadata`. Use the shape for your Dynamo version.
+
+| DGD API version | Override shape | Runtime |
+| --- | --- | --- |
+| `nvidia.com/v1alpha1` | `spec.services.<name>.extraPodSpec.mainContainer` | Legacy 1.1.1 contract |
+| `nvidia.com/v1beta1` | `spec.components[]` with named entries, then `podTemplate.spec.containers[]` | Dynamo 1.5 contract; not supported on 1.1.1 |
+
+For Dynamo 1.5, use the native beta shape shown in the complete Qwen3 example
+above. Names are case-sensitive and must match generated components and
+containers. `VllmDecodeWorker` and `main` select the generated vLLM worker and its
+container. Beta components, containers, and container environment variables merge
+by `name`. Container `args` normally replaces the generated argument list. To
+keep the generated launch arguments, put `$patch: {args: append}` on the named
+container alongside a non-empty `args` list. The target container must already
+have generated arguments. Runway preserves this directive for Dynamo to process.
+
+The alpha DGD API uses a service map and appends worker arguments:
+
+```yaml
+# Contents of spec.provider.overrides.intent.overrides for the alpha DGD API.
+dgd:
+  apiVersion: nvidia.com/v1alpha1
+  kind: DynamoGraphDeployment
+  spec:
+    services:
+      VllmDecodeWorker:
+        extraPodSpec:
+          mainContainer:
+            args:
+              - --dyn-tool-call-parser
+              - hermes
+              - --dyn-reasoning-parser
+              - qwen3
+```
+
+These are targeted modifications to a generated topology, not a way to add
+workers or set a manual GPU allocation. `resources` and `replicas` keys remain
+forbidden anywhere inside typed overrides, including nested objects and arrays.
+Privileged settings such as `securityContext`, host access, and service-account
+selection are also forbidden. Keep the total GPU budget in
+`intent.hardware.totalGpus`; do not add `spec.resources` or `spec.scaling`.
+The ordinary image and argument controls remain manual-only. No new top-level
+parser fields are needed for the Qwen3 example.
+
+See the [upstream override and append contract](https://github.com/ai-dynamo/dynamo/blob/b83b1d9304ebfc624709ac46db32b1b6f1ff1615/docs/fern/pages/kubernetes/auto-deployment/auto-deploy-with-dgdr.md#optional-customize-the-generated-dgd)
+for the native merge behavior. Runway's typed-mode sizing and security restrictions
+still apply.
+
+#### Request lifecycle and explicit reconfiguration
+
+Once profiling starts, normal edits to profiling inputs, including
+`intent.overrides`, are rejected. Gateway
+changes do not restart profiling. Failed requests do not automatically rerun.
+Use the web UI's Retry or Reconfigure action to explicitly create a new request.
+Reconfiguration can interrupt service; it is not a zero-downtime migration.
+
+When a reconfiguration request supplies `intent`, it replaces the whole intent,
+not just the fields in that object. Include all desired hardware, workload,
+latency, search, and override settings. Omitting `overrides` from a replacement
+intent removes them. The UI preserves saved overrides while editing other fields;
+a retry without replacement inputs keeps the existing intent.
+
+For YAML workflows, changing the `airunway.ai/dynamo-attempt` annotation to a new
+short token explicitly starts a fresh attempt. To change profiling inputs, update
+the annotation and desired inputs together. Reapplying the same token is not a
+retry. The controller records the accepted token and input hash durably so a
+controller restart does not repeat profiling.
+
+The request and actual serving workload are tracked separately in
+`status.provider.requestRef` and `status.provider.workloadRef`, including their
+UIDs. `status.provider.intent` reports the request phase and profiling progress.
+Endpoints, serving health, pod discovery, and routing come from the generated DGD.
+When the generated topology has a frontend Service rather than an inference pool,
+the gateway routes to that Service.
+
+Deleting a native DGDR leaves its DGD running. Deleting a Runway ModelDeployment
+instead cleans up its managed request and serving workload, using their recorded
+identities rather than treating a matching name as ownership.
+
+#### Selected configuration and hardware
+
+The deployment details page shows the current configuration step, observed
+hardware, and a selected-plan summary. These come from
+`status.provider.intent`, not from parsing profiler logs.
+
+- `hardware` reports the GPU SKU, memory in MiB, and GPUs per node available in
+  the upstream request. The source is `provided`, `discovered`, or `mixed`
+  relative to the original request. Discovered values may be inferred by Dynamo;
+  they are not measurements performed by Runway.
+- `plan` summarizes `profilingResults.selectedConfig`, or the serving workload
+  when that output is unavailable. It lists known worker roles, replica counts,
+  GPUs per replica, and explicitly represented parallelism. Unknown values stay
+  absent. A replacement profiling attempt clears the previous summary.
+- `diagnostic` adds an actionable hint only when an upstream failure identifies
+  a discovery or profiler-support problem. The original status message remains
+  available.
+
+Dynamo tries DCGM discovery and then node labels. The node-label path requires
+`nvidia.com/gpu.product`, `nvidia.com/gpu.count`, and `nvidia.com/gpu.memory`.
+A product label such as `NVIDIA-A100-80GB-PCIe` alone is insufficient. Check those
+prerequisites and the operator's access before supplying explicit hardware.
+Runway's capacity display has different fallbacks, so a visible GPU count does
+not prove Dynamo discovery can succeed.
+
+Keep the actual GPU identity. `a100_pcie` and `a100_sxm` are not interchangeable
+performance profiles. Hardware discovery succeeding does not establish that the
+profiler has performance data for that model, backend, and GPU. Unsupported rapid
+search combinations may use a fallback whose SLA is unverified.
+
+Dynamo 1.5 exposes the selected graph but not a candidate count or a ranked
+performance comparison in DGDR status. Runway does not invent those estimates,
+parse ANSI tables, or present one short request as a throughput benchmark.
+
+#### Manual configuration and legacy overrides
+
+Omit `deploymentMode`, or set it to `manual`, to render a DGD directly. Manual
+configuration retains ordinary resource updates and scaling; DGDR input
+immutability does not apply to manual deployments.
+
+Existing `deploymentMode: intent` resources using `spec.provider.overrides.spec` retain the
+legacy pass-through format. That format derives the GPU budget from normal
+resource/replica fields and lets upstream validate additional fields. It must not
+be combined with the typed `intent` block, even when that block contains its own
+nested `overrides`. Legacy profiler-only requests using
+`autoApply: false` are not equivalent to a serving deployment.
+
+Typed intent deliberately does not reuse `spec.engine.image` as a profiler image,
+or reinterpret manual engine arguments as topology-independent overrides.
+Manual engine images/arguments, served-model aliases, environment variables, pod
+metadata, placement settings, custom token-secret names, and storage volumes
+cannot be supplied through the ordinary ModelDeployment fields in typed mode.
+Use manual mode for those controls. For supported native customizations, use the
+nested `intent.overrides` object described above. The legacy intent format is
+still available for an explicit upstream model-cache snapshot path.
+The existing API-defaulted `engine.enablePrefixCaching` value is not an optimizer
+constraint; cache tuning belongs in manual mode. Unsupported customization fails
+validation rather than being silently dropped.
+
+#### Dynamo compatibility
+
+New installation metadata defaults to Dynamo 1.5.0. The provider supports the
+1.1.1 alpha DGD contract and the 1.5 beta DGD contract; DGDR uses `v1beta1` on both.
+Installed APIs determine the supported path, not a blanket minimum-version gate.
+An installation without DGDR support can still use manual DGD deployments.
+
+Do not mix a new runtime image with an old launch contract. Existing manual
+workloads retain their API/image choices across a Runway-only upgrade. New 1.5
+workloads use the native Rust endpoint-picker contract, while the legacy contract
+is preserved for existing deployments. Unsupported raw fields fail strict API
+validation instead of being pruned.
+
+Runtime pinning does not guarantee an uninterrupted **Dynamo platform upgrade**.
+The bundled 1.1.1-to-1.5.0 Grove upgrade changed pod-template hashes and replaced
+serving pods even with unchanged workload specs and runtime images. Plan a
+maintenance window and verify actual pod identities and live inference after
+upgrading. Retaining the DGD identity and image tag alone does not prove that the
+serving workload stayed up.
+
+Let the upstream installation manage CRD conversion and storage migration. Keep
+conversion webhooks enabled, verify both served API versions after the upgrade,
+and confirm storage migration completed. A Helm rollback does not by itself
+reverse a migration to beta storage.
+
+The native Rust EPP path on Dynamo 1.5.0 with Istio 1.30.0 requires the
+[documented Istio configuration workaround](gateway.md#istio-workaround-for-dynamo-native-epp):
+a DNS authority on the EPP gRPC route and
+`send_body_without_waiting_for_header_response: true` on the gateway's EPP HTTP
+filter. Both settings were validated with aggregated vLLM, streaming and
+non-streaming requests, and an EPP restart. Runway does not install this
+workaround automatically.
+
+The body-streaming setting affects all EPP routes on that gateway listener,
+not only one model. Preserve TLS and `FailClose`, retain the complete existing
+per-route configuration, and validate other EPP implementations sharing the
+gateway. DGDR routing through a generated standalone Frontend Service does not
+use this EPP hop. Other versions and topologies need separate validation.
+
+Dynamo 1.5's native EPP generates an ephemeral self-signed certificate. The
+workaround preserves the existing trust settings; it does not add CA or
+Service-DNS identity verification.
+
+Compatibility checks include released CRD schemas for 1.1.1 and 1.5.0. Real
+profiling and end-to-end serving additionally require a GPU cluster and the
+corresponding operator/runtime installation. Schema tests alone do not establish
+engine performance or cluster-network compatibility.
 
 ### KAITO Provider
 

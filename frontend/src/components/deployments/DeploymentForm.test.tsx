@@ -59,7 +59,7 @@ vi.mock('./AIConfiguratorPanel', () => ({
 vi.mock('./ManifestViewer', () => ({
   ManifestViewer: (props: unknown) => {
     manifestViewerMock(props)
-    return null
+    return <div data-testid="manifest-preview" />
   },
 }))
 
@@ -110,7 +110,7 @@ function createRuntime(overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
       engines: ['vllm', 'sglang', 'trtllm', 'llamacpp'],
       modes: ['aggregated', 'disaggregated'],
       modelSources: ['huggingface'],
-      routerModes: ['none'],
+      routerModes: ['basic'],
       features: {},
     },
     ...overrides,
@@ -123,6 +123,167 @@ describe('DeploymentForm', () => {
     toast.mockReset()
     manifestViewerMock.mockReset()
     gatewayMock.data = { available: false }
+  })
+
+  it.each(['manual', 'automatic'])('preserves tool calling in %s create and preview payloads, and clears disabled parsers', async mode => {
+    const model = createModel({ id: 'Qwen/Qwen3-0.6B', name: 'Qwen3', size: '0.6B', parameterCount: 600_000_000, estimatedGpuMemoryGb: 2 })
+    render(<MemoryRouter><DeploymentForm model={model} runtimes={[createRuntime({ id: 'dynamo', name: 'Dynamo' })]} /></MemoryRouter>)
+    if (mode === 'automatic') fireEvent.click(screen.getByRole('radio', { name: /Automatic configuration/ }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable tool calling' }))
+    expect(screen.getByLabelText('Tool parser')).toHaveValue('')
+    expect(screen.getByLabelText('Tool parser')).toHaveAttribute('placeholder', 'hermes')
+    expect(manifestViewerMock.mock.lastCall?.[0].config.toolCallParser).toBeUndefined()
+    fireEvent.change(screen.getByLabelText('Tool parser'), { target: { value: 'custom_tool' } })
+    fireEvent.change(screen.getByLabelText('Reasoning parser'), { target: { value: 'basic' } })
+    expect(manifestViewerMock.mock.lastCall?.[0].config).toMatchObject({ toolCalling: true, toolCallParser: 'custom_tool', reasoningParser: 'basic' })
+    const form = screen.getByRole('button', { name: /Deploy Model/ }).closest('form')!
+    fireEvent.submit(form)
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1))
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({ toolCalling: true, toolCallParser: 'custom_tool', reasoningParser: 'basic' })
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable tool calling' }))
+    expect(screen.queryByLabelText('Tool parser')).not.toBeInTheDocument()
+    const disabled = manifestViewerMock.mock.lastCall?.[0].config
+    expect(disabled.toolCalling).toBe(false)
+    expect(disabled.toolCallParser).toBeUndefined()
+    expect(disabled.reasoningParser).toBeUndefined()
+    fireEvent.submit(form)
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(2))
+    expect(mutateAsync.mock.calls[1][0].toolCallParser).toBeUndefined()
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable tool calling' }))
+    expect(screen.getByLabelText('Tool parser')).toHaveValue('')
+    expect(screen.getByLabelText('Reasoning parser')).toHaveValue('')
+  })
+
+  it('blocks unknown model defaults and invalid parsers in create and preview, even through direct submit', () => {
+    render(<MemoryRouter><DeploymentForm model={createModel()} runtimes={[createRuntime({ id: 'dynamo', name: 'Dynamo' })]} /></MemoryRouter>)
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable tool calling' }))
+    const submit = screen.getByRole('button', { name: /Deploy Model/ })
+    expect(submit).toBeDisabled()
+    expect(screen.getByRole('alert')).toHaveTextContent('No automatic tool parser')
+    expect(screen.queryByTestId('manifest-preview')).not.toBeInTheDocument()
+    fireEvent.submit(submit.closest('form')!)
+    expect(mutateAsync).not.toHaveBeenCalled()
+    for (const invalid of ['auto', 'Hermes', 'tool-call']) {
+      fireEvent.change(screen.getByLabelText('Tool parser'), { target: { value: invalid } })
+      expect(submit).toBeDisabled()
+    }
+    fireEvent.change(screen.getByLabelText('Tool parser'), { target: { value: 'hermes' } })
+    expect(submit).toBeEnabled()
+    expect(screen.getByTestId('manifest-preview')).toBeInTheDocument()
+  })
+
+  it('keeps current tool settings across modes without restoring stale hidden values across providers', () => {
+    const model = createModel({ id: 'Qwen/Qwen3-0.6B', estimatedGpuMemoryGb: 2 })
+    render(<MemoryRouter><DeploymentForm model={model} runtimes={[createRuntime({ id: 'dynamo', name: 'Dynamo' }), createRuntime({ id: 'kuberay', name: 'KubeRay' })]} /></MemoryRouter>)
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable tool calling' }))
+    fireEvent.change(screen.getByLabelText('Tool parser'), { target: { value: 'manual_parser' } })
+    fireEvent.click(screen.getByRole('radio', { name: /Automatic configuration/ }))
+    expect(screen.getByLabelText('Tool parser')).toHaveValue('manual_parser')
+    fireEvent.change(screen.getByLabelText('Tool parser'), { target: { value: 'new_parser' } })
+    fireEvent.click(screen.getByRole('radio', { name: /Manual configuration/ }))
+    expect(screen.getByLabelText('Tool parser')).toHaveValue('new_parser')
+    fireEvent.click(screen.getByRole('radio', { name: /Automatic configuration/ }))
+    fireEvent.click(screen.getByText('KubeRay').closest('[role="radio"]')!)
+    expect(screen.queryByRole('checkbox', { name: 'Enable tool calling' })).not.toBeInTheDocument()
+    expect(manifestViewerMock.mock.lastCall?.[0].config.toolCalling).toBeUndefined()
+    expect(manifestViewerMock.mock.lastCall?.[0].config.toolCallParser).toBeUndefined()
+    fireEvent.click(screen.getByText('Dynamo').closest('[role="radio"]')!)
+    expect(screen.getByRole('checkbox', { name: 'Enable tool calling' })).not.toBeChecked()
+    fireEvent.click(screen.getByRole('radio', { name: /Automatic configuration/ }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable tool calling' }))
+    expect(screen.getByLabelText('Tool parser')).toHaveValue('')
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable tool calling' }))
+    fireEvent.click(screen.getByRole('radio', { name: /Manual configuration/ }))
+    expect(manifestViewerMock.mock.lastCall?.[0].config.toolCalling).toBe(false)
+    expect(manifestViewerMock.mock.lastCall?.[0].config.toolCallParser).toBeUndefined()
+  })
+
+  it.each([
+    ['{"profilingJob":', 'Enter valid JSON'],
+    ['{"profilingJob":{"activeDeadlineSeconds":1e400}}', 'finite'],
+  ])('blocks preview and creation for invalid advanced configuration, then submits the corrected value: %s', async (invalidText, error) => {
+    const model = createModel({ id: 'Qwen/Qwen3-0.6B', name: 'Qwen3', size: '0.6B', parameterCount: 600_000_000, estimatedGpuMemoryGb: 2 })
+    const runtime = createRuntime({ id: 'dynamo', name: 'Dynamo' })
+    render(<MemoryRouter><DeploymentForm model={model} detailedCapacity={createCapacity()} runtimes={[runtime]} /></MemoryRouter>)
+    fireEvent.click(screen.getByRole('radio', { name: /Automatic configuration/ }))
+    const editor = screen.getByRole('textbox', { name: /Advanced configuration/ })
+    const submit = screen.getByRole('button', { name: /Deploy Model/ })
+    const form = submit.closest('form')!
+    fireEvent.change(editor, { target: { value: '{"profilingJob":{"activeDeadlineSeconds":1800}}' } })
+    expect(screen.getByTestId('manifest-preview')).toBeInTheDocument()
+    manifestViewerMock.mockClear()
+    fireEvent.change(editor, { target: { value: invalidText } })
+    fireEvent.change(screen.getByRole('spinbutton', { name: /GPU budget/ }), { target: { value: '2' } })
+    expect(editor).toHaveValue(invalidText)
+    expect(screen.getByRole('alert')).toHaveTextContent(error)
+    expect(submit).toBeDisabled()
+    expect(form.checkValidity()).toBe(false)
+    expect(screen.queryByTestId('manifest-preview')).not.toBeInTheDocument()
+    expect(manifestViewerMock).not.toHaveBeenCalled()
+    // Dispatch directly as well, so a native-validation bypass cannot submit stale data.
+    fireEvent.submit(form)
+    expect(mutateAsync).not.toHaveBeenCalled()
+    const overrides = {
+      profilingJob: { activeDeadlineSeconds: 900 },
+      dgd: { apiVersion: 'nvidia.com/v1beta1', kind: 'DynamoGraphDeployment',
+        spec: { components: [{ name: 'VllmDecodeWorker', podTemplate: { spec: { containers: [{
+          name: 'main', $patch: { args: 'append' }, args: ['--dyn-tool-call-parser', 'hermes', '--dyn-reasoning-parser', 'qwen3'],
+        }] } } }] },
+      },
+    }
+    fireEvent.change(editor, { target: { value: JSON.stringify(overrides) } })
+    expect(submit).toBeEnabled()
+    expect(manifestViewerMock.mock.lastCall?.[0].config.providerOverrides).toMatchObject({ intent: { overrides } })
+    fireEvent.submit(form)
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1))
+    expect(mutateAsync.mock.calls[0][0].providerOverrides).toEqual(expect.objectContaining({
+      deploymentMode: 'intent', intent: expect.objectContaining({ hardware: { totalGpus: 2 }, overrides }),
+    }))
+    expect(mutateAsync.mock.calls[0][0].providerOverrides).not.toHaveProperty('spec')
+  })
+
+  it('clears invalid advanced configuration and leaves manual configuration unblocked', () => {
+    const model = createModel({ id: 'Qwen/Qwen3-0.6B', name: 'Qwen3', size: '0.6B', parameterCount: 600_000_000, estimatedGpuMemoryGb: 2 })
+    const runtime = createRuntime({ id: 'dynamo', name: 'Dynamo' })
+    render(<MemoryRouter><DeploymentForm model={model} detailedCapacity={createCapacity()} runtimes={[runtime]} /></MemoryRouter>)
+    fireEvent.click(screen.getByRole('radio', { name: /Automatic configuration/ }))
+    const editor = screen.getByRole('textbox', { name: /Advanced configuration/ })
+    fireEvent.change(editor, { target: { value: '{"profilingJob":{}}' } })
+    fireEvent.change(editor, { target: { value: '[]' } })
+    expect(screen.getByRole('button', { name: /Deploy Model/ })).toBeDisabled()
+    fireEvent.change(editor, { target: { value: '' } })
+    expect(screen.getByRole('button', { name: /Deploy Model/ })).toBeEnabled()
+    expect(manifestViewerMock.mock.lastCall?.[0].config.providerOverrides.intent).not.toHaveProperty('overrides')
+    fireEvent.change(editor, { target: { value: '{' } })
+    fireEvent.click(screen.getByRole('radio', { name: /Manual configuration/ }))
+    expect(screen.queryByRole('textbox', { name: /Advanced configuration/ })).not.toBeInTheDocument()
+    expect(screen.getByTestId('manifest-preview')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Deploy Model/ })).toBeEnabled()
+    fireEvent.click(screen.getByRole('radio', { name: /Automatic configuration/ }))
+    expect(screen.getByRole('textbox', { name: /Advanced configuration/ })).toHaveValue('')
+    expect(screen.getByRole('button', { name: /Deploy Model/ })).toBeEnabled()
+  })
+
+  it('keeps automatic intent through topology effects and restores manual settings', async () => {
+    const model = createModel({ id: 'Qwen/Qwen3-0.6B', name: 'Qwen3', size: '0.6B', parameterCount: 600_000_000, estimatedGpuMemoryGb: 2 })
+    const runtime = createRuntime({ id: 'dynamo', name: 'Dynamo' })
+    const view = render(<MemoryRouter><DeploymentForm model={model} detailedCapacity={createCapacity()} runtimes={[runtime]} /></MemoryRouter>)
+    fireEvent.click(screen.getByRole('radio', { name: /Automatic configuration/ }))
+    expect(screen.queryByText('Deployment Options')).not.toBeInTheDocument()
+    expect(screen.queryByText('Deployment Mode')).not.toBeInTheDocument()
+    fireEvent.change(screen.getByRole('spinbutton', { name: /GPU budget/ }), { target: { value: '2' } })
+    view.rerender(<MemoryRouter><DeploymentForm model={model} detailedCapacity={createCapacity({ totalMemoryGb: 40 })} runtimes={[runtime]} /></MemoryRouter>)
+    await waitFor(() => expect(screen.getByRole('spinbutton', { name: /GPU budget/ })).toHaveValue(2))
+    fireEvent.submit(screen.getByRole('button', { name: /Deploy Model/ }).closest('form')!)
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalled())
+    const config = mutateAsync.mock.calls[0][0]
+    expect(config.providerOverrides).toMatchObject({ deploymentMode: 'intent', intent: { hardware: { totalGpus: 2 }, searchStrategy: 'rapid' } })
+    expect(config.resources).toBeUndefined()
+    expect(config.prefillReplicas).toBeUndefined()
+    expect(config.enforceEager).toBe(false)
+    expect(config.modelId).toBe('Qwen/Qwen3-0.6B')
+    fireEvent.click(screen.getByRole('radio', { name: /Manual configuration/ }))
+    expect(screen.getByText('Deployment Options')).toBeInTheDocument()
   })
 
   it.each([true, false])('selects and deploys a ready unknown runtime with legacy installed=%s', async (installed) => {

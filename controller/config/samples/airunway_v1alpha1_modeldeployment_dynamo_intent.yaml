@@ -1,0 +1,34 @@
+# Supports Dynamo 1.1.1 and 1.5 native tool parsing.
+# GPU discovery and the installation's profiler credentials must be available.
+apiVersion: airunway.ai/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: qwen-auto
+  namespace: default
+spec:
+  model:
+    id: Qwen/Qwen3-0.6B
+    source: huggingface
+  engine:
+    type: vllm
+    toolCalling: true
+  provider:
+    name: dynamo
+    overrides:
+      deploymentMode: intent
+      intent:
+        hardware:
+          totalGpus: 1
+        searchStrategy: rapid
+        overrides:
+          profilingJob:
+            activeDeadlineSeconds: 1800
+        workload:
+          isl: 1024
+          osl: 256
+          requestRate: 1
+        sla:
+          ttft: 1000
+          itl: 50
+  gateway:
+    enabled: true

@@ -65,6 +65,18 @@ rules:
   verbs:
   - get
 - apiGroups:
+  - nvidia.com
+  resources:
+  - dynamographdeploymentrequests
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - delete
+  - update
+  - patch
+- apiGroups:
   - ""
   resources:
   - persistentvolumeclaims
@@ -103,3 +115,37 @@ rules:
   - update
   - patch
   - delete
+
+- apiGroups:
+  - nvidia.com
+  resources:
+  - dynamocomponentdeployments
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - services
+  - configmaps
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - inference.networking.k8s.io
+  resources:
+  - inferencepools
+  verbs:
+  - get
+  - list
+  - watch

@@ -1,3 +1,6 @@
+import { defaultDynamoIntent, getDynamoIntent, getDynamoToolCallingError } from '@airunway/shared'
+import { DynamoIntentFields } from './DynamoIntentFields'
+import { DynamoToolCallingFields } from './DynamoToolCallingFields'
 import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
@@ -130,6 +133,7 @@ function canDeployWithRuntime(runtime?: RuntimeStatus): boolean {
 
 interface DeploymentFormProps {
   model: Model
+  onAutomaticConfigurationChange?: (automatic: boolean) => void
   detailedCapacity?: DetailedClusterCapacity
   autoscaler?: AutoscalerDetectionResult
   runtimes?: RuntimeStatus[]
@@ -420,7 +424,7 @@ function normalizeDirectVllmConfig(
   }
 }
 
-export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, weightQuant = 'fp16', kvCacheDtype = 'fp16', fp8Blocked = false, fp8BlockReason, doesNotFit = false, doesNotFitReason }: DeploymentFormProps) {
+export function DeploymentForm({ model, onAutomaticConfigurationChange, detailedCapacity, autoscaler, runtimes, weightQuant = 'fp16', kvCacheDtype = 'fp16', fp8Blocked = false, fp8BlockReason, doesNotFit = false, doesNotFitReason }: DeploymentFormProps) {
   const navigate = useNavigate()
   const { toast } = useToast()
   const createDeployment = useCreateDeployment()
@@ -588,6 +592,38 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
     },
   })
 
+  const intent = getDynamoIntent(config.provider, config.providerOverrides)
+  const automatic = !!intent
+  const toolCallingError = getDynamoToolCallingError(config)
+  const [intentValid, setIntentValid] = useState(true)
+  useEffect(() => { onAutomaticConfigurationChange?.(automatic) }, [automatic, onAutomaticConfigurationChange])
+  const manualConfig = useRef<DeploymentConfig | null>(null)
+  const changeConfigurationMode = (mode: string) => {
+    if ((mode === 'automatic') === automatic) return
+    setIntentValid(true)
+    setTopologyManagedByAIConfig(false)
+    if (mode === 'automatic') {
+      manualConfig.current = config
+      setConfig(prev => ({
+        ...prev, mode: 'aggregated', routerMode: 'default', resources: undefined,
+        prefillReplicas: undefined, decodeReplicas: undefined, prefillGpus: undefined, decodeGpus: undefined,
+        engineArgs: undefined, engineExtraArgs: undefined, imageRef: undefined,
+        contextLength: undefined, maxModelLen: undefined, servedModelName: undefined,
+        env: undefined, storage: undefined,
+        hfTokenSecret: prev.hfTokenSecret ? 'hf-token-secret' : '',
+        enforceEager: false, trustRemoteCode: false, enablePrefixCaching: false,
+        providerOverrides: { deploymentMode: 'intent', intent: defaultDynamoIntent() },
+      }))
+    } else {
+      setConfig(prev => ({ ...(manualConfig.current || prev),
+        name: prev.name, namespace: prev.namespace, modelId: prev.modelId, engine: prev.engine,
+        gatewayEnabled: prev.gatewayEnabled,
+        toolCalling: prev.toolCalling, toolCallParser: prev.toolCallParser, reasoningParser: prev.reasoningParser,
+        providerOverrides: manualConfig.current?.providerOverrides,
+      }))
+    }
+  }
+
   // If runtimes arrive after the form initializes, select the best discovered runtime.
   useEffect(() => {
     if (!runtimes || runtimes.length === 0 || runtimeManuallySelectedRef.current) return
@@ -601,6 +637,9 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
       return {
         ...prev,
         provider: runtime,
+        toolCalling: runtime === 'dynamo' ? prev.toolCalling : undefined,
+        toolCallParser: runtime === 'dynamo' ? prev.toolCallParser : undefined,
+        reasoningParser: runtime === 'dynamo' ? prev.reasoningParser : undefined,
         namespace: getRuntimeDefaultNamespace(runtime),
         engine: runtime === 'vllm' ? 'vllm' : getDefaultEngineForRuntime(runtime),
         mode: runtime === 'kaito' || runtime === 'vllm' ? 'aggregated' : prev.mode,
@@ -798,6 +837,7 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
     }
 
     setConfig(prev => {
+      if (getDynamoIntent(prev.provider, prev.providerOverrides)) return prev
       const prevNodeCount = getNodeCountFromOverrides(prev.providerOverrides)
       const prevTensorParallel = getNumericEngineArg(prev.engineArgs, TENSOR_PARALLEL_SIZE_ARG)
       const prevPipelineParallel = getNumericEngineArg(prev.engineArgs, PIPELINE_PARALLEL_SIZE_ARG)
@@ -881,6 +921,7 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
     const kvFp8 = kvCacheDtype === 'fp8' && engineSupportsFp8Args && !fp8Blocked
 
     setConfig(prev => {
+      if (getDynamoIntent(prev.provider, prev.providerOverrides)) return prev
       const nextEngineArgs = setFp8PrecisionEngineArgs(prev.engineArgs, { weightFp8, kvFp8 })
       const prevQuant = prev.engineArgs?.[QUANTIZATION_ARG]
       const prevKv = prev.engineArgs?.[KV_CACHE_DTYPE_ARG]
@@ -912,6 +953,9 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
 
   // Handle runtime change - update namespace and engine
   const handleRuntimeChange = (runtime: string) => {
+    if (runtime === selectedRuntime) return
+    manualConfig.current = null
+    setIntentValid(true)
     runtimeManuallySelectedRef.current = true
     setTopologyManagedByAIConfig(false)
     setSelectedRuntime(runtime)
@@ -951,6 +995,9 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
       return {
         ...prev,
         provider: runtime,
+        toolCalling: runtime === 'dynamo' ? prev.toolCalling : undefined,
+        toolCallParser: runtime === 'dynamo' ? prev.toolCallParser : undefined,
+        reasoningParser: runtime === 'dynamo' ? prev.reasoningParser : undefined,
         namespace: getRuntimeDefaultNamespace(runtime),
         // Reset engine if current one isn't supported by new runtime
         engine: runtime === 'vllm' ? 'vllm' : nextEngine,
@@ -1014,6 +1061,7 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
 
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault()
+    if (toolCallingError || (automatic && !intentValid)) return
 
     try {
       // Build the deployment config, adding KAITO-specific fields if needed
@@ -1139,7 +1187,7 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
         variant: 'destructive',
       })
     }
-  }, [config, createDeployment, navigate, toast, triggerConfetti, selectedRuntime, directVllmCustomImageRequired, directVllmImageRef, kaitoComputeType, kaitoResourceType, selectedPremadeModel, isHuggingFaceGgufModel, isVllmModel, model.id, model.gated, ggufFile, ggufRunMode, maxModelLen, gatewayInfo?.available])
+  }, [automatic, intentValid, toolCallingError, config, createDeployment, navigate, toast, triggerConfetti, selectedRuntime, directVllmCustomImageRequired, directVllmImageRef, kaitoComputeType, kaitoResourceType, selectedPremadeModel, isHuggingFaceGgufModel, isVllmModel, model.id, model.gated, ggufFile, ggufRunMode, maxModelLen, gatewayInfo?.available])
 
   const updateConfig = <K extends keyof DeploymentConfig>(
     key: K,
@@ -1297,7 +1345,7 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
       return 'HuggingFace Auth Required'
     }
 
-    if (fp8Blocked) {
+    if (fp8Blocked && !automatic) {
       return 'FP8 Not Supported on This GPU'
     }
 
@@ -1518,8 +1566,25 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
         </div>
       )}
 
+      {selectedRuntime === 'dynamo' && <section className="glass-panel space-y-4">
+        <h3 className="text-lg font-semibold">Configuration</h3>
+        <RadioGroup value={automatic ? 'automatic' : 'manual'} onValueChange={changeConfigurationMode} className="grid gap-4 sm:grid-cols-2">
+          <Label htmlFor="configuration-manual" className="flex items-start gap-3 rounded-lg border p-4 cursor-pointer">
+            <RadioGroupItem id="configuration-manual" value="manual" />
+            <span>Manual configuration<span className="block text-xs text-muted-foreground mt-1">Choose the number of copies, GPUs per copy, and serving layout.</span></span>
+          </Label>
+          <Label htmlFor="configuration-automatic" className="flex items-start gap-3 rounded-lg border p-4 cursor-pointer">
+            <RadioGroupItem id="configuration-automatic" value="automatic" />
+            <span>Automatic configuration<span className="block text-xs text-muted-foreground mt-1">Give Dynamo a GPU budget and performance targets. It chooses the serving layout.</span></span>
+          </Label>
+        </RadioGroup>
+        <DynamoToolCallingFields value={config} modelId={config.modelId} error={toolCallingError}
+          onChange={settings => setConfig(prev => ({ ...prev, ...settings }))} />
+        {intent && <DynamoIntentFields value={intent} onValidityChange={setIntentValid} onChange={next => setConfig(prev => ({ ...prev, providerOverrides: { deploymentMode: 'intent', intent: next } }))} />}
+      </section>}
+
       {/* AI Configurator Panel - only show for Dynamo runtime */}
-      {selectedRuntime === 'dynamo' && (
+      {selectedRuntime === 'dynamo' && !automatic && (
         <AIConfiguratorPanel
           modelId={model.id}
           detailedCapacity={detailedCapacity}
@@ -1899,7 +1964,7 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
       )}
 
       {/* Deployment Mode - show for non-KAITO runtimes OR KAITO with vLLM models */}
-      {(selectedRuntime !== 'kaito' || isVllmModel) && (
+      {!automatic && (selectedRuntime !== 'kaito' || isVllmModel) && (
       <div className="glass-panel">
         <h3 className="text-lg font-semibold mb-4">Deployment Mode</h3>
         <div>
@@ -1979,7 +2044,7 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
       )}
 
       {/* Deployment Options - show for all runtimes with vLLM/GPU */}
-      {(selectedRuntime !== 'kaito' || isVllmModel || kaitoComputeType === 'gpu') && (
+      {!automatic && (selectedRuntime !== 'kaito' || isVllmModel || kaitoComputeType === 'gpu') && (
       <div className="glass-panel">
         <h3 className="text-lg font-semibold mb-4">Deployment Options</h3>
         <div className="space-y-4">
@@ -2161,8 +2226,8 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
       </div>
       )}
 
-      {/* Storage Volumes - only shown for Dynamo runtime */}
-      {selectedRuntime === 'dynamo' && (
+      {/* Storage Volumes - only shown for manual Dynamo configuration */}
+      {selectedRuntime === 'dynamo' && !automatic && (
         <div className="glass-panel">
           <h3 className="text-lg font-semibold flex items-center gap-2 mb-1">
             <HardDrive className="h-5 w-5" />
@@ -2496,7 +2561,7 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
       )}
 
       {/* Advanced Options - show for non-KAITO runtimes OR KAITO with vLLM models */}
-      {(selectedRuntime !== 'kaito' || isVllmModel) && (
+      {!automatic && (selectedRuntime !== 'kaito' || isVllmModel) && (
       <div className="glass-panel !p-0 overflow-hidden">
         <div
           className="cursor-pointer select-none px-6 py-4"
@@ -2591,7 +2656,7 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
       )}
 
         {/* Capacity Warning - only show for non-KAITO or KAITO with GPU/vLLM */}
-        {detailedCapacity && (selectedRuntime !== 'kaito' || kaitoComputeType === 'gpu' || isVllmModel) && (
+        {!automatic && detailedCapacity && (selectedRuntime !== 'kaito' || kaitoComputeType === 'gpu' || isVllmModel) && (
           <CapacityWarning
             selectedGpus={selectedGpus}
             capacity={detailedCapacity}
@@ -2606,6 +2671,8 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
 
         {/* Manifest Preview - build config with runtime-specific fields */}
         {(() => {
+          if (toolCallingError) return <p className="text-sm text-destructive">Fix tool calling settings to preview or deploy.</p>
+          if (automatic && !intentValid) return <p className="text-sm text-destructive">Fix advanced configuration to preview or deploy.</p>
           // Build preview config with all necessary fields
           let previewConfig = normalizeGatewayAvailability(config, gatewayInfo?.available);
 
@@ -2666,7 +2733,7 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
           />
         )}
         {/* Cost Estimate for non-KAITO runtimes (always GPU) */}
-        {selectedRuntime !== 'kaito' && detailedCapacity && detailedCapacity.nodePools.length > 0 && (
+        {!automatic && selectedRuntime !== 'kaito' && detailedCapacity && detailedCapacity.nodePools.length > 0 && (
           <CostEstimate
             nodePools={detailedCapacity.nodePools}
             gpuCount={config.mode === 'disaggregated'
@@ -2691,7 +2758,7 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
         </Button>
         <Button
           type="submit"
-          disabled={createDeployment.isProcessing || needsHfAuth || !isRuntimeReady || !isKaitoConfigValid || fp8Blocked}
+          disabled={!!toolCallingError || createDeployment.isProcessing || needsHfAuth || !isRuntimeReady || !isKaitoConfigValid || (fp8Blocked && !automatic) || (automatic && !intentValid)}
           loading={createDeployment.isProcessing}
           className={cn(
             "flex-1 h-14 rounded-2xl bg-primary text-primary-foreground font-bold shadow-glow-button gap-2",
@@ -2701,7 +2768,7 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
           {getButtonContent()}
         </Button>
       </div>
-      {fp8Blocked && (
+      {fp8Blocked && !automatic && (
         <p className="text-sm text-destructive text-center">
           {fp8BlockReason || 'FP8 is only supported on L40S/L4 and H100/H200 GPUs. Choose FP16/BF16 to deploy.'}
         </p>
@@ -2710,7 +2777,7 @@ export function DeploymentForm({ model, detailedCapacity, autoscaler, runtimes, 
           assumes a fixed GPUs-per-replica, but the user may select more here, so
           we caution rather than block. Hidden when fp8Blocked already explains a
           blocking reason. */}
-      {doesNotFit && !fp8Blocked && (
+      {doesNotFit && !fp8Blocked && !automatic && (
         <p className="text-sm text-yellow-500/90 text-center">
           {doesNotFitReason || "This model is estimated not to fit on this cluster's GPUs at the selected precision. Try more GPUs per replica, a smaller model, or FP8 precision."}
         </p>

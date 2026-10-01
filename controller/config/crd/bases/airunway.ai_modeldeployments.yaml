@@ -100,6 +100,24 @@ spec:
                       image is an engine-specific container image override. For direct vLLM
                       deployments this is the vLLM OpenAI-compatible server image.
                     type: string
+                  reasoningParser:
+                    description: |-
+                      reasoningParser overrides reasoning parsing when toolCalling is enabled.
+                      Omission uses a model-family default when known. Dynamo has no "none" disable value.
+                    maxLength: 64
+                    pattern: ^[a-z][a-z0-9_]*$
+                    type: string
+                  toolCallParser:
+                    description: toolCallParser overrides the Dynamo-native tool parser.
+                      Requires toolCalling.
+                    maxLength: 64
+                    pattern: ^[a-z][a-z0-9_]*$
+                    type: string
+                  toolCalling:
+                    description: |-
+                      toolCalling enables Dynamo-native tool parsing. Known Qwen3 models use
+                      compatible defaults; other models require toolCallParser.
+                    type: boolean
                   trustRemoteCode:
                     default: false
                     description: |-
@@ -803,9 +821,142 @@ spec:
               provider:
                 description: provider contains information about the selected provider
                 properties:
+                  inferencePoolRef:
+                    description: inferencePoolRef identifies a provider-managed routing
+                      pool, when present.
+                    properties:
+                      apiVersion:
+                        type: string
+                      kind:
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                      uid:
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - namespace
+                    type: object
+                  intent:
+                    description: intent records profiling progress and accepted input
+                      identity.
+                    properties:
+                      attempt:
+                        type: string
+                      diagnostic:
+                        description: diagnostic suggests a next step only when an
+                          upstream failure identifies one.
+                        maxLength: 1024
+                        type: string
+                      hardware:
+                        description: hardware records upstream hardware values, without
+                          substituting another GPU profile.
+                        properties:
+                          gpuSku:
+                            maxLength: 256
+                            type: string
+                          numGpusPerNode:
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          source:
+                            enum:
+                            - provided
+                            - discovered
+                            - mixed
+                            type: string
+                          vramMb:
+                            description: |-
+                              vramMb is the upstream per-GPU memory value in MiB. Fractional or
+                              unknown values are omitted rather than rounded.
+                            format: int64
+                            minimum: 1
+                            type: integer
+                        type: object
+                      inputHash:
+                        type: string
+                      phase:
+                        type: string
+                      plan:
+                        description: plan summarizes the selected graph or, when unavailable,
+                          the serving workload.
+                        properties:
+                          engine:
+                            type: string
+                          servingMode:
+                            type: string
+                          source:
+                            enum:
+                            - selectedConfig
+                            - workload
+                            type: string
+                          workers:
+                            description: workers contains at most the first 32 workers,
+                              ordered by name.
+                            items:
+                              description: |-
+                                ProviderIntentWorkerStatus contains only explicitly represented worker
+                                settings. GPUsPerReplica is omitted when a multinode layout is ambiguous.
+                              properties:
+                                gpusPerReplica:
+                                  format: int32
+                                  minimum: 0
+                                  type: integer
+                                name:
+                                  maxLength: 256
+                                  type: string
+                                pipelineParallelism:
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                                replicas:
+                                  format: int32
+                                  minimum: 0
+                                  type: integer
+                                role:
+                                  type: string
+                                tensorParallelism:
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                              required:
+                              - name
+                              type: object
+                            maxItems: 32
+                            type: array
+                        required:
+                        - source
+                        type: object
+                      profilingPhase:
+                        type: string
+                    type: object
                   name:
                     description: name is the selected provider name
                     type: string
+                  requestRef:
+                    description: requestRef identifies an upstream configuration request,
+                      when used.
+                    properties:
+                      apiVersion:
+                        type: string
+                      kind:
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                      uid:
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - namespace
+                    type: object
                   resourceKind:
                     description: resourceKind is the kind of the created provider
                       resource
@@ -817,6 +968,25 @@ spec:
                   selectedReason:
                     description: selectedReason explains why this provider was selected
                     type: string
+                  workloadRef:
+                    description: workloadRef identifies the actual serving workload.
+                    properties:
+                      apiVersion:
+                        type: string
+                      kind:
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                      uid:
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    - namespace
+                    type: object
                 type: object
               replicas:
                 description: replicas contains replica count information

@@ -243,6 +243,24 @@ type EngineSpec struct {
 	// +optional
 	Type EngineType `json:"type,omitempty"`
 
+	// toolCalling enables Dynamo-native tool parsing. Known Qwen3 models use
+	// compatible defaults; other models require toolCallParser.
+	// +optional
+	ToolCalling bool `json:"toolCalling,omitempty"`
+
+	// toolCallParser overrides the Dynamo-native tool parser. Requires toolCalling.
+	// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9_]*$`
+	// +kubebuilder:validation:MaxLength=64
+	// +optional
+	ToolCallParser string `json:"toolCallParser,omitempty"`
+
+	// reasoningParser overrides reasoning parsing when toolCalling is enabled.
+	// Omission uses a model-family default when known. Dynamo has no "none" disable value.
+	// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9_]*$`
+	// +kubebuilder:validation:MaxLength=64
+	// +optional
+	ReasoningParser string `json:"reasoningParser,omitempty"`
+
 	// image is an engine-specific container image override. For direct vLLM
 	// deployments this is the vLLM OpenAI-compatible server image.
 	// +optional
@@ -455,8 +473,53 @@ type ModelDeploymentSpec struct {
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 }
 
+// ProviderResourceReference identifies a particular upstream resource incarnation.
+type ProviderResourceReference struct {
+	APIVersion string `json:"apiVersion"`
+	Kind       string `json:"kind"`
+	Name       string `json:"name"`
+	Namespace  string `json:"namespace"`
+	// +optional
+	UID string `json:"uid,omitempty"`
+}
+
+// ProviderIntentStatus records the accepted, immutable profiling attempt.
+type ProviderIntentStatus struct {
+	// hardware records upstream hardware values, without substituting another GPU profile.
+	// +optional
+	Hardware *ProviderIntentHardwareStatus `json:"hardware,omitempty"`
+	// plan summarizes the selected graph or, when unavailable, the serving workload.
+	// +optional
+	Plan *ProviderIntentPlanStatus `json:"plan,omitempty"`
+	// diagnostic suggests a next step only when an upstream failure identifies one.
+	// +kubebuilder:validation:MaxLength=1024
+	// +optional
+	Diagnostic string `json:"diagnostic,omitempty"`
+	// +optional
+	Phase string `json:"phase,omitempty"`
+	// +optional
+	ProfilingPhase string `json:"profilingPhase,omitempty"`
+	// +optional
+	InputHash string `json:"inputHash,omitempty"`
+	// +optional
+	Attempt string `json:"attempt,omitempty"`
+}
+
 // ProviderStatus contains information about the selected provider
 type ProviderStatus struct {
+	// requestRef identifies an upstream configuration request, when used.
+	// +optional
+	RequestRef *ProviderResourceReference `json:"requestRef,omitempty"`
+	// workloadRef identifies the actual serving workload.
+	// +optional
+	WorkloadRef *ProviderResourceReference `json:"workloadRef,omitempty"`
+	// inferencePoolRef identifies a provider-managed routing pool, when present.
+	// +optional
+	InferencePoolRef *ProviderResourceReference `json:"inferencePoolRef,omitempty"`
+	// intent records profiling progress and accepted input identity.
+	// +optional
+	Intent *ProviderIntentStatus `json:"intent,omitempty"`
+
 	// name is the selected provider name
 	// +optional
 	Name string `json:"name,omitempty"`

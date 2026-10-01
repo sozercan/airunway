@@ -1,10 +1,10 @@
 import * as k8s from '@kubernetes/client-node';
 import { configService } from './config';
-import type { DeploymentStatus, PodStatus, ClusterStatus, PodPhase, DeploymentConfig, RuntimeStatus, ModelDeployment, GatewayInfo, GatewayModelInfo, GatewayCRDStatus, ProviderHealthConfig, InstallationState } from '@airunway/shared';
+import type { DeploymentStatus, PodStatus, ClusterStatus, PodPhase, DeploymentConfig, RuntimeStatus, ModelDeployment, ProviderResourceRef, GatewayInfo, GatewayModelInfo, GatewayCRDStatus, ProviderHealthConfig, InstallationState } from '@airunway/shared';
 import { toModelDeploymentManifest, toDeploymentStatus, INFERENCE_GATEWAY_LABEL } from '@airunway/shared';
 import { withRetry } from '../lib/retry';
 import { loadKubeConfig, makeApiClient, kubeConfigToBunTls, type BunTlsOptions } from '../lib/kubeconfig';
-import { type K8sApiError } from '../lib/k8s-errors';
+import { getK8sStatusCode } from '../lib/k8s-errors';
 import logger from '../lib/logger';
 import {
   extractProviderInfo,
@@ -296,11 +296,6 @@ function describeOperatorProbeNamespaces(operatorPods: NonNullable<ProviderHealt
   return namespaces.join(', ');
 }
 
-function getK8sStatusCode(error: unknown): number | undefined {
-  const e = error as K8sApiError | undefined;
-  return e?.statusCode || e?.response?.statusCode;
-}
-
 function getK8sErrorMessage(error: unknown): string {
   const e = error as
     | {
@@ -540,7 +535,7 @@ class KubernetesService {
     const deployments: DeploymentStatus[] = [];
     for (const item of items) {
       const itemNamespace = item.metadata.namespace || fallbackNamespace || 'default';
-      const pods = await this.getDeploymentPods(item.metadata.name, itemNamespace);
+      const pods = await this.getDeploymentPods(item.metadata.name, itemNamespace, item.status?.provider?.workloadRef);
       deployments.push(toDeploymentStatus(item, pods));
     }
 
@@ -641,7 +636,7 @@ class KubernetesService {
       );
 
       const md = response as ModelDeployment;
-      const pods = await this.getDeploymentPods(name, namespace);
+      const pods = await this.getDeploymentPods(name, namespace, md.status?.provider?.workloadRef);
       return toDeploymentStatus(md, pods);
     } catch (error) {
       const statusCode = getK8sStatusCode(error);
@@ -655,10 +650,12 @@ class KubernetesService {
   }
 
   /**
-   * Get the raw Custom Resource manifest for a deployment
-   * Returns the full CR object as stored in Kubernetes
+   * Get the raw Custom Resource manifest for a deployment.
+   * Strict reads propagate non-404 failures; default reads remain best-effort.
    */
-  async getDeploymentManifest(name: string, namespace: string, userToken?: string): Promise<Record<string, unknown> | null> {
+  async getDeploymentManifest(
+    name: string, namespace: string, userToken?: string, options: { strict?: boolean } = {},
+  ): Promise<Record<string, unknown> | null> {
     try {
       const api = this.getCustomObjectsApi(userToken);
       const response = await withRetry(
@@ -680,6 +677,7 @@ class KubernetesService {
         return null;
       }
       logger.error({ error, name, namespace }, 'Error getting deployment manifest');
+      if (options.strict) throw error;
       return null;
     }
   }
@@ -703,6 +701,19 @@ class KubernetesService {
     );
 
     logger.info({ name: config.name, namespace: config.namespace }, 'ModelDeployment created');
+  }
+
+  /** resourceVersion provides optimistic concurrency; do not retry an outdated write. */
+  async replaceDeployment(deployment: ModelDeployment, userToken?: string): Promise<void> {
+    const api = this.getCustomObjectsApi(userToken);
+    await api.replaceNamespacedCustomObject({
+      group: MODEL_DEPLOYMENT_CRD.apiGroup,
+      version: MODEL_DEPLOYMENT_CRD.apiVersion,
+      plural: MODEL_DEPLOYMENT_CRD.plural,
+      name: deployment.metadata.name,
+      namespace: deployment.metadata.namespace,
+      body: deployment,
+    });
   }
 
   async deleteDeployment(name: string, namespace: string, userToken?: string): Promise<void> {
@@ -729,7 +740,12 @@ class KubernetesService {
     logger.info({ name, namespace }, 'ModelDeployment deleted');
   }
 
-  async getDeploymentPods(name: string, namespace: string): Promise<PodStatus[]> {
+  async getDeploymentPods(name: string, namespace: string, workloadRef?: ProviderResourceRef): Promise<PodStatus[]> {
+    // Dynamo's generated workload can have a different name and namespace.
+    if (workloadRef?.kind === 'DynamoGraphDeployment' && workloadRef.name) {
+      name = workloadRef.name;
+      namespace = workloadRef.namespace || namespace;
+    }
     const coreApi = this.coreV1Api;
     const podsByName = new Map<string, k8s.V1Pod>();
     const addPods = (pods: k8s.V1Pod[]) => {

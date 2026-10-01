@@ -8,6 +8,8 @@ import (
 	"time"
 
 	airunwayv1alpha1 "github.com/ai-runway/airunway/controller/api/v1alpha1"
+	"github.com/ai-runway/airunway/controller/pkg/dynamointent"
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -29,6 +31,7 @@ func newScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	_ = airunwayv1alpha1.AddToScheme(s)
 	_ = corev1.AddToScheme(s)
+	_ = appsv1.AddToScheme(s)
 	_ = batchv1.AddToScheme(s)
 	return s
 }
@@ -54,6 +57,18 @@ func newMDForController(name, ns string) *airunwayv1alpha1.ModelDeployment {
 func setDGDGVK(u *unstructured.Unstructured) {
 	u.SetAPIVersion("nvidia.com/v1alpha1")
 	u.SetKind("DynamoGraphDeployment")
+}
+
+func setDGDRGVK(u *unstructured.Unstructured) {
+	u.SetAPIVersion("nvidia.com/v1beta1")
+	u.SetKind(DynamoGraphDeploymentRequestKind)
+}
+
+func setIntentMode(md *airunwayv1alpha1.ModelDeployment) {
+	md.Spec.Provider = &airunwayv1alpha1.ProviderSpec{
+		Name:      ProviderName,
+		Overrides: &runtime.RawExtension{Raw: []byte(`{"deploymentMode":"intent"}`)},
+	}
 }
 
 func assertCondition(t *testing.T, conditions []metav1.Condition, condType string, status metav1.ConditionStatus, reason string) {
@@ -232,7 +247,7 @@ func TestMapProviderConfigToModelDeployments(t *testing.T) {
 	other := newMDForController("other", "default")
 	other.Status.Provider.Name = "other"
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(selected, pinned, other).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(selected, pinned, other).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	requests := r.mapProviderConfigToModelDeployments(context.Background(), &airunwayv1alpha1.InferenceProviderConfig{
@@ -260,7 +275,7 @@ func TestMapProviderConfigToModelDeployments(t *testing.T) {
 
 func TestReconcileNotFound(t *testing.T) {
 	scheme := newScheme()
-	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -279,7 +294,7 @@ func TestReconcileWrongProvider(t *testing.T) {
 	md := newMDForController("test", "default")
 	md.Status.Provider.Name = "other"
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(md).WithStatusSubresource(md).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(md).WithStatusSubresource(md).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -298,7 +313,7 @@ func TestReconcilePaused(t *testing.T) {
 	md := newMDForController("test", "default")
 	md.Annotations = map[string]string{"airunway.ai/reconcile-paused": "true"}
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(md).WithStatusSubresource(md).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(md).WithStatusSubresource(md).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -316,7 +331,7 @@ func TestReconcileAddsFinalizer(t *testing.T) {
 	scheme := newScheme()
 	md := newMDForController("test", "default")
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(md).WithStatusSubresource(md).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(md).WithStatusSubresource(md).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -342,7 +357,7 @@ func TestReconcileIncompatibleEngine(t *testing.T) {
 	md.Spec.Engine.Type = airunwayv1alpha1.EngineTypeLlamaCpp
 	controllerutil.AddFinalizer(md, FinalizerName)
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(md).WithStatusSubresource(md).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(md).WithStatusSubresource(md).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	_, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -364,7 +379,7 @@ func TestReconcileNilProvider(t *testing.T) {
 	md := newMDForController("test", "default")
 	md.Status.Provider = nil
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(md).WithStatusSubresource(md).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(md).WithStatusSubresource(md).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -383,7 +398,7 @@ func TestReconcileSuccessfulCreate(t *testing.T) {
 	md := newMDForController("test", "default")
 	controllerutil.AddFinalizer(md, FinalizerName)
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(md).WithStatusSubresource(md).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(md).WithStatusSubresource(md).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -404,6 +419,381 @@ func TestReconcileSuccessfulCreate(t *testing.T) {
 	}
 }
 
+func TestReconcileIntentCreate(t *testing.T) {
+	scheme := newScheme()
+	md := newMDForController("test", "default")
+	md.Generation = 3
+	setIntentMode(md)
+	controllerutil.AddFinalizer(md, FinalizerName)
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(md).WithStatusSubresource(md).Build()
+	r := NewDynamoProviderReconciler(c, scheme, "")
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "test", Namespace: "default"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	dgdr := &unstructured.Unstructured{}
+	setDGDRGVK(dgdr)
+	if err := c.Get(context.Background(), types.NamespacedName{Name: intentAttemptName(md), Namespace: "default"}, dgdr); err != nil {
+		t.Fatalf("expected DynamoGraphDeploymentRequest to be created: %v", err)
+	}
+	if dgdr.GetAnnotations()[modelDeploymentGenerationAnnotation] != "3" {
+		t.Errorf("expected generation annotation on DGDR")
+	}
+	var updated airunwayv1alpha1.ModelDeployment
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(md), &updated); err != nil {
+		t.Fatalf("failed to get ModelDeployment: %v", err)
+	}
+	if updated.Status.Provider.ResourceKind != DynamoGraphDeploymentRequestKind {
+		t.Errorf("expected provider resource kind %q, got %q", DynamoGraphDeploymentRequestKind, updated.Status.Provider.ResourceKind)
+	}
+}
+
+func TestIntentGenerationChangeDoesNotReplace(t *testing.T) {
+	scheme := newScheme()
+	md := newMDForController("test", "default")
+	setIntentMode(md)
+	r := NewDynamoProviderReconciler(fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).Build(), scheme, "")
+	desired, err := r.Transformer.Transform(context.Background(), md)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dgdr := desired[0].DeepCopy()
+	dgdr.SetUID("request-uid")
+	dgdr.Object["status"] = map[string]any{"phase": "Profiling"}
+	if err := r.Create(context.Background(), dgdr); err != nil {
+		t.Fatal(err)
+	}
+	md.Generation = 2
+	if err := r.createOrUpdateResource(context.Background(), desired[0], md); err != nil {
+		t.Fatal(err)
+	}
+	current := dgdr.DeepCopy()
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(dgdr), current); err != nil {
+		t.Fatal(err)
+	}
+	if current.GetUID() != dgdr.GetUID() {
+		t.Fatal("legacy request was replaced")
+	}
+	if current.GetAnnotations()[dynamointent.HashAnnotation] == "" {
+		t.Fatal("legacy input identity not adopted")
+	}
+}
+
+func TestDeleteGeneratedDGDsRequiresRelationshipLabels(t *testing.T) {
+	scheme := newScheme()
+	md := newMDForController("test", "default")
+	dgdr := newDynamoResource(
+		DynamoGraphDeploymentRequestAPIVersion,
+		DynamoGraphDeploymentRequestKind,
+		md.Name,
+		md.Namespace,
+	)
+	dgdr.Object["status"] = map[string]any{"dgdName": "confirmed-dgd"}
+	collidingDGD := newDynamoResource(DynamoAPIVersion, DynamoGraphDeploymentKind, "confirmed-dgd", md.Namespace)
+	generatedDGD := newDynamoResource(DynamoAPIVersion, DynamoGraphDeploymentKind, "generated-dgd", md.Namespace)
+	generatedDGD.SetLabels(map[string]string{
+		dynamoDGDRNameLabel:      md.Name,
+		dynamoDGDRNamespaceLabel: md.Namespace,
+	})
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(collidingDGD, generatedDGD).Build()
+	r := NewDynamoProviderReconciler(c, scheme, "")
+
+	pending, err := r.deleteGeneratedDGDs(context.Background(), md, dgdr)
+	if err == nil || pending {
+		t.Fatalf("expected generated DGD deletion, pending=%v err=%v", pending, err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(collidingDGD), collidingDGD); err != nil {
+		t.Fatalf("expected unlabeled status-named DGD to remain, got %v", err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(generatedDGD), generatedDGD); err != nil {
+		t.Fatalf("expected unbound labeled DGD to remain, got %v", err)
+	}
+}
+
+func TestDeleteGeneratedDGDsDiscoversDGDWithoutDGDR(t *testing.T) {
+	scheme := newScheme()
+	md := newMDForController("test", "default")
+	generatedDGD := newDynamoResource(DynamoAPIVersion, DynamoGraphDeploymentKind, "generated-dgd", md.Namespace)
+	generatedDGD.SetLabels(map[string]string{
+		dynamoDGDRNameLabel:      md.Name,
+		dynamoDGDRNamespaceLabel: md.Namespace,
+	})
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(generatedDGD).Build()
+	r := NewDynamoProviderReconciler(c, scheme, "")
+
+	pending, err := r.deleteGeneratedDGDs(context.Background(), md, nil)
+	if err != nil || pending {
+		t.Fatalf("expected generated DGD deletion without DGDR, pending=%v err=%v", pending, err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(generatedDGD), generatedDGD); err != nil {
+		t.Fatalf("expected unbound labeled DGD to remain, got %v", err)
+	}
+}
+
+func TestDeleteGeneratedDGDsDoesNotDeleteReplacement(t *testing.T) {
+	scheme := newScheme()
+	md := newMDForController("test", "default")
+	generatedDGD := newDynamoResource(DynamoAPIVersion, DynamoGraphDeploymentKind, "generated-dgd", md.Namespace)
+	generatedDGD.SetUID("old-uid")
+	generatedDGD.SetLabels(map[string]string{
+		dynamoDGDRNameLabel:      md.Name,
+		dynamoDGDRNamespaceLabel: md.Namespace,
+	})
+	md.Status.Provider.WorkloadRef = resourceReference(generatedDGD)
+	replaced := false
+	interceptorFuncs := interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if obj.GetObjectKind().GroupVersionKind().Kind != DynamoGraphDeploymentKind || replaced {
+				return c.Delete(ctx, obj, opts...)
+			}
+			replaced = true
+			if err := c.Delete(ctx, obj); err != nil {
+				return err
+			}
+			replacement := newDynamoResource(DynamoAPIVersion, DynamoGraphDeploymentKind, obj.GetName(), obj.GetNamespace())
+			replacement.SetUID("new-uid")
+			if err := c.Create(ctx, replacement); err != nil {
+				return err
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).
+		WithObjects(generatedDGD).
+		WithInterceptorFuncs(interceptorFuncs).
+		Build()
+	r := NewDynamoProviderReconciler(c, scheme, "")
+
+	pending, err := r.deleteGeneratedDGDs(context.Background(), md, nil)
+	if err == nil || pending {
+		t.Fatalf("expected replacement conflict, pending=%v err=%v", pending, err)
+	}
+	replacement := newDynamoResource(DynamoAPIVersion, DynamoGraphDeploymentKind, generatedDGD.GetName(), md.Namespace)
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(replacement), replacement); err != nil {
+		t.Fatalf("expected replacement DGD to remain: %v", err)
+	}
+	if replacement.GetUID() != "new-uid" {
+		t.Fatalf("expected replacement UID, got %q", replacement.GetUID())
+	}
+}
+
+func TestDeploymentModeTransitionToIntent(t *testing.T) {
+	scheme := newScheme()
+	md := newMDForController("test", "default")
+	dgd := newDynamoResource(DynamoAPIVersion, DynamoGraphDeploymentKind, md.Name, md.Namespace)
+	dgd.SetUID("manual-uid")
+	dgd.SetOwnerReferences([]metav1.OwnerReference{{UID: md.UID}})
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(dgd).Build()
+	r := NewDynamoProviderReconciler(c, scheme, "")
+	desired := newDynamoResource(
+		DynamoGraphDeploymentRequestAPIVersion,
+		DynamoGraphDeploymentRequestKind,
+		md.Name,
+		md.Namespace,
+	)
+
+	if pending, err := r.ensureDeploymentModeTransition(context.Background(), desired, md); err != nil || !pending {
+		t.Fatalf("identity checkpoint: %v", err)
+	}
+	transitioning, err := r.ensureDeploymentModeTransition(context.Background(), desired, md)
+	if err != nil || !transitioning {
+		t.Fatalf("expected transition after deleting direct DGD, transitioning=%v err=%v", transitioning, err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(dgd), dgd); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected direct DGD deletion, got %v", err)
+	}
+	transitioning, err = r.ensureDeploymentModeTransition(context.Background(), desired, md)
+	if err != nil || transitioning {
+		t.Fatalf("expected completed transition, transitioning=%v err=%v", transitioning, err)
+	}
+}
+
+func TestDeploymentModeTransitionToManual(t *testing.T) {
+	scheme := newScheme()
+	md := newMDForController("test", "default")
+	dgdr := newDynamoResource(
+		DynamoGraphDeploymentRequestAPIVersion,
+		DynamoGraphDeploymentRequestKind,
+		md.Name,
+		md.Namespace,
+	)
+	md.Annotations = map[string]string{dynamointent.AttemptAnnotation: "manual-2"}
+	dgdr.SetOwnerReferences([]metav1.OwnerReference{{UID: md.UID}})
+	dgdr.Object["status"] = map[string]any{"dgdName": "test-dgd"}
+	generatedDGD := newDynamoResource(DynamoAPIVersion, DynamoGraphDeploymentKind, "test-dgd", md.Namespace)
+	generatedDGD.SetUID("workload-uid")
+	generatedDGD.SetLabels(map[string]string{
+		dynamoDGDRNameLabel:      md.Name,
+		dynamoDGDRNamespaceLabel: md.Namespace,
+	})
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(dgdr, generatedDGD).Build()
+	r := NewDynamoProviderReconciler(c, scheme, "")
+	desired := newDynamoResource(DynamoAPIVersion, DynamoGraphDeploymentKind, md.Name, md.Namespace)
+
+	if pending, err := r.ensureDeploymentModeTransition(context.Background(), desired, md); err != nil || !pending {
+		t.Fatalf("identity checkpoint: %v", err)
+	}
+	transitioning, err := r.ensureDeploymentModeTransition(context.Background(), desired, md)
+	if err != nil || !transitioning {
+		t.Fatalf("expected transition after deleting generated DGD, transitioning=%v err=%v", transitioning, err)
+	}
+	if err := c.Get(
+		context.Background(),
+		client.ObjectKeyFromObject(generatedDGD),
+		generatedDGD,
+	); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected generated DGD deletion, got %v", err)
+	}
+	transitioning, err = r.ensureDeploymentModeTransition(context.Background(), desired, md)
+	if err != nil || !transitioning {
+		t.Fatalf("expected transition after deleting DGDR, transitioning=%v err=%v", transitioning, err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(dgdr), dgdr); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected DGDR deletion, got %v", err)
+	}
+	transitioning, err = r.ensureDeploymentModeTransition(context.Background(), desired, md)
+	if err != nil || transitioning {
+		t.Fatalf("expected completed transition, transitioning=%v err=%v", transitioning, err)
+	}
+}
+
+func TestDeploymentModeTransitionToManualCleansGeneratedDGDWithoutDGDR(t *testing.T) {
+	scheme := newScheme()
+	md := newMDForController("test", "default")
+	generatedDGD := newDynamoResource(DynamoAPIVersion, DynamoGraphDeploymentKind, "generated-dgd", md.Namespace)
+	generatedDGD.SetLabels(map[string]string{
+		dynamoDGDRNameLabel:      md.Name,
+		dynamoDGDRNamespaceLabel: md.Namespace,
+	})
+	generatedDGD.SetUID("workload-uid")
+	md.Status.Provider.WorkloadRef = resourceReference(generatedDGD)
+	md.Status.Provider.RequestRef = resourceReference(newDynamoResource(DynamoGraphDeploymentRequestAPIVersion, DynamoGraphDeploymentRequestKind, md.Name, md.Namespace))
+	md.Annotations = map[string]string{dynamointent.AttemptAnnotation: "manual-2"}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(generatedDGD).Build()
+	r := NewDynamoProviderReconciler(c, scheme, "")
+	desired := newDynamoResource(DynamoAPIVersion, DynamoGraphDeploymentKind, md.Name, md.Namespace)
+
+	if pending, err := r.ensureDeploymentModeTransition(context.Background(), desired, md); err != nil || !pending {
+		t.Fatalf("identity checkpoint: %v", err)
+	}
+	transitioning, err := r.ensureDeploymentModeTransition(context.Background(), desired, md)
+	if err != nil || !transitioning {
+		t.Fatalf("expected transition while deleting generated DGD, transitioning=%v err=%v", transitioning, err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(generatedDGD), generatedDGD); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected generated DGD deletion, got %v", err)
+	}
+
+	transitioning, err = r.ensureDeploymentModeTransition(context.Background(), desired, md)
+	if err != nil || transitioning {
+		t.Fatalf("expected completed transition after generated DGD deletion, transitioning=%v err=%v", transitioning, err)
+	}
+}
+
+func TestManualModeTransitionWithoutDGDRCRD(t *testing.T) {
+	scheme := newScheme()
+	md := newMDForController("test", "default")
+	generatedDGD := newDynamoResource(DynamoAPIVersion, DynamoGraphDeploymentKind, "generated-dgd", md.Namespace)
+	generatedDGD.SetLabels(map[string]string{
+		dynamoDGDRNameLabel:      md.Name,
+		dynamoDGDRNamespaceLabel: md.Namespace,
+	})
+	interceptorFuncs := interceptor.Funcs{
+		Get: func(
+			ctx context.Context,
+			c client.WithWatch,
+			key client.ObjectKey,
+			obj client.Object,
+			opts ...client.GetOption,
+		) error {
+			if resource, ok := obj.(*unstructured.Unstructured); ok &&
+				resource.GetKind() == DynamoGraphDeploymentRequestKind {
+				return &meta.NoKindMatchError{
+					GroupKind: schema.GroupKind{
+						Group: DynamoAPIGroup,
+						Kind:  DynamoGraphDeploymentRequestKind,
+					},
+					SearchedVersions: []string{DynamoGraphDeploymentRequestAPIVersion},
+				}
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).
+		WithObjects(generatedDGD).
+		WithInterceptorFuncs(interceptorFuncs).
+		Build()
+	r := NewDynamoProviderReconciler(c, scheme, "")
+	desired := newDynamoResource(DynamoAPIVersion, DynamoGraphDeploymentKind, md.Name, md.Namespace)
+
+	transitioning, err := r.ensureDeploymentModeTransition(context.Background(), desired, md)
+	if err != nil {
+		t.Fatalf("expected missing DGDR CRD to be ignored in manual mode: %v", err)
+	}
+	if transitioning {
+		t.Fatal("expected transition while deleting generated DGD with unavailable DGDR CRD")
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(generatedDGD), generatedDGD); err != nil {
+		t.Fatalf("expected unbound DGD preserved, got %v", err)
+	}
+
+	transitioning, err = r.ensureDeploymentModeTransition(context.Background(), desired, md)
+	if err != nil || transitioning {
+		t.Fatalf("expected completed transition after generated DGD deletion, transitioning=%v err=%v", transitioning, err)
+	}
+}
+
+func TestReconcileIntentDeletionRemovesDGDAndDGDR(t *testing.T) {
+	scheme := newScheme()
+	md := newMDForController("test", "default")
+	setIntentMode(md)
+	controllerutil.AddFinalizer(md, FinalizerName)
+	now := metav1.Now()
+	md.DeletionTimestamp = &now
+
+	dgdr := newDynamoResource(DynamoGraphDeploymentRequestAPIVersion, DynamoGraphDeploymentRequestKind, md.Name, md.Namespace)
+	dgdr.SetOwnerReferences([]metav1.OwnerReference{{UID: md.UID}})
+	dgdr.Object["status"] = map[string]any{"dgdName": "test-dgd"}
+	dgd := newDynamoResource(DynamoAPIVersion, DynamoGraphDeploymentKind, "test-dgd", md.Namespace)
+	dgd.SetUID("workload-uid")
+	dgd.SetLabels(map[string]string{
+		dynamoDGDRNameLabel:      md.Name,
+		dynamoDGDRNamespaceLabel: md.Namespace,
+	})
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(md, dgdr, dgd).WithStatusSubresource(md).Build()
+	r := NewDynamoProviderReconciler(c, scheme, "")
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(md)}
+
+	if _, err := r.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("identity checkpoint: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("unexpected first cleanup error: %v", err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(dgd), dgd); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected generated DGD deletion, got %v", err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(dgdr), dgdr); err != nil {
+		t.Fatalf("expected DGDR to remain after first cleanup pass: %v", err)
+	}
+
+	if _, err := r.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("unexpected second cleanup error: %v", err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(dgdr), dgdr); !apierrors.IsNotFound(err) {
+		t.Fatalf("expected DGDR deletion after generated DGD, got %v", err)
+	}
+}
+
 func TestReconcileHandleDeletion(t *testing.T) {
 	scheme := newScheme()
 	md := newMDForController("test", "default")
@@ -411,7 +801,7 @@ func TestReconcileHandleDeletion(t *testing.T) {
 	now := metav1.Now()
 	md.DeletionTimestamp = &now
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(md).WithStatusSubresource(md).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(md).WithStatusSubresource(md).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	_, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -435,7 +825,7 @@ func TestReconcileDeletionNoFinalizer(t *testing.T) {
 	md.DeletionTimestamp = &now
 	md.Finalizers = []string{"other-finalizer"}
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(md).WithStatusSubresource(md).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(md).WithStatusSubresource(md).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -467,7 +857,7 @@ func TestReconcileDeletionWithUpstreamResource(t *testing.T) {
 		{APIVersion: "airunway.ai/v1alpha1", Kind: "ModelDeployment", Name: "test", UID: "test-uid"},
 	})
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(md, dgd).WithStatusSubresource(md).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(md, dgd).WithStatusSubresource(md).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -538,7 +928,7 @@ func TestReconcileDeletionWithMissingUpstreamCRDCleansUpManagedResources(t *test
 	}
 
 	c := fake.NewClientBuilder().
-		WithScheme(scheme).
+		WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).
 		WithObjects(md, pvc, job).
 		WithStatusSubresource(md).
 		WithInterceptorFuncs(interceptorFuncs).
@@ -573,7 +963,7 @@ func TestReconcileDeletionWithMissingUpstreamCRDCleansUpManagedResources(t *test
 
 func TestCreateOrUpdateResourceNew(t *testing.T) {
 	scheme := newScheme()
-	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	md := &airunwayv1alpha1.ModelDeployment{}
@@ -607,7 +997,7 @@ func TestCreateOrUpdateResourceUpdate(t *testing.T) {
 	})
 	existing.Object["spec"] = map[string]interface{}{"backendFramework": "vllm"}
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(existing).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	md := &airunwayv1alpha1.ModelDeployment{}
@@ -642,7 +1032,7 @@ func TestCreateOrUpdateResourceNoChange(t *testing.T) {
 	})
 	existing.Object["spec"] = map[string]interface{}{"backendFramework": "vllm"}
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(existing).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	md := &airunwayv1alpha1.ModelDeployment{}
@@ -664,7 +1054,7 @@ func TestCreateOrUpdateResourceNoChange(t *testing.T) {
 
 func TestSyncStatusNotFound(t *testing.T) {
 	scheme := newScheme()
-	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	md := &airunwayv1alpha1.ModelDeployment{}
@@ -686,12 +1076,13 @@ func TestSyncStatusRunning(t *testing.T) {
 	setDGDGVK(dgd)
 	dgd.SetName("test")
 	dgd.SetNamespace("default")
+	dgd.SetOwnerReferences([]metav1.OwnerReference{{UID: "test-uid"}})
 	dgd.Object["status"] = map[string]interface{}{"state": "successful"}
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dgd).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(dgd).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
-	md := &airunwayv1alpha1.ModelDeployment{}
+	md := newMDForController("test", "default")
 	md.Status.Message = "DynamoGraphDeployment created, waiting for pods to be ready"
 	desired := &unstructured.Unstructured{}
 	setDGDGVK(desired)
@@ -721,12 +1112,13 @@ func TestSyncStatusFailed(t *testing.T) {
 	setDGDGVK(dgd)
 	dgd.SetName("test")
 	dgd.SetNamespace("default")
+	dgd.SetOwnerReferences([]metav1.OwnerReference{{UID: "test-uid"}})
 	dgd.Object["status"] = map[string]interface{}{"state": "failed", "message": "oom"}
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dgd).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(dgd).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
-	md := &airunwayv1alpha1.ModelDeployment{}
+	md := newMDForController("test", "default")
 	desired := &unstructured.Unstructured{}
 	setDGDGVK(desired)
 	desired.SetName("test")
@@ -748,12 +1140,13 @@ func TestSyncStatusDeploying(t *testing.T) {
 	setDGDGVK(dgd)
 	dgd.SetName("test")
 	dgd.SetNamespace("default")
+	dgd.SetOwnerReferences([]metav1.OwnerReference{{UID: "test-uid"}})
 	dgd.Object["status"] = map[string]interface{}{"state": "deploying"}
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dgd).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(dgd).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
-	md := &airunwayv1alpha1.ModelDeployment{}
+	md := newMDForController("test", "default")
 	desired := &unstructured.Unstructured{}
 	setDGDGVK(desired)
 	desired.SetName("test")
@@ -808,7 +1201,7 @@ func TestReconcilePVCNotBound(t *testing.T) {
 	md := newMDWithStorage("test", "default")
 	controllerutil.AddFinalizer(md, FinalizerName)
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(md).WithStatusSubresource(md).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(md).WithStatusSubresource(md).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -877,7 +1270,7 @@ func TestReconcileDownloadNotComplete(t *testing.T) {
 		},
 	}
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(md, pvc).WithStatusSubresource(md, pvc).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(md, pvc).WithStatusSubresource(md, pvc).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -959,7 +1352,7 @@ func TestReconcileFullPipeline(t *testing.T) {
 		},
 	}
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(md, pvc, job).WithStatusSubresource(md, pvc, job).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(md, pvc, job).WithStatusSubresource(md, pvc, job).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -996,7 +1389,7 @@ func TestReconcileNoStorageSkipsPhases(t *testing.T) {
 	md := newMDForController("test", "default")
 	controllerutil.AddFinalizer(md, FinalizerName)
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(md).WithStatusSubresource(md).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(md).WithStatusSubresource(md).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	result, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -1067,7 +1460,7 @@ func TestReconcileDeletionCleansUpResources(t *testing.T) {
 		},
 	}
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(md, pvc, job).WithStatusSubresource(md).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(md, pvc, job).WithStatusSubresource(md).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	_, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -1130,7 +1523,7 @@ func TestReconcileDeletionRetriesOnCleanupFailure(t *testing.T) {
 	}
 
 	c := fake.NewClientBuilder().
-		WithScheme(scheme).
+		WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).
 		WithObjects(md, job).
 		WithStatusSubresource(md).
 		WithInterceptorFuncs(interceptorFuncs).
@@ -1216,7 +1609,7 @@ func TestReconcileDeletionWithDGDDelaysCleanup(t *testing.T) {
 		},
 	}
 
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(md, dgd, pvc, job).WithStatusSubresource(md).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(operatorRuntimeFixtures("1.1.1", "")...).WithObjects(md, dgd, pvc, job).WithStatusSubresource(md).Build()
 	r := NewDynamoProviderReconciler(c, scheme, "")
 
 	// --- First reconciliation: DGD exists, should delete DGD but NOT PVC/Job ---

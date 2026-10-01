@@ -1,4 +1,6 @@
+import { getDynamoIntent, isDynamoIntent, type DynamoIntent } from './dynamo';
 import { Engine } from './model';
+import type { DynamoToolCallingConfig } from './dynamo-tool-calling';
 
 // ==================== ModelDeployment CRD Types ====================
 // These types mirror the Go CRD types in controller/api/v1alpha1/
@@ -45,7 +47,7 @@ export interface RecipeProvenance {
   revision?: string;
 }
 
-export interface DeploymentConfig {
+export interface DeploymentConfig extends DynamoToolCallingConfig {
   name: string;
   namespace: string;
   modelId: string;
@@ -97,7 +99,7 @@ export interface ProviderSpec {
   overrides?: Record<string, unknown>;
 }
 
-export interface EngineSpec {
+export interface EngineSpec extends DynamoToolCallingConfig {
   type: EngineType;
   image?: string;
   contextLength?: number;
@@ -186,15 +188,52 @@ export interface ReplicaStatus {
   available: number;
 }
 
+export interface ProviderResourceRef {
+  apiVersion?: string;
+  kind?: string;
+  name?: string;
+  namespace?: string;
+  uid?: string;
+}
+
+export interface ProviderIntentStatus {
+  phase?: string;
+  profilingPhase?: string;
+  inputHash?: string;
+  attempt?: string;
+  hardware?: {
+    gpuSku?: string;
+    vramMb?: number;
+    numGpusPerNode?: number;
+    source?: 'provided' | 'discovered' | 'mixed';
+  };
+  plan?: {
+    source: 'selectedConfig' | 'workload';
+    engine?: string;
+    servingMode?: string;
+    workers?: Array<{
+      name: string;
+      role?: string;
+      replicas?: number;
+      gpusPerReplica?: number;
+      tensorParallelism?: number;
+      pipelineParallelism?: number;
+    }>;
+  };
+  diagnostic?: string;
+}
+
 export interface ProviderStatus {
   name?: string;
   selectedReason?: string;
-  resourceRef?: {
-    apiVersion?: string;
-    kind?: string;
-    name?: string;
-    namespace?: string;
-  };
+  resourceName?: string;
+  resourceKind?: string;
+  /** Compatibility with older API clients. New controllers emit resourceName/resourceKind. */
+  resourceRef?: ProviderResourceRef;
+  requestRef?: ProviderResourceRef;
+  workloadRef?: ProviderResourceRef;
+  inferencePoolRef?: ProviderResourceRef;
+  intent?: ProviderIntentStatus;
 }
 
 export interface Condition {
@@ -243,6 +282,7 @@ export interface ImageStatus {
 }
 
 export interface EndpointStatus {
+  namespace?: string;
   service?: string;
   port?: number;
 }
@@ -257,7 +297,7 @@ export interface ModelDeploymentStatus {
   message?: string;
   engine?: EngineStatus;
   provider?: ProviderStatus;
-  replicas?: ReplicaStatus;
+  replicas?: Partial<ReplicaStatus>;
   prefillReplicas?: {
     desired: number;
     ready: number;
@@ -279,6 +319,8 @@ export interface ModelDeployment {
   metadata: {
     name: string;
     namespace: string;
+    resourceVersion?: string;
+    uid?: string;
     creationTimestamp?: string;
     labels?: Record<string, string>;
     annotations?: Record<string, string>;
@@ -299,7 +341,13 @@ export interface PodStatus {
   message?: string;
 }
 
-export interface DeploymentStatus {
+export interface DeploymentStatus extends DynamoToolCallingConfig {
+  resourceVersion?: string;
+  providerStatus?: ProviderStatus;
+  configurationMode?: 'manual' | 'automatic';
+  intent?: DynamoIntent;
+  message?: string;
+  frontendNamespace?: string;
   name: string;
   namespace: string;
   modelId: string;
@@ -379,14 +427,14 @@ export function parseFrontendService(frontendService?: string): FrontendServiceR
 }
 
 export function buildPortForwardCommand(
-  deployment: Pick<DeploymentStatus, 'name' | 'namespace' | 'frontendService'>,
+  deployment: Pick<DeploymentStatus, 'name' | 'namespace' | 'frontendService' | 'frontendNamespace'>,
   localPort = LEGACY_FRONTEND_SERVICE_PORT
 ): string {
   const frontendService = parseFrontendService(deployment.frontendService);
   const serviceName = frontendService?.serviceName || `${deployment.name}-frontend`;
   const servicePort = frontendService?.servicePort || LEGACY_FRONTEND_SERVICE_PORT;
 
-  return `kubectl port-forward svc/${serviceName} ${localPort}:${servicePort} -n ${deployment.namespace}`;
+  return `kubectl port-forward svc/${serviceName} ${localPort}:${servicePort} -n ${deployment.frontendNamespace || deployment.namespace}`;
 }
 
 const FATAL_POD_REASONS = new Set([
@@ -578,6 +626,9 @@ export function toModelDeploymentSpec(config: DeploymentConfig): ModelDeployment
     },
     engine: {
       type: resolveEngineType(config),
+      toolCalling: config.toolCalling,
+      toolCallParser: config.toolCallParser,
+      reasoningParser: config.reasoningParser,
       contextLength: config.contextLength || config.maxModelLen,
       trustRemoteCode: config.trustRemoteCode,
       enablePrefixCaching: config.enablePrefixCaching,
@@ -673,25 +724,46 @@ export function toModelDeploymentSpec(config: DeploymentConfig): ModelDeployment
     };
   }
 
+  if (getDynamoIntent(config.provider, config.providerOverrides)) {
+    delete spec.resources;
+    delete spec.scaling;
+    delete spec.serving;
+  }
   return spec;
 }
 
 export function toDeploymentStatus(md: ModelDeployment, pods: PodStatus[] = []): DeploymentStatus {
   const status = md.status || {};
   const spec = md.spec;
-  const frontendServiceName = status.endpoint?.service || md.metadata.name;
+  const automatic = isDynamoIntent(spec.provider?.name || status.provider?.name, spec.provider?.overrides);
+  // A request is not a Service. Wait for the provider to publish its serving endpoint.
+  const frontendServiceName = status.endpoint?.service || (automatic || status.provider?.workloadRef ? undefined : md.metadata.name);
   const replicas = resolveReplicaStatus(spec, status, pods);
 
   return {
     name: md.metadata.name,
     namespace: md.metadata.namespace,
+    resourceVersion: md.metadata.resourceVersion,
+    providerStatus: status.provider,
+    configurationMode: automatic ? 'automatic' : 'manual',
+    intent: getDynamoIntent(spec.provider?.name || status.provider?.name, spec.provider?.overrides),
+    message: status.message,
+    frontendNamespace: status.endpoint?.namespace || status.provider?.workloadRef?.namespace || md.metadata.namespace,
     modelId: spec.model.id,
     servedModelName: spec.model.servedName,
+    toolCalling: spec.engine?.toolCalling,
+    toolCallParser: spec.engine?.toolCallParser,
+    reasoningParser: spec.engine?.reasoningParser,
     engine: (spec.engine?.type as Engine) || (status.engine?.type as Engine) || undefined,
     mode: spec.serving?.mode || 'aggregated',
-    phase: resolveDeploymentPhase(spec, status, pods),
+    phase: automatic ? (status.phase || 'Pending') : resolveDeploymentPhase(spec, status, pods),
     provider: status.provider?.name || spec.provider?.name || 'unknown',
-    replicas,
+    replicas: automatic ? {
+      // Go omits zero-valued status counters. Never infer serving copies from a profiling pod.
+      desired: status.replicas?.desired ?? 0,
+      ready: status.replicas?.ready ?? 0,
+      available: status.replicas?.available ?? 0,
+    } : replicas,
     conditions: status.conditions,
     pods,
     createdAt: md.metadata.creationTimestamp || new Date().toISOString(),
