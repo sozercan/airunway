@@ -35,6 +35,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	airunwayv1alpha1 "github.com/ai-runway/airunway/controller/api/v1alpha1"
+	"github.com/ai-runway/airunway/controller/pkg/storage"
 	vllm "github.com/ai-runway/airunway/providers/vllm"
 )
 
@@ -55,6 +56,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var downloadJobImage string
 	var tlsOpts []func(*tls.Config)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "The address the metrics endpoint binds to.")
@@ -68,6 +70,9 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics server.")
+
+	flag.StringVar(&downloadJobImage, "download-job-image", storage.DefaultDownloadJobImage,
+		"Container image for model download jobs.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -110,6 +115,9 @@ func main() {
 
 	// Set up the vLLM provider reconciler
 	reconciler := vllm.NewVLLMProviderReconciler(mgr.GetClient(), mgr.GetScheme())
+	if downloadJobImage != "" {
+		reconciler.DownloadJobImage = downloadJobImage
+	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "VLLMProvider")
 		os.Exit(1)

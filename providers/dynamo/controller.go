@@ -22,6 +22,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"io"
+	"maps"
 	"regexp"
 	"strings"
 	"syscall"
@@ -546,6 +547,7 @@ func (r *DynamoProviderReconciler) createOrUpdateResource(ctx context.Context, r
 	// from the existing spec before comparing.
 	existingSpec, _, _ := unstructured.NestedMap(existing.Object, "spec")
 	newSpec, _, _ := unstructured.NestedMap(resource.Object, "spec")
+	preserveMinAvailableDefaults(existingSpec, newSpec)
 
 	// Normalize server-added zero values on both sides for the ordinary comparison, then
 	// compare paths explicitly supplied through provider.overrides.spec with presence-aware
@@ -555,11 +557,46 @@ func (r *DynamoProviderReconciler) createOrUpdateResource(ctx context.Context, r
 	if !equality.Semantic.DeepEqual(stripEmptyDefaults(existingSpec), stripEmptyDefaults(newSpec)) ||
 		overrideSpecDiffers(md, existingSpec, newSpec) {
 		logger.Info("Updating resource", "kind", resource.GetKind(), "name", resource.GetName())
-		resource.SetResourceVersion(existing.GetResourceVersion())
-		return wrapResourceWriteError(r.Update(ctx, resource, strictFieldValidation), resourceWasOwnedActiveAndServing)
+		// Start with the observed object so an ordinary spec update cannot
+		// remove the operator's immutable annotations, finalizers or ownership.
+		update := existing.DeepCopy()
+		update.Object["spec"] = newSpec
+		update.SetLabels(mergeDynamoMetadata(existing.GetLabels(), resource.GetLabels()))
+		update.SetAnnotations(mergeDynamoMetadata(existing.GetAnnotations(), resource.GetAnnotations()))
+		return wrapResourceWriteError(r.Update(ctx, update, strictFieldValidation), resourceWasOwnedActiveAndServing)
 	}
 
 	return nil
+}
+
+func mergeDynamoMetadata(existing, desired map[string]string) map[string]string {
+	merged := maps.Clone(existing)
+	if merged == nil {
+		merged = map[string]string{}
+	}
+	maps.Copy(merged, desired)
+	return merged
+}
+
+// preserveMinAvailableDefaults retains Dynamo's immutable, server-defaulted minAvailable
+// for matching services on an already ownership-verified resource. Explicit desired values,
+// including null, must reach upstream validation unchanged. Do not copy other server fields.
+func preserveMinAvailableDefaults(existingSpec, desiredSpec map[string]any) {
+	existingServices, _ := existingSpec["services"].(map[string]any)
+	desiredServices, _ := desiredSpec["services"].(map[string]any)
+	for name, desired := range desiredServices {
+		desiredService, ok := desired.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, specified := desiredService["minAvailable"]; specified {
+			continue
+		}
+		existingService, _ := existingServices[name].(map[string]any)
+		if value, found := existingService["minAvailable"]; found {
+			desiredService["minAvailable"] = runtime.DeepCopyJSONValue(value)
+		}
+	}
 }
 
 // overrideSpecDiffers reports whether any path explicitly supplied through

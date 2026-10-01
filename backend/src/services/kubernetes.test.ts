@@ -266,6 +266,52 @@ describe('KubernetesService - deployment pod lookup', () => {
 
 
 describe('KubernetesService - pod logs', () => {
+  const waitingMessage = 'container "vllm" in pod "demo-model" is waiting to start: ContainerCreating';
+  const pendingLogCases = [
+    { name: 'SDK JSON body', error: { code: 400, body: JSON.stringify({ message: waitingMessage }) } },
+    { name: 'object body', error: { statusCode: 400, body: { message: waitingMessage } } },
+    { name: 'wrapped JSON body', error: { response: { statusCode: 400, body: JSON.stringify({ message: waitingMessage.replace('ContainerCreating', 'PodInitializing') }) } } },
+  ];
+
+  for (const { name, error } of pendingLogCases) {
+    test(`returns empty logs for a waiting container with ${name}`, async () => {
+      const service = asMockable();
+      const originalCoreV1Api = service.coreV1Api;
+      service.coreV1Api = {
+        readNamespacedPodLog: async () => { throw error; },
+      };
+
+      try {
+        expect(await kubernetesService.getPodLogs('demo-model', 'default', { container: 'vllm' })).toBe('');
+      } finally {
+        service.coreV1Api = originalCoreV1Api;
+      }
+    });
+  }
+
+  const otherLogErrors = [
+    { name: 'invalid container', error: { code: 400, body: { message: 'container "missing" is not valid for pod "demo-model"' } } },
+    { name: 'malformed JSON', error: { code: 400, body: '{invalid JSON' } },
+    { name: 'non-400 status', error: { code: 403, body: { message: waitingMessage } } },
+  ];
+
+  for (const { name, error } of otherLogErrors) {
+    test(`does not suppress log errors for ${name}`, async () => {
+      const service = asMockable();
+      const originalCoreV1Api = service.coreV1Api;
+      service.coreV1Api = {
+        readNamespacedPodLog: async () => { throw error; },
+      };
+
+      try {
+        await expect(kubernetesService.getPodLogs('demo-model', 'default', { container: 'vllm' }))
+          .rejects.toThrow("Failed to get logs for pod 'demo-model'");
+      } finally {
+        service.coreV1Api = originalCoreV1Api;
+      }
+    });
+  }
+
   test('defaults multi-container pod logs to the primary main container using pod list permission', async () => {
     const service = asMockable();
     const originalCoreV1Api = service.coreV1Api;

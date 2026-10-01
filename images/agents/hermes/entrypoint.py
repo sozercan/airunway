@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+from contextlib import redirect_stderr, redirect_stdout
 import http.client
 import json
 import os
@@ -277,6 +278,65 @@ def write_runtime_config(
         (STATE_DIR / "SOUL.md").write_text(system_prompt.strip() + "\n", encoding="utf-8")
 
 
+def one_shot_answer(
+    result: Any, secret_values: tuple[str | None, ...] = ()
+) -> str:
+    """Use native completion flags, never the wording of the model's answer."""
+    if (
+        not isinstance(result, dict)
+        or result.get("completed") is not True
+        or result.get("failed") is True
+        or result.get("interrupted") is True
+        or result.get("error")
+    ):
+        raise ValueError("Hermes task did not complete successfully.")
+    answer = result.get("final_response")
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError("Hermes returned no text answer.")
+    if any(value and value in answer for value in secret_values):
+        raise ValueError("Hermes returned sensitive runtime data.")
+    return answer
+
+
+def run_one_shot(task: str) -> str:
+    provider, model, base_url, model_key = model_config()
+    api_key = required(model_key[2:-1])
+    # The pinned native API returns completion/error flags that `hermes -z`
+    # discards. Raw native diagnostics can contain provider credentials.
+    with open(os.devnull, "w", encoding="utf-8") as sink:
+        with redirect_stdout(sink), redirect_stderr(sink):
+            from run_agent import AIAgent
+
+            agent = AIAgent(
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                quiet_mode=True,
+                # None means native defaults; [] is an explicit empty allowlist.
+                # Match the server platform's policy for late tool injection too.
+                enabled_toolsets=[],
+                platform="api_server",
+                load_soul_identity=True,
+            )
+            try:
+                if agent.tools or agent.valid_tool_names:
+                    raise ValueError("Hermes chat-only task exposed tools.")
+                result = agent.run_conversation(task)
+            finally:
+                agent.close()
+    return one_shot_answer(
+        result,
+        (
+            os.environ.get("OPENAI_API_KEY"),
+            os.environ.get("ANTHROPIC_API_KEY"),
+            os.environ.get("AZURE_OPENAI_API_KEY"),
+            os.environ.get("AIRUNWAY_AGENT_API_KEY"),
+            os.environ.get("API_SERVER_KEY"),
+        ),
+    )
+
+
 class ProxyHandler(HeaderDeadlineHandler):
     internal_key = ""
     access_token = ""
@@ -507,10 +567,23 @@ def main() -> None:
     )
 
     if os.environ.get("AIRUNWAY_AGENT_MODE", "server") == "job":
+        structured = "resultFormat" in config
+        if structured and config["resultFormat"] != "airunway-json-v1":
+            raise ValueError("spec.config.resultFormat must be airunway-json-v1 when set")
         task = config.get("task") or config.get("prompt")
         if not isinstance(task, str) or not task.strip():
             raise ValueError("job lifecycle requires spec.config.task or spec.config.prompt")
-        os.execvpe("hermes", ["hermes", "-z", task], os.environ)
+        try:
+            answer = run_one_shot(task)
+            if structured:
+                if not isinstance(answer, str) or not answer.strip():
+                    raise ValueError("Hermes returned no text answer.")
+                answer = "AIRUNWAY_RESULT_V1 " + json.dumps({"output": answer}, separators=(",", ":"))
+        except Exception:
+            print("Hermes task failed.", file=sys.stderr, flush=True)
+            raise SystemExit(1) from None
+        print(answer, flush=True)
+        return
 
     ProxyHandler.internal_key = internal_key
     ProxyHandler.access_token = required("AIRUNWAY_AGENT_API_KEY")

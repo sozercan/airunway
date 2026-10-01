@@ -50,13 +50,10 @@ func HasStorageVolumes(md *airunwayv1alpha1.ModelDeployment) bool {
 
 // EnsurePVCs ensures that all storage volume PVCs exist and are usable.
 //
-// For managed PVCs (Size is set): returns ready once the PVC has been created,
-// even if it is still in Pending phase. This avoids a deadlock with
-// WaitForFirstConsumer storage classes, where the PVC won't bind until a Pod
-// (such as the model-download Job) references it.
-//
-// For pre-existing PVCs (Size is nil): returns ready only when the PVC is Bound,
-// since these are outside the controller's control.
+// Both managed and pre-existing PVCs may still be Pending. This avoids a
+// deadlock with WaitForFirstConsumer storage classes, where the PVC won't bind
+// until a Pod (such as the model-download Job or serving pod) references it.
+// Pre-existing PVCs are only checked, never adopted or modified.
 func EnsurePVCs(ctx context.Context, c client.Client, md *airunwayv1alpha1.ModelDeployment) (bool, error) {
 	logger := log.FromContext(ctx)
 
@@ -85,8 +82,7 @@ func EnsurePVCs(ctx context.Context, c client.Client, md *airunwayv1alpha1.Model
 			case corev1.ClaimBound:
 				logger.Info("Pre-existing PVC is Bound", "name", claimName)
 			case corev1.ClaimPending:
-				logger.Info("Pre-existing PVC is Pending", "name", claimName)
-				allReady = false
+				logger.Info("Pre-existing PVC is Pending (will bind when a consumer pod is scheduled)", "name", claimName)
 			case corev1.ClaimLost:
 				return false, fmt.Errorf("pre-existing PVC %q is in Lost phase", claimName)
 			default:

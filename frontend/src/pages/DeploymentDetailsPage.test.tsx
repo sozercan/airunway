@@ -105,6 +105,24 @@ function streamResponse(chunks: string[]): Response {
   )
 }
 
+describe('DeploymentDetailsPage storage summary', () => {
+  it.each([
+    { storageClassName: 'managed-csi', summary: 'New disk · 10Gi · managed-csi' },
+    { storageClassName: undefined, summary: 'New disk · 10Gi' },
+  ])('renders readable separators with storage class $storageClassName', ({ storageClassName, summary }) => {
+    deploymentMock.current = createDeployment({
+      storage: {
+        volumes: [{ name: 'model-cache', size: '10Gi', storageClassName }],
+      },
+    })
+
+    const { container } = renderDetailsPage()
+
+    expect(screen.getByText(summary)).toBeInTheDocument()
+    expect(container).not.toHaveTextContent('&middot;')
+  })
+})
+
 describe('DeploymentDetailsPage chat panel', () => {
   beforeEach(() => {
     deploymentMock.current = createDeployment()

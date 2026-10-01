@@ -147,6 +147,20 @@ export function createRuntimeProxy({
       response.once("finish", releaseBudget);
       response.once("close", releaseBudget);
 
+      if (request.method === "GET" && request.url === "/v1/models") {
+        // This adapter exposes the main agent only. Native discovery also lists
+        // aliases, which make single-agent clients unable to select a model.
+        response.writeHead(200, {
+          "content-type": "application/json",
+          connection: "close",
+        });
+        response.end(JSON.stringify({
+          object: "list",
+          data: [{ id: "openclaw/main", object: "model", created: 0, owned_by: "openclaw" }],
+        }));
+        return;
+      }
+
       const headers = { ...request.headers, authorization: `Bearer ${gatewayToken}` };
       delete headers.host;
       delete headers["x-openclaw-session-key"];

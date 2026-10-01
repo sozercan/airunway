@@ -18,6 +18,7 @@ package kuberay
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -25,6 +26,7 @@ import (
 	airunwayv1alpha1 "github.com/ai-runway/airunway/controller/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -59,6 +61,12 @@ func NewTransformer() *Transformer {
 
 // Transform converts a ModelDeployment to a RayService
 func (t *Transformer) Transform(ctx context.Context, md *airunwayv1alpha1.ModelDeployment) ([]*unstructured.Unstructured, error) {
+	// These raw CLI flags have no mapping to the provider's runtime configuration.
+	if len(md.Spec.Engine.ExtraArgs) > 0 {
+		return nil, fmt.Errorf("KubeRay does not support spec.engine.extraArgs (--engine-arg); " +
+			"remove raw arguments or select another provider")
+	}
+
 	rs := &unstructured.Unstructured{}
 	rs.SetAPIVersion(fmt.Sprintf("%s/%s", RayAPIGroup, RayAPIVersion))
 	rs.SetKind(RayServiceKind)
@@ -113,21 +121,10 @@ func (t *Transformer) Transform(ctx context.Context, md *airunwayv1alpha1.ModelD
 func (t *Transformer) buildSpec(md *airunwayv1alpha1.ModelDeployment) (map[string]interface{}, error) {
 	spec := map[string]interface{}{}
 
-	// Build serveConfigV2
-	replicas := int64(1)
-	if md.Spec.Scaling != nil && md.Spec.Scaling.Replicas > 0 {
-		replicas = int64(md.Spec.Scaling.Replicas)
+	serveConfig, err := t.buildServeConfig(md)
+	if err != nil {
+		return nil, err
 	}
-
-	serveConfig := fmt.Sprintf(`applications:
-  - name: llm
-    route_prefix: /
-    import_path: vllm_serve:deployment
-    deployments:
-      - name: VLLMDeployment
-        num_replicas: %d
-`, replicas)
-
 	spec["serveConfigV2"] = serveConfig
 
 	// Build rayClusterConfig
@@ -138,6 +135,97 @@ func (t *Transformer) buildSpec(md *airunwayv1alpha1.ModelDeployment) (map[strin
 	spec["rayClusterConfig"] = rayClusterConfig
 
 	return spec, nil
+}
+
+// buildServeConfig uses the native builder shipped in DefaultImage. Model identity
+// belongs in model_loading_config, not engine_kwargs, in Ray Serve LLM.
+func (t *Transformer) buildServeConfig(md *airunwayv1alpha1.ModelDeployment) (string, error) {
+	replicas := int32(1)
+	if md.Spec.Scaling != nil {
+		replicas = md.Spec.Scaling.Replicas
+	}
+	// Ray's application builder rejects num_replicas=0. An empty application
+	// list removes the model without enabling autoscaling back above zero.
+	if replicas == 0 {
+		return "applications: []\n", nil
+	}
+
+	modelID := md.Spec.Model.ID
+	if md.Spec.Model.ServedName != "" {
+		modelID = md.Spec.Model.ServedName
+	}
+	modelLoading := map[string]interface{}{
+		"model_id":     modelID,
+		"model_source": md.Spec.Model.ID,
+	}
+	engineKwargs := t.buildEngineKwargs(md)
+	// These CLI overrides must also use Ray's model-loading fields. Ray rejects
+	// model and served_model_name inside engine_kwargs during initialization.
+	for arg, field := range map[string]string{"model": "model_source", "served_model_name": "model_id"} {
+		if value, ok := engineKwargs[arg]; ok {
+			modelLoading[field] = value
+			delete(engineKwargs, arg)
+		}
+	}
+	config := map[string]interface{}{
+		"applications": []interface{}{
+			map[string]interface{}{
+				"name":         "llm",
+				"route_prefix": "/",
+				"import_path":  "ray.serve.llm:build_openai_app",
+				"args": map[string]interface{}{
+					"llm_configs": []interface{}{
+						map[string]interface{}{
+							"model_loading_config": modelLoading,
+							"engine_kwargs":        engineKwargs,
+							"deployment_config":    map[string]interface{}{"num_replicas": replicas},
+						},
+					},
+				},
+			},
+		},
+	}
+	data, err := yaml.Marshal(config)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal Ray Serve config: %w", err)
+	}
+	return string(data), nil
+}
+
+// buildEngineKwargs converts CLI-style map arguments into native vLLM kwargs.
+func (t *Transformer) buildEngineKwargs(md *airunwayv1alpha1.ModelDeployment) map[string]interface{} {
+	kwargs := map[string]interface{}{
+		"trust_remote_code":    md.Spec.Engine.TrustRemoteCode,
+		"tensor_parallel_size": int32(1),
+	}
+	if md.Spec.Resources != nil && md.Spec.Resources.GPU != nil && md.Spec.Resources.GPU.Count > 0 {
+		kwargs["tensor_parallel_size"] = md.Spec.Resources.GPU.Count
+	}
+	if md.Spec.Engine.ContextLength != nil {
+		kwargs["max_model_len"] = *md.Spec.Engine.ContextLength
+	}
+	// Keep overrides deterministic even if dashed and underscored aliases are
+	// both present. Explicit engine args take precedence over structured fields.
+	keys := make([]string, 0, len(md.Spec.Engine.Args))
+	for key := range md.Spec.Engine.Args {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		value := md.Spec.Engine.Args[key]
+		key = strings.ReplaceAll(key, "-", "_")
+		var parsed interface{}
+		switch {
+		case key == "model" || key == "served_model_name":
+			parsed = value
+		case value == "":
+			parsed = true
+		case json.Unmarshal([]byte(value), &parsed) != nil:
+			parsed = value
+		}
+		kwargs[key] = parsed
+	}
+	return kwargs
 }
 
 // buildRayClusterConfig creates the rayClusterConfig section
@@ -223,7 +311,7 @@ func (t *Transformer) buildHeadGroupSpec(md *airunwayv1alpha1.ModelDeployment) m
 func (t *Transformer) buildAggregatedWorkerGroup(md *airunwayv1alpha1.ModelDeployment) []interface{} {
 	image := t.getImage(md)
 	replicas := int64(1)
-	if md.Spec.Scaling != nil && md.Spec.Scaling.Replicas > 0 {
+	if md.Spec.Scaling != nil {
 		replicas = int64(md.Spec.Scaling.Replicas)
 	}
 
@@ -261,6 +349,7 @@ func (t *Transformer) buildAggregatedWorkerGroup(md *airunwayv1alpha1.ModelDeplo
 					map[string]interface{}{
 						"name":  "ray-worker",
 						"image": image,
+						"env":   t.buildEnvVars(md),
 						"resources": map[string]interface{}{
 							"limits": limits,
 						},
@@ -312,6 +401,7 @@ func (t *Transformer) buildDisaggregatedWorkerGroups(md *airunwayv1alpha1.ModelD
 						map[string]interface{}{
 							"name":  "ray-worker",
 							"image": image,
+							"env":   t.buildEnvVars(md),
 							"resources": map[string]interface{}{
 								"limits": prefillLimits,
 							},
@@ -357,6 +447,7 @@ func (t *Transformer) buildDisaggregatedWorkerGroups(md *airunwayv1alpha1.ModelD
 						map[string]interface{}{
 							"name":  "ray-worker",
 							"image": image,
+							"env":   t.buildEnvVars(md),
 							"resources": map[string]interface{}{
 								"limits": decodeLimits,
 							},

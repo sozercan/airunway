@@ -557,3 +557,55 @@ func TestBuildDisaggregatedWorkerGroupsWithCustomGPUType(t *testing.T) {
 		t.Errorf("expected prefill amd.com/gpu=2, got %v", pLimits["amd.com/gpu"])
 	}
 }
+
+func TestTransformAggregatedReplicaIntent(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		scaling *airunwayv1alpha1.ScalingSpec
+		want    int64
+	}{
+		{name: "omitted", want: 1},
+		{name: "zero", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 0}, want: 0},
+		{name: "one", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 1}, want: 1},
+		{name: "multiple", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 3}, want: 3},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			md := newTestMD("replica-intent", "default")
+			md.Spec.Scaling = tt.scaling
+			resources, err := NewTransformer().Transform(context.Background(), md)
+			if err != nil {
+				t.Fatal(err)
+			}
+			serveConfig, found, err := unstructured.NestedString(resources[0].Object, "spec", "serveConfigV2")
+			wantConfig := fmt.Sprintf("num_replicas: %d\n", tt.want)
+			if tt.want == 0 {
+				wantConfig = "applications: []\n"
+			}
+			if err != nil || !found || !strings.Contains(serveConfig, wantConfig) {
+				t.Fatalf("Serve replicas must be %d: %q, found=%v, err=%v", tt.want, serveConfig, found, err)
+			}
+			assertWorkerReplicaBounds(t, resources[0], tt.want)
+			status := NewStatusTranslator().extractReplicas(resources[0])
+			if status.Desired != int32(tt.want) {
+				t.Errorf("status desired = %d; want %d", status.Desired, tt.want)
+			}
+		})
+	}
+}
+
+func assertWorkerReplicaBounds(t *testing.T, upstream *unstructured.Unstructured, want int64) {
+	t.Helper()
+	groups, found, err := unstructured.NestedSlice(upstream.Object, "spec", "rayClusterConfig", "workerGroupSpecs")
+	if err != nil || !found || len(groups) != 1 {
+		t.Fatalf("expected one worker group, got %v, found=%v, err=%v", groups, found, err)
+	}
+	group, ok := groups[0].(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected worker group: %T", groups[0])
+	}
+	for _, field := range []string{"replicas", "minReplicas", "maxReplicas"} {
+		if got, ok := group[field].(int64); !ok || got != want {
+			t.Errorf("worker group %s = %v; want %d", field, group[field], want)
+		}
+	}
+}

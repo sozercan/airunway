@@ -85,11 +85,22 @@ export interface DeploymentConfig {
   gatewayEnabled?: boolean;
 }
 
+/** Immutable source staged by the download Job before Direct vLLM starts. */
+export interface ModelArtifactSpec {
+  uri: string;
+  revision?: string;
+  file?: string;
+  credentialsRef?: { name: string; key?: string };
+  image?: string;
+  serviceAccountName?: string;
+}
+
 export interface ModelSpec {
   id: string;
   servedName?: string;
   source?: ModelSource;
   storage?: StorageSpec;
+  artifact?: ModelArtifactSpec;
 }
 
 export interface ProviderSpec {

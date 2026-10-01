@@ -18,17 +18,29 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
 	airunwayv1alpha1 "github.com/ai-runway/airunway/controller/api/v1alpha1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
+
+func assertDownloadJobTokenAutomount(t *testing.T, job *batchv1.Job, want bool) {
+	t.Helper()
+	token := job.Spec.Template.Spec.AutomountServiceAccountToken
+	if token == nil || *token != want {
+		t.Fatalf("download Job must explicitly set automountServiceAccountToken=%t", want)
+	}
+}
 
 func TestNeedsDownloadJob(t *testing.T) {
 	tests := []struct {
@@ -138,6 +150,7 @@ func TestEnsureDownloadJobCreation(t *testing.T) {
 	}
 
 	// Verify Job spec
+	assertDownloadJobTokenAutomount(t, job, false)
 	if job.Spec.Template.Spec.Containers[0].Image != DefaultDownloadJobImage {
 		t.Errorf("expected image %s, got %s", DefaultDownloadJobImage, job.Spec.Template.Spec.Containers[0].Image)
 	}
@@ -269,6 +282,7 @@ func TestEnsureDownloadJobWithHFToken(t *testing.T) {
 		t.Fatalf("expected Job to be created: %v", err)
 	}
 
+	assertDownloadJobTokenAutomount(t, job, false)
 	container := job.Spec.Template.Spec.Containers[0]
 	if len(container.EnvFrom) != 1 {
 		t.Fatalf("expected 1 envFrom, got %d", len(container.EnvFrom))
@@ -618,6 +632,90 @@ func TestDownloadJobName(t *testing.T) {
 	}
 }
 
+func TestEnsureDownloadJobRefusesUnmanagedCollision(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		label string
+		value string
+	}{
+		{name: "unlabelled"},
+		{name: "foreign manager", label: airunwayv1alpha1.LabelManagedBy, value: "another-controller"},
+		{name: "missing manager", label: airunwayv1alpha1.LabelManagedBy},
+		{name: "different model", label: airunwayv1alpha1.LabelModelDeployment, value: "other-model"},
+		{name: "missing model", label: airunwayv1alpha1.LabelModelDeployment},
+		{name: "different job type", label: airunwayv1alpha1.LabelJobType, value: "other-job"},
+		{name: "missing job type", label: airunwayv1alpha1.LabelJobType},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := newScheme()
+			if err := batchv1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			md := artifactDownloadMD()
+			collision := buildDownloadJob(md, findModelCacheVolume(md), DefaultDownloadJobImage)
+			collision.UID = "colliding-job"
+			collision.OwnerReferences[0].UID = "other-owner"
+			if tt.label == "" {
+				collision.Labels = nil
+			} else {
+				collision.Labels[tt.label] = tt.value
+			}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(collision).Build()
+			completed, err := EnsureDownloadJob(context.Background(), c, md, DefaultDownloadJobImage)
+			if completed || err == nil || !strings.Contains(err.Error(), "refusing to delete") {
+				t.Fatalf("expected unmanaged collision error, got completed=%v, err=%v", completed, err)
+			}
+			got := &batchv1.Job{}
+			key := types.NamespacedName{Name: collision.Name, Namespace: collision.Namespace}
+			if err := c.Get(context.Background(), key, got); err != nil {
+				t.Fatalf("colliding Job must be preserved: %v", err)
+			}
+			if got.UID != collision.UID || got.OwnerReferences[0].UID != "other-owner" {
+				t.Fatal("colliding Job must not be replaced or adopted")
+			}
+		})
+	}
+}
+
+func TestDeleteStaleJobPreservesReplacement(t *testing.T) {
+	scheme := newScheme()
+	if err := batchv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	stale := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "model-download", Namespace: "default", UID: "stale-job"}}
+	replacement := stale.DeepCopy()
+	replacement.UID = "replacement-job"
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(replacement).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				options := (&client.DeleteOptions{}).ApplyOptions(opts)
+				if options.Preconditions == nil || options.Preconditions.UID == nil || *options.Preconditions.UID != stale.UID {
+					t.Fatal("stale Job deletion must require the UID observed during ownership checks")
+				}
+				// The fake client does not enforce UID preconditions. Model the API
+				// server's conflict when the checked Job was replaced before deletion.
+				current := &batchv1.Job{}
+				if err := c.Get(ctx, client.ObjectKeyFromObject(obj), current); err != nil {
+					return err
+				}
+				if *options.Preconditions.UID != current.UID {
+					return apierrors.NewConflict(batchv1.Resource("jobs"), obj.GetName(), fmt.Errorf("UID precondition failed"))
+				}
+				return c.Delete(ctx, obj, opts...)
+			},
+		}).Build()
+	if err := deleteStaleJob(context.Background(), c, stale); !apierrors.IsConflict(err) {
+		t.Fatalf("expected replacement conflict, got %v", err)
+	}
+	got := &batchv1.Job{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(replacement), got); err != nil {
+		t.Fatalf("replacement must be preserved: %v", err)
+	}
+	if got.UID != replacement.UID {
+		t.Fatal("replacement Job changed")
+	}
+}
+
 func TestEnsureDownloadJobStaleCompleted(t *testing.T) {
 	scheme := newScheme()
 	_ = batchv1.AddToScheme(scheme)
@@ -629,6 +727,7 @@ func TestEnsureDownloadJobStaleCompleted(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "my-model-model-download",
 			Namespace: "default",
+			Labels:    buildDownloadJob(md, findModelCacheVolume(md), DefaultDownloadJobImage).Labels,
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion: "airunway.ai/v1alpha1",
@@ -673,6 +772,7 @@ func TestEnsureDownloadJobStaleFailed(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "my-model-model-download",
 			Namespace: "default",
+			Labels:    buildDownloadJob(md, findModelCacheVolume(md), DefaultDownloadJobImage).Labels,
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion: "airunway.ai/v1alpha1",
@@ -719,6 +819,7 @@ func TestEnsureDownloadJobStaleRunning(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "my-model-model-download",
 			Namespace: "default",
+			Labels:    buildDownloadJob(md, findModelCacheVolume(md), DefaultDownloadJobImage).Labels,
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion: "airunway.ai/v1alpha1",
@@ -813,4 +914,118 @@ func TestIsOwnedByMD(t *testing.T) {
 			}
 		})
 	}
+}
+
+func artifactDownloadMD() *airunwayv1alpha1.ModelDeployment {
+	md := newDownloadMD("artifact-model", "default")
+	md.Spec.Model.Source = airunwayv1alpha1.ModelSourceCustom
+	md.Spec.Model.ID = "/model-cache/artifacts"
+	md.Spec.Provider = &airunwayv1alpha1.ProviderSpec{Name: "vllm"}
+	md.Spec.Model.Artifact = &airunwayv1alpha1.ModelArtifactSpec{URI: "s3://bucket/prefix", CredentialsRef: &airunwayv1alpha1.ArtifactCredentialsRef{Name: "artifact-auth"}, Image: "example.com/downloader:v1", ServiceAccountName: "model-reader"}
+	return md
+}
+
+func TestArtifactDownloadJob(t *testing.T) {
+	md := artifactDownloadMD()
+	if !NeedsDownloadJob(md) {
+		t.Fatal("artifact download was skipped")
+	}
+	job := buildDownloadJob(md, findModelCacheVolume(md), DefaultDownloadJobImage)
+	pod := job.Spec.Template.Spec
+	container := pod.Containers[0]
+	if container.Image != md.Spec.Model.Artifact.Image || len(container.Args) != 1 || container.Args[0] != "artifact" {
+		t.Fatal("wrong artifact invocation", container.Args)
+	}
+	if pod.ServiceAccountName != "model-reader" || job.Spec.Template.Labels["azure.workload.identity/use"] != "true" || job.Spec.ActiveDeadlineSeconds == nil {
+		t.Fatal("missing identity/deadline")
+	}
+	assertDownloadJobTokenAutomount(t, job, true)
+	if len(container.EnvFrom) != 0 {
+		t.Fatal("must not inject entire Secret")
+	}
+	found := false
+	for _, env := range container.Env {
+		if env.Name == "ARTIFACT_CREDENTIALS_JSON" {
+			found = true
+			if env.Value != "" || env.ValueFrom.SecretKeyRef.Name != "artifact-auth" || env.ValueFrom.SecretKeyRef.Key != "credentials" {
+				t.Fatal("wrong Secret selector")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("missing credentials")
+	}
+}
+
+func TestArtifactDownloadJobCleanupGrace(t *testing.T) {
+	md := artifactDownloadMD()
+	job := buildDownloadJob(md, findModelCacheVolume(md), DefaultDownloadJobImage)
+	if job.Spec.ActiveDeadlineSeconds == nil || *job.Spec.ActiveDeadlineSeconds != 24*60*60 {
+		t.Fatal("artifact Jobs must retain their 24-hour deadline")
+	}
+	grace := job.Spec.Template.Spec.TerminationGracePeriodSeconds
+	if grace == nil || *grace != 5*60 {
+		t.Fatal("artifact pods must allow five minutes for SIGTERM cleanup")
+	}
+	legacy := newDownloadMD("legacy", "default")
+	job = buildDownloadJob(legacy, findModelCacheVolume(legacy), DefaultDownloadJobImage)
+	if job.Spec.ActiveDeadlineSeconds != nil || job.Spec.Template.Spec.TerminationGracePeriodSeconds != nil {
+		t.Fatal("legacy HF Jobs must retain their default deadline and termination behavior")
+	}
+}
+
+func TestArtifactDownloadJobWithoutWorkloadIdentity(t *testing.T) {
+	md := artifactDownloadMD()
+	md.Spec.Model.Artifact.ServiceAccountName = ""
+	job := buildDownloadJob(md, findModelCacheVolume(md), DefaultDownloadJobImage)
+	pod := job.Spec.Template.Spec
+	assertDownloadJobTokenAutomount(t, job, false)
+	if pod.ServiceAccountName != "" || job.Spec.Template.Labels["azure.workload.identity/use"] != "" {
+		t.Fatal("workload identity must require an explicit service account")
+	}
+	for _, env := range pod.Containers[0].Env {
+		if env.Name == "ARTIFACT_WORKLOAD_IDENTITY" {
+			t.Fatal("workload identity must not be enabled by default")
+		}
+	}
+}
+
+func TestArtifactDownloadJobRejectsInvalidSpec(t *testing.T) {
+	md := artifactDownloadMD()
+	for _, mutate := range []func(*airunwayv1alpha1.ModelDeployment){
+		func(m *airunwayv1alpha1.ModelDeployment) { m.Spec.Model.Storage = nil },
+		func(m *airunwayv1alpha1.ModelDeployment) { m.Spec.Model.Storage.Volumes[0].ReadOnly = true },
+		func(m *airunwayv1alpha1.ModelDeployment) { m.Spec.Provider = nil },
+	} {
+		bad := md.DeepCopy()
+		mutate(bad)
+		if NeedsDownloadJob(bad) {
+			t.Fatal("invalid cache/provider accepted")
+		}
+		scheme := newScheme()
+		_ = batchv1.AddToScheme(scheme)
+		if _, err := EnsureDownloadJob(context.Background(), fake.NewClientBuilder().WithScheme(scheme).Build(), bad, DefaultDownloadJobImage); err == nil {
+			t.Fatal("bypassed artifact validation")
+		}
+	}
+}
+
+func TestStagedHFDownloadJob(t *testing.T) {
+	md := artifactDownloadMD()
+	md.Spec.Model.Artifact = &airunwayv1alpha1.ModelArtifactSpec{URI: "hf://org/model", Revision: "v1", File: "weights/model.gguf"}
+	md.Spec.Secrets = &airunwayv1alpha1.SecretsSpec{HuggingFaceToken: "hf-auth"}
+	job := buildDownloadJob(md, findModelCacheVolume(md), DefaultDownloadJobImage)
+	pod := job.Spec.Template.Spec
+	if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
+		t.Fatal("unneeded API token mounted")
+	}
+	for _, env := range pod.Containers[0].Env {
+		if env.Name == "HF_TOKEN" {
+			if env.ValueFrom.SecretKeyRef.Key != "HF_TOKEN" || env.ValueFrom.SecretKeyRef.Name != "hf-auth" {
+				t.Fatal("incorrect HF selector")
+			}
+			return
+		}
+	}
+	t.Fatal("HF token missing")
 }

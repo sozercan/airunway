@@ -2107,6 +2107,23 @@ class KubernetesService {
       return logs.replace(ansiRegex, '');
     } catch (error) {
       const statusCode = getK8sStatusCode(error);
+      // Generated SDK errors use numeric `code`; older clients use `statusCode`.
+      if ((statusCode ?? (error as { code?: number } | undefined)?.code) === 400) {
+        const apiError = error as K8sApiError;
+        let body = apiError.body ?? apiError.response?.body;
+        if (typeof body === 'string') {
+          try {
+            body = JSON.parse(body);
+          } catch {
+            // Unrecognized errors keep the normal failure path below.
+          }
+        }
+        if (body && typeof body === 'object' && typeof body.message === 'string' &&
+          /^container ".+" in pod ".+" is waiting to start(?::|$)/.test(body.message)) {
+          // A container that has not started has no log stream yet.
+          return '';
+        }
+      }
       if (statusCode === 404) {
         throw new Error(`Pod '${podName}' not found in namespace '${namespace}'`);
       }

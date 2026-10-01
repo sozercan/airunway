@@ -47,6 +47,30 @@ This ingress-token contract applies only to the generic container backend. CRD-b
 
 In job mode the image reads `task` (or its `prompt` alias) from the mounted config, performs one agent turn, writes the final answer to standard output and exits. A missing task is a configuration error. HTTP probes are intentionally omitted from Jobs, and no ingress token is created or injected because Jobs do not expose a Service.
 
+### Machine-readable task results
+
+`airunway agent run` sets `spec.config.resultFormat` to `airunway-json-v1`.
+An image supporting this opt-in mode must emit exactly one successful final-result
+record on stdout, with this prefix and a compact JSON object on a single line:
+
+```text
+AIRUNWAY_RESULT_V1 {"output":"The final answer"}
+```
+
+The `output` value must be a nonempty string. Encode embedded newlines and other
+special characters as JSON escapes. Do not emit a result record on task failure.
+Diagnostics may appear before or after the record; they must not use its prefix.
+The CLI selects only the successful `agent` container owned by the completed
+Job, checks resource UIDs, and rejects missing, malformed, or duplicate results.
+Its result-reading limit is 4 MiB of combined logs.
+
+Without `resultFormat`, the repo-owned images retain their existing plain-answer
+stdout behavior. Unknown result formats are rejected. Older or custom images
+that do not implement this record may still execute a task, but `agent run`
+returns a result-unavailable error rather than treating logs as the answer. It
+never resubmits or deletes that task automatically. Deploy updated runtime images
+before using `agent run`; no controller or CRD changes are required.
+
 ## Security posture
 
 Workloads run as numeric UID/GID 65532, cannot gain privileges, drop every Linux capability, do not receive a Kubernetes service-account token and use a RuntimeDefault seccomp profile. `/tmp` is always writable. Images must work with a read-only root filesystem unless their `AgentProviderConfig` explicitly owns the writable-root exception.

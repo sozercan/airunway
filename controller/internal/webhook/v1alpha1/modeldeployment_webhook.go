@@ -66,7 +66,9 @@ func SetupModelDeploymentWebhookWithManager(mgr ctrl.Manager) error {
 			// Reader returns NotFound, to disambiguate "truly absent" from
 			// "informer hasn't yet observed a freshly-created provider".
 			// In steady state it is never called.
-			APIReader: mgr.GetAPIReader(),
+			APIReader:         mgr.GetAPIReader(),
+			SecretAccess:      &sarReviewer{client: mgr.GetClient()},
+			ArtifactPodAccess: &artifactPodSARReviewer{client: mgr.GetClient()},
 		}).
 		WithDefaulter(&ModelDeploymentCustomDefaulter{}).
 		Complete()
@@ -98,15 +100,11 @@ func (d *ModelDeploymentCustomDefaulter) Default(_ context.Context, obj *airunwa
 		spec.Serving.Mode = airunwayv1alpha1.ServingModeAggregated
 	}
 
-	// Default scaling replicas to 1 for aggregated mode
-	if spec.Serving.Mode == airunwayv1alpha1.ServingModeAggregated {
-		if spec.Scaling == nil {
-			spec.Scaling = &airunwayv1alpha1.ScalingSpec{
-				Replicas: 1,
-			}
-		} else if spec.Scaling.Replicas == 0 {
-			// Allow 0 for scale-to-zero, but default to 1 if not explicitly set
-			// This is handled by the kubebuilder default tag
+	// Default only absent scaling. The API server defaults omitted replicas in a
+	// supplied scaling object, so an existing zero is an explicit scale-to-zero.
+	if spec.Serving.Mode == airunwayv1alpha1.ServingModeAggregated && spec.Scaling == nil {
+		spec.Scaling = &airunwayv1alpha1.ScalingSpec{
+			Replicas: 1,
 		}
 	}
 
@@ -180,6 +178,10 @@ func (d *ModelDeploymentCustomDefaulter) Default(_ context.Context, obj *airunwa
 // ModelDeploymentCustomValidator struct is responsible for validating the ModelDeployment resource
 // when it is created, updated, or deleted.
 type ModelDeploymentCustomValidator struct {
+	// Artifact privileges are checked against the admission caller on every edit.
+	SecretAccess      SecretAccessReviewer
+	ArtifactPodAccess ArtifactPodAccessReviewer
+
 	// Reader is used to look up InferenceProviderConfig resources for
 	// provider compatibility validation at admission time. In production
 	// this is the manager's cached client so admission does not synchronously
@@ -213,6 +215,8 @@ func (v *ModelDeploymentCustomValidator) ValidateCreate(ctx context.Context, obj
 	specWarnings, specErrs := v.validateSpec(ctx, obj)
 	warnings = append(warnings, specWarnings...)
 	allErrs = append(allErrs, specErrs...)
+	allErrs = append(allErrs, validateProviderScaling(obj, nil)...)
+	allErrs = append(allErrs, v.validateArtifactAccess(ctx, obj)...)
 
 	// Check for warnings
 	warnings = append(warnings, v.checkWarnings(obj)...)
@@ -227,6 +231,13 @@ func (v *ModelDeploymentCustomValidator) ValidateCreate(ctx context.Context, obj
 func (v *ModelDeploymentCustomValidator) ValidateUpdate(ctx context.Context, oldObj, newObj *airunwayv1alpha1.ModelDeployment) (admission.Warnings, error) {
 	modeldeploymentlog.Info("Validation for ModelDeployment upon update", "name", newObj.GetName())
 
+	// Stricter validation must not trap cleanup of previously admitted resources.
+	// Spec, ownership, labels, and workload annotations still must be unchanged.
+	if !oldObj.DeletionTimestamp.IsZero() && !newObj.DeletionTimestamp.IsZero() &&
+		artifactBookkeepingOnly(oldObj, newObj) {
+		return nil, nil
+	}
+
 	var warnings admission.Warnings
 	var allErrs field.ErrorList
 
@@ -234,6 +245,10 @@ func (v *ModelDeploymentCustomValidator) ValidateUpdate(ctx context.Context, old
 	specWarnings, specErrs := v.validateSpec(ctx, newObj)
 	warnings = append(warnings, specWarnings...)
 	allErrs = append(allErrs, specErrs...)
+	allErrs = append(allErrs, validateProviderScaling(newObj, oldObj)...)
+	if !artifactBookkeepingOnly(oldObj, newObj) {
+		allErrs = append(allErrs, v.validateArtifactAccess(ctx, newObj)...)
+	}
 
 	// Validate immutable fields (identity fields that trigger delete+recreate)
 	allErrs = append(allErrs, v.validateImmutableFields(oldObj, newObj)...)
@@ -253,6 +268,29 @@ func (v *ModelDeploymentCustomValidator) ValidateDelete(_ context.Context, obj *
 
 	// No validation on delete
 	return nil, nil
+}
+
+// validateProviderScaling rejects unsupported new zero-replica requests while
+// allowing bookkeeping and deletion of pre-existing unsupported resources.
+func validateProviderScaling(obj, old *airunwayv1alpha1.ModelDeployment) field.ErrorList {
+	kaitoZero := func(md *airunwayv1alpha1.ModelDeployment) bool {
+		if md == nil || md.Spec.Scaling == nil || md.Spec.Scaling.Replicas != 0 {
+			return false
+		}
+		provider := ""
+		if md.Spec.Provider != nil {
+			provider = md.Spec.Provider.Name
+		}
+		if provider == "" && md.Status.Provider != nil {
+			provider = md.Status.Provider.Name
+		}
+		return provider == "kaito"
+	}
+	if !kaitoZero(obj) || kaitoZero(old) {
+		return nil
+	}
+	return field.ErrorList{field.Invalid(field.NewPath("spec", "scaling", "replicas"), 0,
+		"KAITO does not support zero replicas; use at least one replica")}
 }
 
 // validateSpec validates the ModelDeployment spec
@@ -282,6 +320,10 @@ func (v *ModelDeploymentCustomValidator) validateSpec(ctx context.Context, obj *
 			spec.Engine.ExtraArgs,
 			err.Error(),
 		))
+	}
+
+	if err := spec.ValidateArtifact(); err != nil {
+		allErrs = append(allErrs, field.Forbidden(specPath.Child("model", "artifact"), err.Error()))
 	}
 
 	// Validate model.id is required for huggingface source
@@ -530,6 +572,10 @@ func (v *ModelDeploymentCustomValidator) validateImmutableFields(oldObj, newObj 
 	oldSpec := &oldObj.Spec
 	newSpec := &newObj.Spec
 
+	if err := newSpec.ValidateArtifactUpdate(oldSpec); err != nil {
+		allErrs = append(allErrs, field.Forbidden(specPath.Child("model", "artifact"), err.Error()))
+	}
+
 	// model.id is an identity field
 	if oldSpec.Model.ID != newSpec.Model.ID {
 		allErrs = append(allErrs, field.Invalid(
@@ -699,7 +745,7 @@ func (v *ModelDeploymentCustomValidator) checkWarnings(obj *airunwayv1alpha1.Mod
 	spec := &obj.Spec
 
 	// Warn if servedName is specified with custom source
-	if spec.Model.Source == airunwayv1alpha1.ModelSourceCustom && spec.Model.ServedName != "" {
+	if spec.Model.Source == airunwayv1alpha1.ModelSourceCustom && spec.Model.Artifact == nil && spec.Model.ServedName != "" {
 		warnings = append(warnings, "servedName is ignored for custom source (model name is defined by the container)")
 	}
 

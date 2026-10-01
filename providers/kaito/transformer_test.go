@@ -659,26 +659,6 @@ func TestTransformVLLMDefaultReplicas(t *testing.T) {
 	}
 }
 
-func TestTransformVLLMZeroReplicas(t *testing.T) {
-	tr := NewTransformer()
-	md := newTestMD("test-model", "default")
-	md.Spec.Scaling = &airunwayv1alpha1.ScalingSpec{
-		Replicas: 0,
-	}
-
-	resources, err := tr.Transform(context.Background(), md)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	ws := resources[0]
-	// When replicas is 0, should still default to 1
-	count, found, _ := unstructured.NestedInt64(ws.Object, "resource", "count")
-	if !found || count != 1 {
-		t.Errorf("expected default count 1 for zero replicas, got %v", count)
-	}
-}
-
 func TestTransformLlamaCppDoesNotInjectServedNameFlag(t *testing.T) {
 	tr := NewTransformer()
 	md := newTestMD("test-model", "default")
@@ -1109,5 +1089,41 @@ func TestTransformPreservesOwnerReference(t *testing.T) {
 	}
 	if *ownerRefs[0].Controller != true {
 		t.Error("expected controller=true on owner ref")
+	}
+}
+
+func TestTransformAggregatedReplicaIntent(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		scaling *airunwayv1alpha1.ScalingSpec
+		want    int64
+	}{
+		{name: "omitted", want: 1},
+		{name: "zero", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 0}, want: 0},
+		{name: "one", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 1}, want: 1},
+		{name: "multiple", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 3}, want: 3},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			md := newTestMD("replica-intent", "default")
+			md.Spec.Scaling = tt.scaling
+			resources, err := NewTransformer().Transform(context.Background(), md)
+			if tt.name == "zero" {
+				if err == nil || !strings.Contains(err.Error(), "KAITO does not support zero replicas") || len(resources) != 0 {
+					t.Fatalf("unsupported zero replicas must not render a Workspace: resources=%d, err=%v", len(resources), err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, found, err := unstructured.NestedInt64(resources[0].Object, "resource", "count")
+			if err != nil || !found || got != tt.want {
+				t.Fatalf("Workspace count = %d, found=%v, err=%v; want %d", got, found, err, tt.want)
+			}
+			status := NewStatusTranslator().extractReplicas(resources[0], nil)
+			if status.Desired != int32(tt.want) {
+				t.Errorf("status desired = %d; want %d", status.Desired, tt.want)
+			}
+		})
 	}
 }

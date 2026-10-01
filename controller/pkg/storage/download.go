@@ -19,6 +19,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	airunwayv1alpha1 "github.com/ai-runway/airunway/controller/api/v1alpha1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -39,6 +40,8 @@ const (
 	// downloadJobSuffix is the suffix appended to the ModelDeployment name to form the Job name
 	downloadJobSuffix = "-model-download"
 
+	downloadJobManagedBy = "airunway"
+
 	// defaultBackoffLimit is the number of retries for the download Job
 	defaultBackoffLimit int32 = 6
 
@@ -56,6 +59,9 @@ const (
 // - A volume with purpose=modelCache exists
 // - The modelCache volume is not readOnly (readOnly implies pre-populated data)
 func NeedsDownloadJob(md *airunwayv1alpha1.ModelDeployment) bool {
+	if md.Spec.Model.Artifact != nil {
+		return md.Spec.ValidateArtifact() == nil
+	}
 	if md.Spec.Model.Source != airunwayv1alpha1.ModelSourceHuggingFace {
 		return false
 	}
@@ -92,6 +98,7 @@ func deleteStaleJob(ctx context.Context, c client.Client, job *batchv1.Job) erro
 	propagation := metav1.DeletePropagationBackground
 	if err := c.Delete(ctx, job, &client.DeleteOptions{
 		PropagationPolicy: &propagation,
+		Preconditions:     &metav1.Preconditions{UID: &job.UID},
 	}); err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete stale download Job %s: %w", job.Name, err)
 	}
@@ -100,7 +107,18 @@ func deleteStaleJob(ctx context.Context, c client.Client, job *batchv1.Job) erro
 
 // EnsureDownloadJob ensures a model download Job exists and tracks its completion.
 // Returns completed=true when the Job has succeeded.
-func EnsureDownloadJob(ctx context.Context, c client.Client, md *airunwayv1alpha1.ModelDeployment, downloadJobImage string) (bool, error) {
+func EnsureDownloadJob(
+	ctx context.Context, c client.Client, md *airunwayv1alpha1.ModelDeployment, downloadJobImage string,
+) (bool, error) {
+	if err := md.Spec.ValidateArtifact(); err != nil {
+		return false, err
+	}
+	return ensureDownloadJob(ctx, c, md, downloadJobImage)
+}
+
+func ensureDownloadJob(
+	ctx context.Context, c client.Client, md *airunwayv1alpha1.ModelDeployment, downloadJobImage string,
+) (bool, error) {
 	logger := log.FromContext(ctx)
 
 	vol := findModelCacheVolume(md)
@@ -138,6 +156,14 @@ func EnsureDownloadJob(ctx context.Context, c client.Client, md *airunwayv1alpha
 	// race window where the old Job still exists. Delete it and requeue so the
 	// next reconcile creates a fresh Job.
 	if !IsOwnedByMD(existing, md.UID) {
+		// A name collision alone does not prove this is one of our stale Jobs.
+		if existing.Labels[airunwayv1alpha1.LabelManagedBy] != downloadJobManagedBy ||
+			existing.Labels[airunwayv1alpha1.LabelModelDeployment] != md.Name ||
+			existing.Labels[airunwayv1alpha1.LabelJobType] != "model-download" {
+			return false, fmt.Errorf(
+				"job %s exists but is not an AI Runway download Job for this model; refusing to delete", jobName,
+			)
+		}
 		if err := deleteStaleJob(ctx, c, existing); err != nil {
 			return false, err
 		}
@@ -180,7 +206,8 @@ func EnsureDownloadJob(ctx context.Context, c client.Client, md *airunwayv1alpha
 	return false, nil
 }
 
-// buildDownloadJob creates a batch Job that downloads a HuggingFace model.
+// buildDownloadJob preserves the legacy HF CLI invocation and dispatches staged
+// artifacts through the downloader image's artifact command.
 func buildDownloadJob(md *airunwayv1alpha1.ModelDeployment, vol *airunwayv1alpha1.StorageVolume, downloadJobImage string) *batchv1.Job {
 	claimName := vol.ResolvedClaimName(md.Name)
 	backoffLimit := defaultBackoffLimit
@@ -199,7 +226,7 @@ func buildDownloadJob(md *airunwayv1alpha1.ModelDeployment, vol *airunwayv1alpha
 			Name:      downloadJobName(md.Name),
 			Namespace: md.Namespace,
 			Labels: map[string]string{
-				airunwayv1alpha1.LabelManagedBy:       "airunway",
+				airunwayv1alpha1.LabelManagedBy:       downloadJobManagedBy,
 				airunwayv1alpha1.LabelModelDeployment: md.Name,
 				airunwayv1alpha1.LabelJobType:         "model-download",
 			},
@@ -220,7 +247,8 @@ func buildDownloadJob(md *airunwayv1alpha1.ModelDeployment, vol *airunwayv1alpha
 			Parallelism:  &parallelism,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyNever,
+					AutomountServiceAccountToken: boolPtr(false),
+					RestartPolicy:                corev1.RestartPolicyNever,
 					Containers: []corev1.Container{
 						{
 							Name:  "model-download",
@@ -259,6 +287,57 @@ func buildDownloadJob(md *airunwayv1alpha1.ModelDeployment, vol *airunwayv1alpha
 		},
 	}
 
+	if a := md.Spec.Model.Artifact; a != nil {
+		artifactPath := md.Spec.ArtifactPath()
+		pod := &job.Spec.Template.Spec
+		container := &pod.Containers[0]
+		container.Args = []string{"artifact"}
+		container.Env = []corev1.EnvVar{
+			{Name: "ARTIFACT_URI", Value: a.URI},
+			{Name: "ARTIFACT_REVISION", Value: a.Revision},
+			{Name: "ARTIFACT_FILE", Value: a.File},
+			{Name: "ARTIFACT_DESTINATION", Value: artifactPath},
+		}
+		container.VolumeMounts[0].MountPath = strings.TrimSuffix(artifactPath, "/"+airunwayv1alpha1.ArtifactDirectory)
+		if a.Image != "" {
+			container.Image = a.Image
+		}
+		if a.CredentialsRef != nil {
+			key := a.CredentialsRef.Key
+			if key == "" {
+				key = "credentials"
+			}
+			container.Env = append(container.Env, corev1.EnvVar{
+				Name: "ARTIFACT_CREDENTIALS_JSON",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: a.CredentialsRef.Name}, Key: key,
+				}},
+			})
+		}
+		if strings.HasPrefix(a.URI, "hf://") && md.Spec.Secrets != nil && md.Spec.Secrets.HuggingFaceToken != "" {
+			container.Env = append(container.Env, corev1.EnvVar{
+				Name: "HF_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: md.Spec.Secrets.HuggingFaceToken}, Key: "HF_TOKEN",
+				}},
+			})
+		}
+		pod.ServiceAccountName = a.ServiceAccountName
+		if a.ServiceAccountName != "" {
+			// Identity admission may inject a projected token for the selected account.
+			// AWS/GCP can also use the service account's existing identity binding.
+			pod.AutomountServiceAccountToken = boolPtr(true)
+			container.Env = append(container.Env, corev1.EnvVar{Name: "ARTIFACT_WORKLOAD_IDENTITY", Value: "true"})
+			job.Spec.Template.Labels = map[string]string{"azure.workload.identity/use": "true"}
+		}
+		deadline := int64(24 * 60 * 60)
+		job.Spec.ActiveDeadlineSeconds = &deadline
+		// The Job deadline starts before the downloader's own 24-hour timer.
+		// Allow its SIGTERM handler time to remove partial artifacts before SIGKILL.
+		cleanupGrace := int64(5 * 60)
+		pod.TerminationGracePeriodSeconds = &cleanupGrace
+		return job
+	}
+
 	// Add HuggingFace token secret if configured
 	if md.Spec.Secrets != nil && md.Spec.Secrets.HuggingFaceToken != "" {
 		job.Spec.Template.Spec.Containers[0].EnvFrom = []corev1.EnvFromSource{
@@ -290,7 +369,7 @@ func DeleteManagedJobs(ctx context.Context, c client.Client, md *airunwayv1alpha
 	if err := c.List(ctx, jobList,
 		client.InNamespace(md.Namespace),
 		client.MatchingLabels{
-			airunwayv1alpha1.LabelManagedBy:       "airunway",
+			airunwayv1alpha1.LabelManagedBy:       downloadJobManagedBy,
 			airunwayv1alpha1.LabelModelDeployment: md.Name,
 		},
 	); err != nil {

@@ -60,6 +60,17 @@ func NewTransformer() *Transformer {
 
 // Transform converts a ModelDeployment to a KAITO Workspace
 func (t *Transformer) Transform(ctx context.Context, md *airunwayv1alpha1.ModelDeployment) ([]*unstructured.Unstructured, error) {
+	// KAITO 0.10 accepts resource.count=0 but still creates one serving replica.
+	if md.Spec.Scaling != nil && md.Spec.Scaling.Replicas == 0 {
+		return nil, fmt.Errorf("KAITO does not support zero replicas; use at least one replica")
+	}
+
+	// These raw CLI flags have no mapping to the provider's runtime configuration.
+	if len(md.Spec.Engine.ExtraArgs) > 0 {
+		return nil, fmt.Errorf("KAITO does not support spec.engine.extraArgs (--engine-arg); " +
+			"remove raw arguments or select another provider")
+	}
+
 	ws := &unstructured.Unstructured{}
 	ws.SetAPIVersion(fmt.Sprintf("%s/%s", KaitoAPIGroup, KaitoAPIVersion))
 	ws.SetKind(WorkspaceKind)
@@ -131,7 +142,7 @@ func (t *Transformer) buildResource(md *airunwayv1alpha1.ModelDeployment) map[st
 
 	// Map scaling.replicas → spec.resource.count
 	count := int64(1)
-	if md.Spec.Scaling != nil && md.Spec.Scaling.Replicas > 0 {
+	if md.Spec.Scaling != nil {
 		count = int64(md.Spec.Scaling.Replicas)
 	}
 	resource["count"] = count

@@ -86,6 +86,9 @@ func NewTransformer() *Transformer {
 // Disaggregated mode returns [decode Deployment, prefill Deployment, decode Service, prefill Service].
 // resources[0] is always the primary resource used for status tracking.
 func (t *Transformer) Transform(ctx context.Context, md *airunwayv1alpha1.ModelDeployment) ([]*unstructured.Unstructured, error) {
+	if err := md.Spec.ValidateArtifact(); err != nil {
+		return nil, err
+	}
 	if md.ResolvedEngineType() != airunwayv1alpha1.EngineTypeVLLM {
 		return nil, fmt.Errorf("vLLM provider only supports vllm engine, got %s", md.ResolvedEngineType())
 	}
@@ -104,7 +107,7 @@ func (t *Transformer) Transform(ctx context.Context, md *airunwayv1alpha1.ModelD
 // transformAggregated creates a single Deployment + Service for aggregated serving.
 func (t *Transformer) transformAggregated(md *airunwayv1alpha1.ModelDeployment) ([]*unstructured.Unstructured, error) {
 	replicas := int64(1)
-	if md.Spec.Scaling != nil && md.Spec.Scaling.Replicas > 0 {
+	if md.Spec.Scaling != nil {
 		replicas = int64(md.Spec.Scaling.Replicas)
 	}
 
@@ -272,6 +275,15 @@ func (t *Transformer) buildDeployment(md *airunwayv1alpha1.ModelDeployment, name
 
 	spec := map[string]interface{}{
 		"replicas": replicas,
+		// Release an old replica's GPUs before starting its replacement. A surge
+		// can deadlock updates when no spare GPUs are available.
+		"strategy": map[string]any{
+			"type": "RollingUpdate",
+			"rollingUpdate": map[string]any{
+				"maxSurge":       int64(0),
+				"maxUnavailable": int64(1),
+			},
+		},
 		"selector": map[string]interface{}{
 			"matchLabels": selectorLabels,
 		},
@@ -699,17 +711,22 @@ func (t *Transformer) buildResourceLimits(spec *airunwayv1alpha1.ResourceSpec) m
 	return result
 }
 
-// buildEnvVars constructs environment variables including HF_TOKEN from secrets.
+// buildEnvVars constructs serving environment variables. Artifact credentials
+// belong only to the download Job; the serving process reads local files.
 func (t *Transformer) buildEnvVars(md *airunwayv1alpha1.ModelDeployment) []interface{} {
 	var envVars []interface{}
+	hasHFHome := false
 
 	// When a HuggingFace token secret is configured we inject HF_TOKEN from it
 	// below; drop any user-supplied HF_TOKEN so the pod does not carry two
 	// same-named env entries (Kubernetes silently keeps the last one).
-	injectHFToken := md.Spec.Secrets != nil && md.Spec.Secrets.HuggingFaceToken != ""
+	injectHFToken := md.Spec.Model.Artifact == nil && md.Spec.Secrets != nil && md.Spec.Secrets.HuggingFaceToken != ""
 
 	// Add user-specified env vars
 	for _, e := range md.Spec.Env {
+		if e.Name == "HF_HOME" {
+			hasHFHome = true
+		}
 		if injectHFToken && e.Name == "HF_TOKEN" {
 			continue
 		}
@@ -738,6 +755,19 @@ func (t *Transformer) buildEnvVars(md *airunwayv1alpha1.ModelDeployment) []inter
 				},
 			},
 		})
+	}
+
+	// Use the same HF cache as the download Job, including pre-populated read-only
+	// caches. Local artifacts do not use HF's cache layout; explicit env wins.
+	if !hasHFHome && md.Spec.Model.Artifact == nil && md.Spec.Model.Source == airunwayv1alpha1.ModelSourceHuggingFace && md.Spec.Model.Storage != nil {
+		for _, vol := range md.Spec.Model.Storage.Volumes {
+			if vol.Purpose == airunwayv1alpha1.VolumePurposeModelCache {
+				envVars = append(envVars, map[string]interface{}{
+					"name": "HF_HOME", "value": storageVolumeMountPath(vol),
+				})
+				break
+			}
+		}
 	}
 
 	return envVars
@@ -881,6 +911,11 @@ func applyOverrides(obj *unstructured.Unstructured, md *airunwayv1alpha1.ModelDe
 		return fmt.Errorf("unsupported provider.overrides key(s) %q: only \"spec\" is supported", unsupported)
 	}
 
+	// Recreate cannot include rollingUpdate settings. Remove our defaults before
+	// merging so an explicit strategy override remains authoritative.
+	if strategy, _, _ := unstructured.NestedString(overrides, "spec", "strategy", "type"); strategy == "Recreate" {
+		unstructured.RemoveNestedField(obj.Object, "spec", "strategy", "rollingUpdate")
+	}
 	obj.Object = deepMerge(obj.Object, overrides)
 	return nil
 }

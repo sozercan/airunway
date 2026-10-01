@@ -45,6 +45,69 @@ function createProxy(internalPort, overrides = {}) {
   });
 }
 
+test("advertises only the authenticated main agent without exposing native aliases", async (t) => {
+  let upstreamCalls = 0;
+  const upstream = http.createServer((_request, response) => {
+    upstreamCalls += 1;
+    response.end(JSON.stringify({ data: ["openclaw", "openclaw/default", "openclaw/main"] }));
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = createProxy(upstreamPort);
+  const proxyPort = await listen(proxy);
+  t.after(async () => {
+    proxy.closeAllConnections();
+    upstream.closeAllConnections();
+    await Promise.all([close(proxy), close(upstream)]);
+  });
+
+  for (const authorization of [undefined, "access-token", "Bearer wrong-token"]) {
+    const response = await call(proxyPort, {
+      path: "/v1/models",
+      headers: authorization === undefined ? {} : { authorization },
+    });
+    assert.equal(response.status, 401);
+  }
+  const response = await call(proxyPort, {
+    path: "/v1/models",
+    headers: { authorization: "Bearer access-token" },
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(JSON.parse(response.body), {
+    object: "list",
+    data: [{ id: "openclaw/main", object: "model", created: 0, owned_by: "openclaw" }],
+  });
+  assert.ok(Buffer.byteLength(response.body) < 256);
+  assert.doesNotMatch(response.body, /access-token|gateway-token/);
+  assert.equal(upstreamCalls, 0);
+});
+
+test("keeps unauthenticated health checks connected to the native gateway", async (t) => {
+  const received = [];
+  const upstream = http.createServer((request, response) => {
+    received.push({ path: request.url, authorization: request.headers.authorization });
+    response.writeHead(503, { "content-type": "application/json" });
+    response.end(JSON.stringify({ status: "starting" }));
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = createProxy(upstreamPort);
+  const proxyPort = await listen(proxy);
+  t.after(async () => {
+    proxy.closeAllConnections();
+    upstream.closeAllConnections();
+    await Promise.all([close(proxy), close(upstream)]);
+  });
+
+  for (const path of ["/healthz", "/readyz"]) {
+    const response = await call(proxyPort, { path });
+    assert.equal(response.status, 503);
+    assert.deepEqual(JSON.parse(response.body), { status: "starting" });
+  }
+  assert.deepEqual(received, [
+    { path: "/healthz", authorization: "Bearer gateway-token" },
+    { path: "/readyz", authorization: "Bearer gateway-token" },
+  ]);
+});
+
 test("accepts case-insensitive Bearer schemes but rejects other credentials", async (t) => {
   const upstream = http.createServer((_request, response) => response.end("ok"));
   const upstreamPort = await listen(upstream);
@@ -96,7 +159,7 @@ test("isolates chat requests while preserving complete OpenAI request bodies", a
   });
 
   const payload = {
-    model: "openclaw",
+    model: "openclaw/main",
     user: "ordinary-user-42",
     messages: [
       { role: "system", content: "Return a concise project assessment." },
@@ -412,7 +475,7 @@ test("uses an absolute upstream deadline", async (t) => {
   });
 
   const response = await call(proxyPort, {
-    path: "/v1/models",
+    path: "/readyz",
     headers: { authorization: "Bearer access-token" },
   });
   assert.equal(response.status, 504);
@@ -473,7 +536,7 @@ test("aborts the upstream request when the downstream disconnects", async (t) =>
   const downstream = http.request({
     host: "127.0.0.1",
     port: proxyPort,
-    path: "/v1/models",
+    path: "/readyz",
     headers: { authorization: "Bearer access-token" },
   });
   downstream.on("error", () => {});

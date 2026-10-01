@@ -1,0 +1,548 @@
+# Command-line interface
+
+The `airunway` binary manages models and agents directly through the selected
+Kubernetes API. It does not need the dashboard to be running. Running `airunway`
+without arguments or running `airunway serve` starts the separate `airunway-web`
+executable. Matching version/platform-suffixed release assets work together when
+kept in the same directory, without renaming. A canonical `airunway-web` beside
+`airunway` or on `PATH` also supports `serve`, `login`, and `logout`. Model and
+agent commands do not use the dashboard or Bun.
+
+## Build
+
+The CLI is written in Go and uses Kubernetes `client-go` for kubeconfig,
+authentication, API requests, and port forwarding. It does not shell out to
+`kubectl`.
+
+```bash
+make cli-build        # Build only the Go CLI to dist/airunway
+make cli-test         # Run its Go tests
+make cli-cross        # Build Linux, macOS, and Windows CLI binaries
+make compile          # Build both the Go CLI and the Bun dashboard
+./dist/airunway --help
+```
+
+Use the Go toolchain version in `cli/go.mod` or newer. Building the CLI does not
+require Node.js, Bun, or frontend assets. The dashboard still requires Bun when
+building from source.
+
+Install the controller, matching CRDs, and the model/agent providers before using
+creation commands. The CLI never creates clusters, namespaces, providers, cloud
+identities, or management credentials automatically.
+
+## Names and identifiers
+
+Commands follow `airunway RESOURCE ACTION NAME`. The positional name identifies
+one deployed instance. Model `--id` identifies the model artifacts. Agent
+`--model-ref` identifies an existing model deployment in the selected namespace.
+
+```bash
+airunway model create demo --id hf://Qwen/Qwen3-8B --gpus 1
+airunway agent create assistant --framework langgraph --model-ref demo \
+  --prompt "You are a concise, helpful assistant."
+```
+
+Bare `Qwen/Qwen3-8B` is shorthand for `hf://Qwen/Qwen3-8B`. It always means Hugging
+Face, regardless of local configuration. A name is not the source model ID or a
+server-generated resource UID. `create` fails on an existing name; it never
+silently updates or replaces it.
+
+## Environment and defaults
+
+```bash
+airunway context list
+airunway context current
+airunway context use dev
+airunway config set namespace team-a --context dev
+airunway config get --context dev --namespace team-a
+airunway doctor --context dev --namespace team-a
+
+airunway model list --kubeconfig ./dev.kubeconfig --context dev --namespace team-a
+```
+
+Explicit flags override AI Runway's saved settings, which override kubeconfig
+settings. `context use` changes only AI Runway's default, not kubectl's current
+context. Settings live in `$XDG_CONFIG_HOME/airunway/cli.json`, or
+`~/.config/airunway/cli.json`. `AIRUNWAY_CONFIG` selects another file. The CLI writes
+configuration atomically with owner-only permissions.
+
+Agent defaults are scoped to both context and namespace:
+
+```bash
+airunway config set agent.framework langgraph --context dev --namespace team-a
+airunway config set agent.model-ref demo --context dev --namespace team-a
+airunway agent create assistant --prompt "Be helpful."
+airunway config unset agent.model-ref
+```
+
+An explicitly selected model binding replaces the entire saved binding. Defaults
+are for new requests, never for rewriting existing deployments.
+
+## Output
+
+Text is the default. Lists show headers and resource-specific columns. `get`
+shows a compact summary, while create, update, delete, and wait commands print
+short receipts. Ready counts describe reported replicas, not measured pod or GPU
+counts. Summaries mark a status as updating when it predates the current request.
+
+Use `-o json` or `-o yaml` for structured details. Model and agent reads retain
+full resource objects in these formats; credential commands remain metadata-only.
+Dry-run previews retain their manifest output. Progress stays on stderr.
+
+```bash
+airunway model get demo
+airunway model get demo -o yaml
+airunway agent list
+airunway doctor
+airunway doctor -o json
+```
+
+`doctor` prints an access-check count with the selected context and namespace.
+Failures include readable details and a nonzero exit code. These checks verify
+API access and creation permissions, not model readiness or successful inference.
+`apply` prints an `applied` receipt for each accepted resource, or `validated
+(dry run)` for server-side validation. It does not claim to detect unchanged
+resources.
+
+## Models
+
+```bash
+airunway model create demo --id hf://Qwen/Qwen3-8B --gpus 1 \
+  --provider vllm --engine vllm --memory 32Gi --context-length 8192
+
+airunway model create private-demo --id hf://example-org/private-model \
+  --credential hf-access --gpus 1
+
+airunway model list
+airunway model list --all-namespaces
+airunway model get demo --output json
+airunway model logs demo --follow
+airunway model events demo
+airunway model update demo --replicas 2
+airunway model update demo --context-length 16384
+airunway model delete demo
+```
+
+The default GPU request is one. Use `--gpus 0` for a compatible CPU runtime.
+Resource values in these examples are not a promise that a model fits every GPU.
+Provider and engine selection remain controller-owned when omitted. `--served-name`
+sets an inference-facing model name; endpoint discovery reports the resolved name
+and routing headers rather than assuming the deployment name is callable.
+
+Use `--engine-arg=--flag=value` repeatedly for raw engine flags. KAITO and KubeRay
+do not support these raw arguments and reject them rather than ignoring them.
+KAITO also requires at least one replica; `--replicas 0` is not a supported stop
+operation for that provider. Remote model code is not trusted unless
+`--trust-remote-code` is explicitly supplied. Use `--gateway=false` to disable
+gateway integration, not to create a public service.
+
+### Source references and artifacts
+
+Remote artifacts are staged by the model downloader into a writable model-cache
+volume. This path requires the matching controller, downloader image, and Direct
+vLLM provider. Source adapters do not imply that every inference engine supports
+every artifact format.
+
+For a development checkout, build and publish `images/model-downloader` to your
+own test registry. Set `ARTIFACT_DOWNLOADER_IMAGE` to that exact image and pass it
+with `--artifact-image` as below. Do not assume an existing `latest` image includes
+this checkout's artifact loader.
+
+```bash
+# A pinned Hugging Face snapshot
+airunway model create pinned-demo --id hf://Qwen/Qwen3-8B \
+  --revision MODEL_COMMIT --provider vllm --gpus 1 \
+  --artifact-image "$ARTIFACT_DOWNLOADER_IMAGE"
+
+# Download a remote prefix
+airunway model create s3-demo --id s3://model-bucket/qwen3-8b/ \
+  --artifact-image "$ARTIFACT_DOWNLOADER_IMAGE" \
+  --credential object-storage --storage-size 100Gi --gpus 1
+
+airunway model create gcs-demo --id gs://model-bucket/qwen3-8b/ \
+  --service-account model-reader --gpus 1 \
+  --artifact-image "$ARTIFACT_DOWNLOADER_IMAGE"
+
+# HTTPS identifies artifact bytes, not an inference API
+airunway model create file-demo \
+  --id https://account.blob.core.windows.net/models/model.gguf \
+  --file model.gguf --credential blob-access --gpus 1 \
+  --artifact-image "$ARTIFACT_DOWNLOADER_IMAGE"
+
+# OCI model artifacts, not executable container images
+airunway model create registry-demo \
+  --id oci://registry.example.com/models/qwen3-8b:v1 --gpus 1 \
+  --artifact-image "$ARTIFACT_DOWNLOADER_IMAGE"
+
+# Use an existing volume without downloading or owning it
+airunway model create volume-demo --id pvc://model-store/qwen3-8b/ --gpus 1
+```
+
+`--storage-size` sets the staged artifact volume's capacity, defaulting to `100Gi`.
+`--storage-class` selects its storage class. The CLI sets `accessMode` to
+`ReadWriteOnce` for zero or one replica, including the default of one, and
+`ReadWriteMany` for multiple replicas. Use
+`--storage-access-mode ReadWriteOnce|ReadWriteMany` to override this choice.
+The selected storage class must support the access mode. `ReadWriteOnce` permits
+writers on one node; use `ReadWriteMany` with compatible shared storage when
+replicas need to run on different nodes.
+
+For example, stage a single-replica model on an AKS managed disk:
+
+```bash
+airunway model create disk-demo --id hf://Qwen/Qwen3-0.6B \
+  --revision main --storage-class managed-csi --storage-size 10Gi \
+  --replicas 1 --storage-access-mode ReadWriteOnce \
+  --artifact-image "$ARTIFACT_DOWNLOADER_IMAGE"
+```
+
+These storage flags apply only to generated staged caches. They are rejected for
+ordinary Hugging Face models without `--revision` or `--file`, bundled models,
+and existing `pvc://` references. Storage settings are immutable after creation.
+Changing `--replicas` with `model update` does not change the existing volume's
+access mode. Create a new model with compatible storage to change that mode.
+These CLI defaults do not change the controller's shared-storage default for
+other deployments, including Dynamo.
+
+`--artifact-image` overrides the downloader image, not the inference image.
+`--service-account` selects an existing download-job workload identity. Configure
+cloud identity and permissions separately; the CLI cannot infer or create them.
+
+Source URLs cannot contain credentials or signed query strings. `--revision` is
+for Hugging Face; OCI identity is its tag or digest. `--file` must be a safe
+relative path. Absolute paths and parent traversal are rejected. Source identity
+is immutable after creation.
+
+Runtime images and bundled model paths are separate:
+
+```bash
+airunway model create custom-runtime --id hf://Qwen/Qwen3-8B \
+  --provider vllm --image registry.example.com/vllm-runtime:v1 --gpus 1
+
+airunway model create bundled-demo --provider vllm \
+  --image registry.example.com/qwen-server:v1 \
+  --model-path /models/qwen3-8b --gpus 1
+```
+
+`--model-path` is inside the runtime image, not on the developer's laptop. Local
+`file://` paths are rejected; upload artifacts to supported storage first.
+
+## Agents and bindings
+
+The default mode creates a long-running agent. Its prompt is persistent system
+instructions, not a request to execute a task immediately.
+
+```bash
+airunway agent create assistant --framework langgraph --model-ref demo \
+  --prompt-file ./instructions.md
+
+cat ./instructions.md | airunway agent create assistant \
+  --framework langgraph --model-ref demo --prompt-file -
+```
+
+Select exactly one model-binding form:
+
+```bash
+# An existing model deployment in this namespace
+airunway agent create local-assistant --framework langgraph \
+  --model-ref demo --prompt "Be helpful."
+
+# An existing inference API; no model deployment is created
+airunway agent create remote-assistant --framework langgraph \
+  --model-url https://models.example.com/v1 --model-api openai \
+  --model-id qwen-chat --model-credential inference-access/API_KEY \
+  --prompt-file ./instructions.md
+
+# Azure OpenAI: model ID is the configured deployment name
+airunway agent create azure-assistant --framework langgraph \
+  --model-url https://my-resource.openai.azure.com --model-api azure-openai \
+  --model-id my-chat-deployment --model-credential azure-access/API_KEY \
+  --prompt "Be helpful."
+
+# Existing gateway and served-model name
+airunway agent create gateway-assistant --framework crewai \
+  --model-gateway inference --gateway-listener https \
+  --model-id team-chat --prompt "Be helpful."
+```
+
+Supported API types are `openai`, `anthropic`, `azure-openai`, and `custom`, subject
+to framework compatibility. Credential references are namespace-local. The
+requesting identity must be allowed to read the referenced credential. Referenced
+models and gateways must be in the agent's namespace. Use `--model-url` for an
+explicit endpoint elsewhere; cross-namespace resource grants are not implemented.
+
+```bash
+airunway agent list
+airunway agent get assistant
+airunway agent logs assistant --follow
+airunway agent events assistant
+airunway agent update assistant --prompt-file ./revised-instructions.md
+airunway agent update assistant --model-ref demo-v2
+airunway agent delete assistant
+```
+
+Deleting an agent does not delete its shared model or user-managed credentials.
+Changing the framework requires a new agent. Container image/resource overrides
+are rejected for frameworks that do not implement them.
+
+### Framework configuration and presets
+
+```bash
+airunway framework list
+airunway framework get langgraph
+airunway catalog agent list
+airunway catalog agent get langgraph/langgraph-agent
+
+airunway agent create assistant --preset langgraph/langgraph-agent --model-ref demo
+
+airunway agent create research-assistant --framework langgraph --model-ref demo \
+  --config-file ./langgraph.json --prompt-file ./instructions.md
+```
+
+Use preset identifiers returned by the installed catalog. A preset selects
+framework configuration; it cannot silently create a model or install a provider.
+`--config-file` contains framework-specific JSON, not a whole deployment. Conflicts
+between explicit flags and file configuration are rejected.
+
+For container frameworks, omitting `--image` leaves image selection to the
+controller, which uses the framework's unambiguous registered catalog image.
+This keeps the catalog as the source of truth and does not require extra catalog
+read permissions for ordinary creation. If no usable default exists, configure
+the catalog or supply `--image`; use `--preset` when choosing a specific recipe.
+The CLI does not install a framework automatically.
+
+### One-shot tasks
+
+```bash
+airunway agent run report --framework crewai --model-ref demo \
+  --prompt "Summarize the supplied information accurately." \
+  --task-file ./report-task.txt --timeout 10m
+
+# Or submit without waiting, then inspect it separately:
+airunway agent create background-report --framework crewai --model-ref demo \
+  --mode once --task-file ./report-task.txt --wait=false
+airunway agent wait background-report --for completed --timeout 10m
+airunway agent logs background-report
+airunway agent delete background-report
+```
+
+`agent run` implies one-shot mode, waits for completion, and prints the task
+result rather than the resource object or runtime diagnostics. It retains the
+agent and workload for inspection. Use a new name for each invocation.
+This command requires a runtime image supporting the
+[versioned task-result record](agent-container-runtime.md#machine-readable-task-results).
+It requests that format through the existing opaque runtime configuration.
+Older images may complete the task without emitting this record; the CLI reports
+that the result is unavailable and does not resubmit. JSON/YAML output represents
+the answer string, not an AgentDeployment.
+
+One-shot mode requires a compatible container framework. It has no endpoint or
+interactive chat. Creation submits work. Jobs may retry, so execution is not
+exactly-once. The CLI never resubmits automatically after timeout. Use a new name
+for another task; ordinary updates must not replay a completed job.
+
+## Readiness and access
+
+```bash
+airunway model wait demo --for ready --timeout 20m
+airunway model endpoint demo
+airunway model endpoint demo --check --output json
+airunway model connect demo --port 8000
+airunway model chat demo --message "Reply with OK."
+airunway model chat demo --system-file ./instructions.txt \
+  --message-file ./question.txt --temperature 0.2 --max-tokens 256
+
+airunway agent wait assistant --for ready
+airunway agent endpoint assistant
+airunway agent connect assistant --port 8080
+airunway agent chat assistant
+airunway agent chat assistant --message-file ./question.txt
+```
+
+`model chat` accepts `--system TEXT` or `--system-file FILE|-`, but not both.
+The system instruction remains first in interactive conversation history.
+System prompt files use the same 4 MiB input limit as message files. Only one
+input can consume stdin; use a regular system-prompt file for interactive chat.
+Agent instructions remain part of their deployment configuration, set with
+`--prompt` or `--prompt-file`, rather than a per-chat system override.
+`--temperature` accepts values from 0 to 2, and `--max-tokens` accepts positive
+integers. Both are forwarded to the chat endpoint.
+
+Deployment readiness, endpoint reachability, and successful inference are separate
+claims. Endpoint checks do not submit chat requests or execute agent tools.
+Provider status must publish a usable access contract. Providers without one fail
+with an explanation rather than a fabricated URL.
+
+Model create/update requests with zero desired replicas skip the default readiness
+wait and return the submitted resource. They do not confirm that pods have finished
+terminating. Explicit `--wait=true` is rejected for these requests; omit it or use
+`--wait=false`.
+
+Plain agent creation can proceed when framework discovery is forbidden by RBAC;
+the controller resolves the framework. Preset/catalog reads and credential or
+model-reference authorization are still required where applicable.
+
+Model endpoint checks require a route that permits `GET /v1/models`. Chat can use
+a POST-only route when the served model name is already known; otherwise its
+model-discovery request also needs GET support.
+
+`connect` binds loopback and stays in the foreground. Ctrl+C closes the connection,
+not the deployment. Authentication remains required by the upstream service.
+`chat` can resolve authorized agent ingress credentials internally; it never uses
+the model credential as an agent-call token. The existing same-namespace agent
+workload, Service, Pod, and ingress Secret checks still apply, and these tunnels
+can use HTTP. Chat requests may execute configured tools, so use trusted
+frameworks and deliberate prompts.
+
+`model chat` and `model endpoint --check` accept `--credential NAME` to read the
+Secret's `API_KEY` in the model's namespace. Plain endpoint display never reads
+credentials; `model endpoint --credential` requires `--check`. Agent endpoint
+checks use the unauthenticated `/readyz` route, not the agent's ingress token.
+
+Direct external access requires the exact published URL in `--server`, and
+credentials require verified HTTPS. Model Gateway tunnels also require verified
+HTTPS when using `--credential`: their backends can be outside the Secret's
+namespace, and labels or owner references do not authenticate those backends.
+For an HTTP Gateway, publish an HTTPS endpoint, verify its address, and pass that
+exact URL with `--server`. Normal internal model tunnels, including
+`--gateway=false`, can still use HTTP with a credential. Unauthenticated endpoint
+checks and raw `connect` discovery are unchanged.
+
+Gateway access requires the selected HTTPRoute's matching parent to report current
+`Accepted=True` and `ResolvedRefs=True` conditions. The CLI reads the route by
+name: `spec.gateway.httpRouteRef` when configured, otherwise the model name. It
+also checks ownership for controller-managed routes.
+
+`connect`, `logs --follow`, and interactive chat have no default session timeout.
+Use an explicit `--timeout` to limit the entire operation, including setup. A
+calling process's deadline still applies, and Ctrl+C cancels setup or closes the
+session. Waits and finite access operations, including endpoint checks, non-follow
+logs, and one-shot chat, retain the default 10-minute timeout.
+
+### HTTPS tunnels
+
+For HTTP, `connect` returns a loopback URL. For HTTPS, `url` retains the hostname
+needed for certificate verification and SNI. This can be the route's `headers.host`
+when the Gateway publishes an IP address. The `connectTo` field maps that hostname
+and upstream port to the loopback listener using curl's `--connect-to` format.
+Apply the mapping rather than replacing the URL hostname or disabling TLS checks.
+
+Keep the tunnel running in one terminal:
+
+```bash
+airunway model connect demo --port 8443 --output json
+```
+
+In another terminal, replace these example values with `url`, `connectTo`, and any
+required routing headers from the output. Do not put credentials in these values.
+
+```bash
+url='https://inference.example.test:8443/models'
+connect_to='inference.example.test:8443:127.0.0.1:8443'
+route_header='x-gateway-model-name: demo'
+base_url=${url%/}
+curl --connect-to "$connect_to" --header "$route_header" "${base_url%/v1}/v1/models"
+```
+
+The raw tunnel does not inject or print an authentication token. Use the upstream
+service's authentication requirements separately.
+
+### Logs
+
+```bash
+airunway model logs demo --tail 1000
+airunway agent logs assistant --output json
+airunway model logs demo --follow
+```
+
+Log commands stream text to stdout as it arrives, with or without `--follow`.
+Text output preserves the received bytes and has no overall size limit.
+
+Without `--follow`, `--output json` and `--output yaml` return the logs as a single
+string and accept at most 4 MiB of log data before formatting. Larger responses
+fail with an explicit error and no partial structured output. Reduce `--tail` or
+use `--output text` to stream larger responses. With `--follow`, structured output
+emits one record per log line, with a 4 MiB limit per line.
+Ctrl+C or `--timeout` stops reading and closes the log response.
+
+## Credentials
+
+```bash
+airunway credential create hf-access --type huggingface --from-file ./hf-token.txt
+airunway credential create inference-access --type api-key --from-file - < ./key.txt
+airunway credential create object-storage --type artifact --from-file ./storage.json
+
+airunway credential list
+airunway credential get hf-access
+airunway credential update hf-access --from-file ./replacement.txt
+airunway credential delete hf-access
+```
+
+Commands affect only the selected namespace. Hugging Face uses `HF_TOKEN`, API
+keys use `API_KEY`, and artifact loaders use source-specific JSON in `credentials`.
+`get` and `list` return metadata, never secret bytes. Update/delete operate only on
+CLI-managed credentials. Referenced credentials cannot be deleted through this
+command. No tokens belong in command arguments, model URLs, config files checked
+into Git, or machine-readable output.
+
+### Recovery after credential rotation
+
+Updating a credential changes its Secret contents without changing the model
+specification. A download Job that has already exhausted its retries does not
+restart automatically after that update. After fixing the credential, an
+operator must inspect and remove the failed AI Runway download Job to request a
+fresh attempt. The controller then recreates it using the current Secret.
+
+## Files, previews, and automation
+
+```bash
+airunway model create demo --id hf://Qwen/Qwen3-8B --gpus 1 \
+  --dry-run client --output yaml > ./demo.yaml
+
+airunway agent create assistant --framework langgraph --model-ref demo \
+  --prompt "Be helpful." --dry-run server --output yaml
+
+airunway apply --file ./demo.yaml
+airunway apply --file ./deployments/ --dry-run server
+```
+
+Client dry-run does not contact the cluster or invoke authentication plugins.
+Server dry-run performs admission without persisting resources. `apply` accepts
+ModelDeployment and AgentDeployment documents, rejects cross-namespace surprises,
+and does not force ownership conflicts or replace immutable resources. Parsing
+all input documents happens before writes; subsequent API operations are not a
+transaction. If a later operation fails, stdout lists the completed resources and
+stderr reports that they were not rolled back.
+
+```bash
+airunway model create ci-demo --id hf://Qwen/Qwen3-8B --gpus 1 \
+  --wait=false --output json
+airunway model wait ci-demo --for ready --timeout 20m
+airunway model chat ci-demo --message "Reply with OK." --output json
+airunway model delete ci-demo
+```
+
+`--output json` puts results on stdout and structured errors/progress on stderr.
+No command prompts when stdin is not a terminal. Creation/update waits by default;
+`--wait=false` returns after submission. Timeouts and interruption leave submitted
+resources available for inspection.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | Operation failed |
+| 2 | Invalid input or unsupported combination |
+| 3 | Authentication, authorization, or connectivity failure |
+| 4 | Timeout |
+| 5 | Existing-name or concurrent-update conflict |
+| 130 | Interrupted |
+
+```bash
+airunway provider list
+airunway provider get vllm
+airunway catalog model search qwen
+airunway catalog model get hf://Qwen/Qwen3-8B
+airunway completion zsh
+airunway model create --help
+airunway version
+```

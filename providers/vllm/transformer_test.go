@@ -2,6 +2,7 @@ package vllm
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1417,5 +1418,189 @@ func TestTransformMountsModelStorageVolumes(t *testing.T) {
 	}
 	if pvc["claimName"] != "shared-model-cache" {
 		t.Errorf("expected claimName shared-model-cache, got %v", pvc["claimName"])
+	}
+}
+
+func TestTransformArtifactPreservesLocalModelPath(t *testing.T) {
+	md := newTestMD("artifact-model", "default")
+	md.Spec.Provider = &airunwayv1alpha1.ProviderSpec{Name: "vllm"}
+	md.Spec.Model.Source = airunwayv1alpha1.ModelSourceCustom
+	md.Spec.Model.ID = "/model-cache/artifacts/quant/model.gguf"
+	md.Spec.Model.ServedName = "my-model"
+	md.Spec.Secrets = &airunwayv1alpha1.SecretsSpec{HuggingFaceToken: "download-only"}
+	md.Spec.Model.Artifact = &airunwayv1alpha1.ModelArtifactSpec{URI: "hf://org/model", File: "quant/model.gguf"}
+	md.Spec.Model.Storage = &airunwayv1alpha1.StorageSpec{Volumes: []airunwayv1alpha1.StorageVolume{{Name: "weights", ClaimName: "weights", Purpose: airunwayv1alpha1.VolumePurposeModelCache}}}
+	resources, err := NewTransformer().Transform(context.Background(), md)
+	if err != nil {
+		t.Fatal(err)
+	}
+	containers, _, _ := unstructured.NestedSlice(resources[0].Object, "spec", "template", "spec", "containers")
+	var container corev1.Container
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(containers[0].(map[string]any), &container); err != nil {
+		t.Fatal(err)
+	}
+	for flag, want := range map[string]string{
+		"--model":             md.Spec.Model.ID,
+		"--served-model-name": md.Spec.Model.ServedName,
+	} {
+		if got, found := argValue(container.Args, flag); !found || got != want {
+			t.Fatalf("%s = %q, want %q", flag, got, want)
+		}
+	}
+	for _, env := range container.Env {
+		if env.Name == "HF_TOKEN" {
+			t.Fatal("download-only HF credential reached serving container")
+		}
+		if env.Name == "HF_HOME" {
+			t.Fatal("local artifacts must not use the HF cache layout")
+		}
+	}
+	foundMount := false
+	for _, mount := range container.VolumeMounts {
+		if mount.MountPath == "/model-cache" {
+			foundMount = true
+		}
+	}
+	if !foundMount {
+		t.Fatal("artifact cache was not mounted")
+	}
+	md.Spec.Model.Storage.Volumes[0].ReadOnly = true
+	if _, err := NewTransformer().Transform(context.Background(), md); err == nil {
+		t.Fatal("invalid artifact contract was accepted")
+	}
+}
+
+func TestTransformHuggingFaceCacheHome(t *testing.T) {
+	fromConfig := &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "cache-settings"}, Key: "home",
+	}}
+	for _, tt := range []struct {
+		name      string
+		mountPath string
+		readOnly  bool
+		purpose   airunwayv1alpha1.VolumePurpose
+		env       []corev1.EnvVar
+		want      []corev1.EnvVar
+	}{
+		{name: "default path", want: []corev1.EnvVar{{Name: "HF_HOME", Value: "/model-cache"}}},
+		{name: "custom path", mountPath: "/weights/hf", want: []corev1.EnvVar{{Name: "HF_HOME", Value: "/weights/hf"}}},
+		{name: "read-only cache", readOnly: true, want: []corev1.EnvVar{{Name: "HF_HOME", Value: "/model-cache"}}},
+		{name: "explicit value", env: []corev1.EnvVar{{Name: "HF_HOME", Value: "/custom/hf"}}, want: []corev1.EnvVar{{Name: "HF_HOME", Value: "/custom/hf"}}},
+		{name: "explicit valueFrom", env: []corev1.EnvVar{{Name: "HF_HOME", ValueFrom: fromConfig}}, want: []corev1.EnvVar{{Name: "HF_HOME", ValueFrom: fromConfig}}},
+		{name: "explicit empty value", env: []corev1.EnvVar{{Name: "HF_HOME"}}, want: []corev1.EnvVar{{Name: "HF_HOME"}}},
+		{name: "compilation cache only", purpose: airunwayv1alpha1.VolumePurposeCompilationCache},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			md := newTestMD("cached-model", "team")
+			purpose := tt.purpose
+			if purpose == "" {
+				purpose = airunwayv1alpha1.VolumePurposeModelCache
+			}
+			md.Spec.Model.Storage = &airunwayv1alpha1.StorageSpec{Volumes: []airunwayv1alpha1.StorageVolume{{
+				Name: "cache", ClaimName: "existing-cache", Purpose: purpose, MountPath: tt.mountPath, ReadOnly: tt.readOnly,
+			}}}
+			md.Spec.Env = tt.env
+			resources, err := NewTransformer().Transform(context.Background(), md)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var container corev1.Container
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(getContainer(t, resources[0]), &container); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(container.Env, tt.want) {
+				t.Fatalf("env = %#v, want %#v", container.Env, tt.want)
+			}
+			if len(container.VolumeMounts) != 1 || container.VolumeMounts[0].ReadOnly != tt.readOnly {
+				t.Fatalf("cache mount changed: %+v", container.VolumeMounts)
+			}
+			if container.VolumeMounts[0].MountPath != storageVolumeMountPath(md.Spec.Model.Storage.Volumes[0]) {
+				t.Fatalf("unexpected cache mount: %+v", container.VolumeMounts[0])
+			}
+		})
+	}
+}
+
+func TestTransformAggregatedReplicaIntent(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		scaling *airunwayv1alpha1.ScalingSpec
+		want    int64
+	}{
+		{name: "omitted", want: 1},
+		{name: "zero", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 0}, want: 0},
+		{name: "one", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 1}, want: 1},
+		{name: "multiple", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 3}, want: 3},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			md := newTestMD("replica-intent", "default")
+			md.Spec.Scaling = tt.scaling
+			resources, err := NewTransformer().Transform(context.Background(), md)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, found, err := unstructured.NestedInt64(resources[0].Object, "spec", "replicas")
+			if err != nil || !found || got != tt.want {
+				t.Fatalf("Deployment replicas = %d, found=%v, err=%v; want %d", got, found, err, tt.want)
+			}
+			status := NewStatusTranslator().extractReplicas(resources[0])
+			if status.Desired != int32(tt.want) {
+				t.Errorf("status desired = %d; want %d", status.Desired, tt.want)
+			}
+		})
+	}
+}
+
+func TestTransformDeploymentStrategy(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		overrides   string
+		wantType    string
+		wantRolling map[string]any
+	}{
+		{
+			name: "default needs no spare GPU", wantType: "RollingUpdate",
+			wantRolling: map[string]any{"maxSurge": int64(0), "maxUnavailable": int64(1)},
+		},
+		{
+			name: "intentional surge", wantType: "RollingUpdate",
+			overrides:   `{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}`,
+			wantRolling: map[string]any{"maxSurge": float64(1), "maxUnavailable": float64(0)},
+		},
+		{
+			name: "percentage override", wantType: "RollingUpdate",
+			overrides:   `{"spec":{"strategy":{"rollingUpdate":{"maxSurge":"25%","maxUnavailable":"25%"}}}}`,
+			wantRolling: map[string]any{"maxSurge": "25%", "maxUnavailable": "25%"},
+		},
+		{
+			name: "partial override retains defaults", wantType: "RollingUpdate",
+			overrides:   `{"spec":{"strategy":{"rollingUpdate":{"maxUnavailable":2}}}}`,
+			wantRolling: map[string]any{"maxSurge": int64(0), "maxUnavailable": float64(2)},
+		},
+		{
+			name: "recreate override drops rolling defaults", wantType: "Recreate",
+			overrides: `{"spec":{"strategy":{"type":"Recreate"}}}`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			md := newTestMD("strategy", "default")
+			if tt.overrides != "" {
+				md.Spec.Provider = &airunwayv1alpha1.ProviderSpec{
+					Overrides: &runtime.RawExtension{Raw: []byte(tt.overrides)},
+				}
+			}
+			resources, err := NewTransformer().Transform(context.Background(), md)
+			if err != nil {
+				t.Fatal(err)
+			}
+			strategy, _, err := unstructured.NestedString(resources[0].Object, "spec", "strategy", "type")
+			if err != nil || strategy != tt.wantType {
+				t.Fatalf("strategy type = %q, err=%v; want %q", strategy, err, tt.wantType)
+			}
+			rolling, found, err := unstructured.NestedMap(resources[0].Object, "spec", "strategy", "rollingUpdate")
+			if err != nil || found != (tt.wantRolling != nil) || !reflect.DeepEqual(rolling, tt.wantRolling) {
+				t.Errorf("rollingUpdate = %v, found=%v, err=%v; want %v", rolling, found, err, tt.wantRolling)
+			}
+		})
 	}
 }

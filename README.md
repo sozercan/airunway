@@ -9,6 +9,8 @@ Deploy and manage large language models on Kubernetes — no YAML required.
 
 AI Runway gives you a web UI and a unified Kubernetes CRD (`ModelDeployment`) to deploy models across multiple inference providers. Browse [HuggingFace](https://huggingface.co/), pick a model, click deploy.
 
+See the [command-line guide](docs/cli.md) to manage models and agents with the standalone Go CLI. Build it with `make cli-build`, without Bun or the dashboard.
+
 ## Demo
 
 [![AI Runway Demo](https://img.youtube.com/vi/Pe0sLv7v2FM/maxresdefault.jpg)](https://youtu.be/Pe0sLv7v2FM)
@@ -43,15 +45,15 @@ AI Runway gives you a web UI and a unified Kubernetes CRD (`ModelDeployment`) to
 
 ### Option A: Run Locally
 
-Download the [latest release](https://github.com/ai-runway/airunway/releases) and run:
+Download the dashboard binary from the [latest release](https://github.com/ai-runway/airunway/releases), rename it to `airunway-web`, and run:
 
 ```bash
-./airunway
+./airunway-web
 ```
 
 Open **http://localhost:3001**
 
-> **macOS:** Remove quarantine if needed: `xattr -dr com.apple.quarantine airunway`
+> **macOS:** Remove quarantine if needed: `xattr -dr com.apple.quarantine airunway-web`
 
 ### Option B: Deploy to Kubernetes
 

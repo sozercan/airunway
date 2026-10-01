@@ -525,7 +525,7 @@ func (t *Transformer) buildEPPPluginsAndProfiles(isDisagg bool) ([]interface{}, 
 func (t *Transformer) buildAggregatedWorker(md *airunwayv1alpha1.ModelDeployment, image string, gatewayEnabled bool) (map[string]interface{}, error) {
 	// Get replicas
 	replicas := int64(1)
-	if md.Spec.Scaling != nil && md.Spec.Scaling.Replicas > 0 {
+	if md.Spec.Scaling != nil {
 		replicas = int64(md.Spec.Scaling.Replicas)
 	}
 
@@ -967,6 +967,9 @@ func (t *Transformer) buildPVCs(md *airunwayv1alpha1.ModelDeployment) []interfac
 		pvcs = append(pvcs, map[string]interface{}{
 			"name":   vol.ResolvedClaimName(md.Name),
 			"create": false,
+			// This is a reference, not a resize request. Dynamo's legacy API
+			// round-trips an omitted quantity as "0"; render it canonically.
+			"size": "0",
 		})
 	}
 	return pvcs

@@ -1879,3 +1879,45 @@ func assertNoArg(t *testing.T, args []string, flag string) {
 		}
 	}
 }
+
+func TestTransformAggregatedReplicaIntent(t *testing.T) {
+	const (
+		servicesField = "services"
+		replicasField = "replicas"
+	)
+	for _, tt := range []struct {
+		name    string
+		scaling *airunwayv1alpha1.ScalingSpec
+		want    int64
+	}{
+		{name: "omitted", want: 1},
+		{name: "zero", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 0}, want: 0},
+		{name: "one", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 1}, want: 1},
+		{name: "multiple", scaling: &airunwayv1alpha1.ScalingSpec{Replicas: 3}, want: 3},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			md := newTestMD("replica-intent", "default")
+			md.Spec.Scaling = tt.scaling
+			resources, err := NewTransformer().Transform(context.Background(), md)
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker, found, err := unstructured.NestedMap(resources[0].Object, "spec", servicesField, "VllmWorker")
+			if err != nil || !found {
+				t.Fatalf("missing VllmWorker: found=%v, err=%v", found, err)
+			}
+			if got, ok := worker[replicasField].(int64); !ok || got != tt.want {
+				t.Fatalf("VllmWorker replicas = %v; want %d", worker[replicasField], tt.want)
+			}
+			// Dynamo reports desired replicas through its per-service status.
+			status := NewStatusTranslator().extractReplicas(map[string]any{
+				servicesField: map[string]any{
+					"VllmWorker": map[string]any{replicasField: tt.want},
+				},
+			})
+			if status.Desired != int32(tt.want) {
+				t.Errorf("status desired = %d; want %d", status.Desired, tt.want)
+			}
+		})
+	}
+}

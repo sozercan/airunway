@@ -908,8 +908,14 @@ func TestEnsurePVCsPreExistingPending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if allReady {
-		t.Error("expected allReady=false for Pending pre-existing PVC")
+	if !allReady {
+		t.Error("expected allReady=true for Pending pre-existing PVC (WaitForFirstConsumer compatible)")
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "existing-pvc", Namespace: "default"}, existingPVC); err != nil {
+		t.Fatal(err)
+	}
+	if len(existingPVC.OwnerReferences) != 0 || existingPVC.Status.Phase != corev1.ClaimPending {
+		t.Fatal("pre-existing PVC must not be adopted or modified")
 	}
 }
 

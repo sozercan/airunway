@@ -1,0 +1,12 @@
+# Official publishers verified against these projects' PyPI metadata.
+# Keep the existing HF CLI version for legacy `hf download` jobs.
+huggingface-hub==1.6.0
+# The HF CLI imports click directly; newer Typer releases no longer depend on it.
+click==8.4.2
+boto3==1.43.103
+google-cloud-storage==3.15.0
+azure-storage-blob==12.30.3
+azure-identity==1.25.3
+# Direct transports used to enforce timeout/redirect policy.
+httpx==0.28.1
+requests==2.34.2

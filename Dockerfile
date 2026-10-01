@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-# Stage 1: Build frontend and compile binary
+# Build the dashboard and its embedded frontend
 FROM --platform=$BUILDPLATFORM oven/bun:1 AS builder
 
 # Build arguments
@@ -44,9 +44,25 @@ RUN cd backend && \
     fi && \
     VERSION=${VERSION} GIT_COMMIT=${GIT_COMMIT} bun run scripts/compile.ts \
       --target=$TARGET \
-      --outfile=airunway
+      --outfile=airunway-web
 
-# Stage 2: Download CLI tools used by backend installation routes
+# Build the standalone Go CLI for the same target as the dashboard.
+FROM --platform=$BUILDPLATFORM golang:1.25.13@sha256:cbff9d1a9041b316010f2da6b701b6c0d597718cb90928c85eb597334a0d23d4 AS cli-builder
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+WORKDIR /app
+COPY cli/go.mod cli/go.sum cli/
+COPY controller/go.mod controller/go.sum controller/
+RUN cd cli && go mod download
+COPY cli/ cli/
+COPY controller/ controller/
+RUN cd cli && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags "-s -w -X github.com/ai-runway/airunway/cli/internal/cli.Version=${VERSION} -X github.com/ai-runway/airunway/cli/internal/cli.GitCommit=${GIT_COMMIT}" \
+    -o /airunway ./cmd/airunway
+
+# Download CLI tools used by backend installation routes
 FROM --platform=$BUILDPLATFORM alpine:3.22 AS cli-tools
 
 ARG TARGETARCH
@@ -68,7 +84,7 @@ RUN apk add --no-cache ca-certificates curl gzip tar && \
     helm version --short && \
     kubectl version --client=true
 
-# Stage 3: Runtime with distroless
+# Runtime with distroless
 # Using cc-debian12 which includes glibc (required by Bun-compiled binaries)
 FROM gcr.io/distroless/cc-debian12:nonroot
 
@@ -79,7 +95,8 @@ LABEL org.opencontainers.image.source="https://github.com/ai-runway/airunway"
 LABEL org.opencontainers.image.licenses="MIT"
 
 # Copy the compiled binary and CLI tools used by installation routes
-COPY --from=builder /app/dist/airunway /airunway
+COPY --from=cli-builder /airunway /airunway
+COPY --from=builder /app/dist/airunway-web /airunway-web
 COPY --from=cli-tools /usr/local/bin/helm /usr/local/bin/helm
 COPY --from=cli-tools /usr/local/bin/kubectl /usr/local/bin/kubectl
 

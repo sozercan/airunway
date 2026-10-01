@@ -199,7 +199,57 @@ type StorageSpec struct {
 	Volumes []StorageVolume `json:"volumes,omitempty"`
 }
 
+// ArtifactCredentialsRef selects one JSON credentials key from a namespaced Secret.
+type ArtifactCredentialsRef struct {
+	// name is the Secret in the ModelDeployment namespace.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// key contains source-specific JSON credentials, not environment variable names.
+	// Defaults to credentials. For HF_TOKEN secrets use secrets.huggingFaceToken instead.
+	// +kubebuilder:default=credentials
+	// +optional
+	Key string `json:"key,omitempty"`
+}
+
+// ModelArtifactSpec stages a remote artifact into the writable modelCache volume.
+// All fields are immutable; delete and recreate the deployment to change the download.
+// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="artifact is immutable; delete and recreate the deployment"
+type ModelArtifactSpec struct {
+	// uri is an hf://, s3://, gs://, https://, or oci:// source without inline credentials.
+	// OCI sources require an explicit tag or sha256 digest.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=4096
+	URI string `json:"uri"`
+
+	// revision selects an HF branch, tag, or commit. Other schemes encode identity in uri.
+	// +kubebuilder:validation:MaxLength=256
+	// +optional
+	Revision string `json:"revision,omitempty"`
+
+	// file selects a relative file within HF/S3/GCS/OCI, or names the HTTPS output file.
+	// +kubebuilder:validation:MaxLength=1024
+	// +optional
+	File string `json:"file,omitempty"`
+
+	// credentialsRef selects JSON credentials. When omitted, SDK default credentials
+	// or anonymous access are used. Credentials are only passed to the download Job.
+	// +optional
+	CredentialsRef *ArtifactCredentialsRef `json:"credentialsRef,omitempty"`
+
+	// image overrides the model-downloader image; it must implement the artifact command.
+	// +kubebuilder:validation:MaxLength=512
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// serviceAccountName selects a preconfigured workload identity for the download Job.
+	// No service account or cloud identity is created by AI Runway.
+	// +optional
+	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+}
+
 // ModelSpec defines the model specification
+// +kubebuilder:validation:XValidation:rule="has(self.artifact) == has(oldSelf.artifact)",message="artifact cannot be added or removed; delete and recreate the deployment"
 type ModelSpec struct {
 	// id is the model identifier (e.g., HuggingFace model ID)
 	// Required when source is huggingface
@@ -220,6 +270,10 @@ type ModelSpec struct {
 	// storage defines persistent storage for model data (e.g., model weights, compilation caches)
 	// +optional
 	Storage *StorageSpec `json:"storage,omitempty"`
+
+	// artifact stages model files before serving. Requires source=custom and provider=vllm.
+	// +optional
+	Artifact *ModelArtifactSpec `json:"artifact,omitempty"`
 }
 
 // ProviderSpec defines the provider selection
@@ -346,7 +400,7 @@ type ScalingSpec struct {
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:default=1
 	// +optional
-	Replicas int32 `json:"replicas,omitempty"`
+	Replicas int32 `json:"replicas"`
 
 	// prefill defines prefill worker configuration for disaggregated mode
 	// +optional

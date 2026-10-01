@@ -289,7 +289,15 @@ def job_messages(config: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def run_job(adapter: AgentAdapter, config: dict[str, Any]) -> None:
+    structured = "resultFormat" in config
+    if structured and config["resultFormat"] != "airunway-json-v1":
+        raise ValueError("spec.config.resultFormat must be airunway-json-v1 when set")
     result = adapter.invoke(job_messages(config), config)
+    if structured:
+        if not isinstance(result, str) or not result.strip():
+            raise ValueError("agent returned an empty or non-string task result")
+        # JSON escaping keeps multiline answers and marker-like text in one record.
+        result = "AIRUNWAY_RESULT_V1 " + json.dumps({"output": result}, separators=(",", ":"))
     print(result, flush=True)
 
 

@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -93,5 +94,40 @@ func TestValidateEngineArgs(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+func TestModelDeploymentZeroReplicasJSONRoundTrip(t *testing.T) {
+	const input = `{"spec":{"model":{"id":"test/model"},"scaling":{"replicas":0}}}`
+	var md ModelDeployment
+	if err := json.Unmarshal([]byte(input), &md); err != nil {
+		t.Fatal(err)
+	}
+	// Providers use typed updates for finalizers and spec changes.
+	md.Finalizers = []string{"airunway.ai/test-provider"}
+	md.Spec.Engine.Args = map[string]string{"max-model-len": "1024"}
+	data, err := json.Marshal(&md)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Spec struct {
+			Scaling struct {
+				Replicas *int32 `json:"replicas"`
+			} `json:"scaling"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire.Spec.Scaling.Replicas == nil || *wire.Spec.Scaling.Replicas != 0 {
+		t.Fatalf("explicit zero was lost in typed update: %s", data)
+	}
+	var roundTrip ModelDeployment
+	if err := json.Unmarshal(data, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	if roundTrip.Spec.Scaling == nil || roundTrip.Spec.Scaling.Replicas != 0 {
+		t.Fatalf("explicit zero was lost in JSON round trip: %+v", roundTrip.Spec.Scaling)
 	}
 }
